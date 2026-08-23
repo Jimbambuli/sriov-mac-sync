@@ -119,7 +119,7 @@ fn load_conf(opts: &mut Options) {
             }
             "EXCLUDE" => opts.exclude.extend(
                 value
-                    .split(|c| c == ',' || c == ' ')
+                    .split([',', ' '])
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
             ),
@@ -158,7 +158,7 @@ fn parse_args(opts: &mut Options) -> Result<(), String> {
             "--exclude" => opts.exclude.extend(
                 args.next()
                     .ok_or("--exclude needs addresses")?
-                    .split(|c| c == ',' || c == ' ')
+                    .split([',', ' '])
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
             ),
@@ -176,7 +176,7 @@ fn parse_args(opts: &mut Options) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
+fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<Vec<Pair>, String> {
     let mut pairs = Vec::new();
     if opts.pairs.is_empty() {
         let (found, skipped) = topo.autodetect();
@@ -185,12 +185,10 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
                 eprintln!("{s}");
             }
         }
-        if found.is_empty() {
-            return Err(
-                "no SR-IOV interface found that ends up in a bridge \
+        if found.is_empty() && !allow_empty {
+            return Err("no SR-IOV interface found that ends up in a bridge \
                  (use --pair; -v explains what was skipped)"
-                    .into(),
-            );
+                .into());
         }
         pairs.extend(found.into_iter().map(|(dev, bridge)| Pair { dev, bridge }));
     } else {
@@ -211,6 +209,15 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
         }
     }
     Ok(pairs)
+}
+
+fn pair_names(pairs: &[Pair]) -> Vec<String> {
+    let mut v: Vec<String> = pairs
+        .iter()
+        .map(|p| format!("{}:{}", p.dev, p.bridge))
+        .collect();
+    v.sort();
+    v
 }
 
 /// Can this driver take entries at all? Only half an answer: it proves the
@@ -305,7 +312,7 @@ fn run() -> Result<bool, String> {
     parse_args(&mut opts)?;
 
     let topo = Topology::load().map_err(|e| format!("cannot read /sys/class/net: {e}"))?;
-    let pairs = resolve_pairs(&topo, &opts)?;
+    let pairs = resolve_pairs(&topo, &opts, opts.mode == Mode::Daemon)?;
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
@@ -363,44 +370,98 @@ fn run() -> Result<bool, String> {
             Ok(true)
         }
         Mode::Daemon => {
-            let names: Vec<String> = pairs
-                .iter()
-                .map(|p| format!("{}:{}", p.dev, p.bridge))
-                .collect();
+            let auto = opts.pairs.is_empty();
+            let listed = pair_names(&pairs);
             eprintln!(
                 "sriov-mac-sync {VERSION}: watching {}, full reconciliation every {}s",
-                names.join(" "),
+                if listed.is_empty() {
+                    "nothing yet".to_string()
+                } else {
+                    listed.join(" ")
+                },
                 opts.interval
             );
             let mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
-            let reports = syncer
-                .reconcile(&mut sock, true)
-                .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose);
+            let mut said_empty = false;
 
             loop {
-                let woken = mon
-                    .wait((opts.interval * 1000) as i32)
-                    .map_err(|e| e.to_string())?;
-                if woken {
-                    // Register what just appeared before doing anything else,
-                    // so the first reply to it is not lost.
-                    let topo = Topology::load().map_err(|e| e.to_string())?;
-                    for (kind, entry) in mon.recv_events().map_err(|e| e.to_string())? {
-                        if kind == netlink::RTM_NEWNEIGH {
-                            let _ = syncer.fast_add(&mut sock, &topo, &entry);
+                // Autodetection is redone every pass. A NIC that gets its VFs
+                // later, or a bridge built after boot, must not need a restart
+                // to be noticed - and starting before the network is up must
+                // not turn into a crash loop.
+                if auto {
+                    match Topology::load() {
+                        Ok(topo) => {
+                            let found: Vec<Pair> = topo
+                                .autodetect()
+                                .0
+                                .into_iter()
+                                .map(|(dev, bridge)| Pair { dev, bridge })
+                                .collect();
+                            if pair_names(&found) != pair_names(&syncer.pairs) {
+                                if !found.is_empty() {
+                                    eprintln!("now watching {}", pair_names(&found).join(" "));
+                                    said_empty = false;
+                                }
+                                syncer.pairs = found;
+                            }
                         }
-                    }
-                    // Let a burst settle before the full pass.
-                    while mon.wait(200).map_err(|e| e.to_string())? {
-                        let _ = mon.recv_events();
+                        Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
                     }
                 }
-                let reports = syncer
-                    .reconcile(&mut sock, true)
-                    .map_err(|e| e.to_string())?;
-                report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose);
+
+                if syncer.pairs.is_empty() {
+                    if !said_empty {
+                        eprintln!("waiting for an SR-IOV interface to appear in a bridge");
+                        said_empty = true;
+                    }
+                } else {
+                    match syncer.reconcile(&mut sock, true) {
+                        Ok(reports) => {
+                            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose)
+                        }
+                        // One failed pass is no reason to give up: the next is
+                        // seconds away and starts from the kernel's state again.
+                        Err(e) => eprintln!("warning: reconciliation failed: {e}"),
+                    }
+                }
+
+                let woken = match mon.wait((opts.interval * 1000) as i32) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("warning: waiting for events failed: {e}");
+                        false
+                    }
+                };
+                if !woken {
+                    continue;
+                }
+
+                // Register what just appeared before anything else, so the
+                // first reply to it is not sent into the void.
+                let topo = Topology::load().ok();
+                match mon.recv_events() {
+                    Ok(events) => {
+                        if let Some(topo) = topo.as_ref() {
+                            for (kind, entry) in events {
+                                if kind == netlink::RTM_NEWNEIGH {
+                                    let _ = syncer.fast_add(&mut sock, topo, &entry);
+                                }
+                            }
+                        }
+                    }
+                    // ENOBUFS means the kernel dropped notifications because we
+                    // could not keep up. Losing them is survivable - the full
+                    // pass at the top of the loop reads the real state - but
+                    // exiting over it would not be.
+                    Err(e) => eprintln!("warning: lost neighbour notifications: {e}"),
+                }
+
+                // Let a burst settle before the full pass.
+                while mon.wait(200).unwrap_or(false) {
+                    let _ = mon.recv_events();
+                }
             }
         }
         Mode::Check => unreachable!(),

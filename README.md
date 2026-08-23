@@ -193,6 +193,20 @@ Topology comes from `/sys/class/net`: `master` chains upward for bonds,
 `lower_*` links downward for stacking, `sriov_numvfs` and `physfn`/`virtfn` for
 the SR-IOV relationships.
 
+## Development
+
+```
+cargo test        # topology and parsing logic, no hardware needed
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+The parts most likely to be wrong on unfamiliar hardware are the ones that
+decide *which way the wire is* and *which addresses count*, and those are pure
+functions over a topology that tests build by hand — bonds, stacked VLAN
+interfaces, vnet bridges, a second unrelated bridge, a bridge carrying its own
+address. CI runs all of that plus a static build on every push.
+
 ## License
 
 MIT.

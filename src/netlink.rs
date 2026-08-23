@@ -32,6 +32,9 @@ const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
+/// The kernel sets this on a dump whose result changed underneath it: what
+/// came back is a mixture of two states and must not be acted on.
+const NLM_F_DUMP_INTR: u16 = 0x10;
 
 pub const NDA_LLADDR: u16 = 2;
 pub const NDA_MASTER: u16 = 9;
@@ -170,6 +173,9 @@ impl Socket {
         Ok(())
     }
 
+    /// Reads one datagram. `MSG_TRUNC` makes the kernel report the real size
+    /// even when it did not fit, so a buffer that is too small shows up as a
+    /// number larger than the buffer instead of as silently missing entries.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let n = unsafe {
@@ -177,7 +183,7 @@ impl Socket {
                     self.fd.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
-                    0,
+                    libc::MSG_TRUNC,
                 )
             };
             if n < 0 {
@@ -191,17 +197,88 @@ impl Socket {
         }
     }
 
+    /// Runs one dump and hands every message body of type `want` to `sink`.
+    ///
+    /// Returns `false` when the answer cannot be trusted - either the kernel
+    /// flagged the dump as interrupted, or a datagram did not fit the buffer.
+    /// Either way the caller should enlarge and try again rather than work
+    /// from half a picture.
+    fn run_dump(
+        &self,
+        buf: &mut [u8],
+        want: u16,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> io::Result<bool> {
+        loop {
+            let n = self.recv(buf)?;
+            if n > buf.len() {
+                return Ok(false); // did not fit
+            }
+            for msg in messages(&buf[..n]) {
+                if msg.flags & NLM_F_DUMP_INTR != 0 {
+                    return Ok(false); // inconsistent
+                }
+                match msg.kind {
+                    NLMSG_DONE => return Ok(true),
+                    NLMSG_ERROR => {
+                        if let Some(e) = nlmsg_error(msg.payload) {
+                            return Err(e);
+                        }
+                        return Ok(true);
+                    }
+                    NLMSG_NOOP => continue,
+                    k if k == want => sink(msg.payload),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Repeats `run_dump` with a growing buffer until it comes back trustworthy.
+    fn dump(&mut self, request: &[u8], want: u16, sink: &mut impl FnMut(&[u8])) -> io::Result<()> {
+        let mut size = 256 * 1024;
+        for _ in 0..6 {
+            self.send(request)?;
+            let mut buf = vec![0u8; size];
+            if self.run_dump(&mut buf, want, sink)? {
+                return Ok(());
+            }
+            self.drain();
+            size *= 2;
+        }
+        Err(io::Error::other(
+            "forwarding database dump kept changing or outgrew the buffer",
+        ))
+    }
+
+    /// Throws away whatever is still queued from an abandoned dump.
+    fn drain(&self) {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                )
+            };
+            if n <= 0 {
+                return;
+            }
+        }
+    }
+
     /// Every forwarding database entry on the host, learnt and configured.
     pub fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         self.seq += 1;
-        let seq = self.seq;
         let mut req = Vec::with_capacity(NLMSG_HDR + NDMSG_LEN);
         put_nlmsghdr(
             &mut req,
             (NLMSG_HDR + NDMSG_LEN) as u32,
             RTM_GETNEIGH,
             NLM_F_REQUEST | NLM_F_DUMP,
-            seq,
+            self.seq,
         );
         req.push(libc::AF_BRIDGE as u8); // ndm_family
         req.push(0); // pad1
@@ -210,31 +287,13 @@ impl Socket {
         req.extend_from_slice(&0u16.to_ne_bytes()); // state
         req.push(0); // flags
         req.push(0); // type
-        self.send(&req)?;
 
         let mut out = Vec::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        'outer: loop {
-            let n = self.recv(&mut buf)?;
-            for (kind, payload) in messages(&buf[..n]) {
-                match kind {
-                    NLMSG_DONE => break 'outer,
-                    NLMSG_ERROR => {
-                        if let Some(e) = nlmsg_error(payload) {
-                            return Err(e);
-                        }
-                        break 'outer;
-                    }
-                    NLMSG_NOOP => continue,
-                    RTM_NEWNEIGH => {
-                        if let Some(e) = parse_fdb(payload) {
-                            out.push(e);
-                        }
-                    }
-                    _ => {}
-                }
+        self.dump(&req, RTM_NEWNEIGH, &mut |payload| {
+            if let Some(e) = parse_fdb(payload) {
+                out.push(e);
             }
-        }
+        })?;
         Ok(out)
     }
 
@@ -243,10 +302,15 @@ impl Socket {
     /// it exists whether or not the VF is bound on the host.
     pub fn dump_vf_macs(&mut self) -> io::Result<Vec<(u32, [u8; 6])>> {
         self.seq += 1;
-        let seq = self.seq;
         let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
         let mut req = Vec::with_capacity(len);
-        put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, seq);
+        put_nlmsghdr(
+            &mut req,
+            len as u32,
+            RTM_GETLINK,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            self.seq,
+        );
         req.push(libc::AF_UNSPEC as u8);
         req.push(0);
         req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
@@ -254,26 +318,11 @@ impl Socket {
         req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
         req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
         put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
-        self.send(&req)?;
 
         let mut out = Vec::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        'outer: loop {
-            let n = self.recv(&mut buf)?;
-            for (kind, payload) in messages(&buf[..n]) {
-                match kind {
-                    NLMSG_DONE => break 'outer,
-                    NLMSG_ERROR => {
-                        if let Some(e) = nlmsg_error(payload) {
-                            return Err(e);
-                        }
-                        break 'outer;
-                    }
-                    RTM_NEWLINK => collect_vf_macs(payload, &mut out),
-                    _ => {}
-                }
-            }
-        }
+        self.dump(&req, RTM_NEWLINK, &mut |payload| {
+            collect_vf_macs(payload, &mut out)
+        })?;
         Ok(out)
     }
 
@@ -285,7 +334,10 @@ impl Socket {
         let len = NLMSG_HDR + NDMSG_LEN + RTATTR_HDR + 6 + 2; // lladdr is padded to 8
         let mut req = Vec::with_capacity(len);
         let (kind, flags) = if add {
-            (RTM_NEWNEIGH, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL)
+            (
+                RTM_NEWNEIGH,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            )
         } else {
             (RTM_DELNEIGH, NLM_F_REQUEST | NLM_F_ACK)
         };
@@ -301,10 +353,10 @@ impl Socket {
         self.send(&req)?;
 
         let mut buf = vec![0u8; 8192];
-        let n = self.recv(&mut buf)?;
-        for (k, payload) in messages(&buf[..n]) {
-            if k == NLMSG_ERROR {
-                if let Some(e) = nlmsg_error(payload) {
+        let n = self.recv(&mut buf)?.min(buf.len());
+        for msg in messages(&buf[..n]) {
+            if msg.kind == NLMSG_ERROR {
+                if let Some(e) = nlmsg_error(msg.payload) {
                     return Err(e);
                 }
             }
@@ -316,12 +368,14 @@ impl Socket {
     /// arrived. `None` means the notification was of no interest.
     pub fn recv_events(&self) -> io::Result<Vec<(u16, FdbEntry)>> {
         let mut buf = vec![0u8; 64 * 1024];
-        let n = self.recv(&mut buf)?;
+        // A notification that did not fit is no loss worth chasing: the full
+        // pass that follows every wake-up sees the same state anyway.
+        let n = self.recv(&mut buf)?.min(buf.len());
         let mut out = Vec::new();
-        for (kind, payload) in messages(&buf[..n]) {
-            if kind == RTM_NEWNEIGH || kind == RTM_DELNEIGH {
-                if let Some(e) = parse_fdb(payload) {
-                    out.push((kind, e));
+        for msg in messages(&buf[..n]) {
+            if msg.kind == RTM_NEWNEIGH || msg.kind == RTM_DELNEIGH {
+                if let Some(e) = parse_fdb(msg.payload) {
+                    out.push((msg.kind, e));
                 }
             }
         }
@@ -369,17 +423,30 @@ fn put_attr_u32(buf: &mut Vec<u8>, kind: u16, value: u32) {
     put_attr(buf, kind, &value.to_ne_bytes());
 }
 
-/// Walk the netlink messages in a received buffer.
-fn messages(buf: &[u8]) -> Vec<(u16, &[u8])> {
+pub struct Message<'a> {
+    pub kind: u16,
+    pub flags: u16,
+    pub payload: &'a [u8],
+}
+
+/// Walk the netlink messages in a received buffer. A trailing fragment that
+/// does not fit is dropped rather than parsed, so a short read cannot turn
+/// into nonsense.
+fn messages(buf: &[u8]) -> Vec<Message<'_>> {
     let mut out = Vec::new();
     let mut off = 0usize;
     while off + NLMSG_HDR <= buf.len() {
         let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
         let kind = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
+        let flags = u16::from_ne_bytes(buf[off + 6..off + 8].try_into().unwrap());
         if len < NLMSG_HDR || off + len > buf.len() {
             break;
         }
-        out.push((kind, &buf[off + NLMSG_HDR..off + len]));
+        out.push(Message {
+            kind,
+            flags,
+            payload: &buf[off + NLMSG_HDR..off + len],
+        });
         off += align4(len);
     }
     out
@@ -490,5 +557,187 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
         Some(out)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(kind: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
+        let len = NLMSG_HDR + payload.len();
+        let mut v = Vec::with_capacity(align4(len));
+        v.extend_from_slice(&(len as u32).to_ne_bytes());
+        v.extend_from_slice(&kind.to_ne_bytes());
+        v.extend_from_slice(&flags.to_ne_bytes());
+        v.extend_from_slice(&0u32.to_ne_bytes()); // seq
+        v.extend_from_slice(&0u32.to_ne_bytes()); // pid
+        v.extend_from_slice(payload);
+        v.resize(align4(len), 0);
+        v
+    }
+
+    fn ndmsg(
+        ifindex: u32,
+        state: u16,
+        flags: u8,
+        mac: Option<[u8; 6]>,
+        master: Option<u32>,
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(libc::AF_BRIDGE as u8);
+        v.push(0);
+        v.extend_from_slice(&0u16.to_ne_bytes());
+        v.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+        v.extend_from_slice(&state.to_ne_bytes());
+        v.push(flags);
+        v.push(0);
+        if let Some(m) = mac {
+            put_attr(&mut v, NDA_LLADDR, &m);
+        }
+        if let Some(m) = master {
+            put_attr_u32(&mut v, NDA_MASTER, m);
+        }
+        v
+    }
+
+    #[test]
+    fn messages_walks_a_batch() {
+        let mut buf = msg(RTM_NEWNEIGH, 0, b"one");
+        buf.extend(msg(RTM_DELNEIGH, 0, b"twotwo"));
+        let got = messages(&buf);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, RTM_NEWNEIGH);
+        assert_eq!(&got[0].payload[..3], b"one");
+        assert_eq!(got[1].kind, RTM_DELNEIGH);
+        assert_eq!(&got[1].payload[..6], b"twotwo");
+    }
+
+    /// A datagram that did not fit must lose its last message rather than
+    /// hand back a half-parsed one.
+    #[test]
+    fn a_truncated_tail_is_dropped_not_parsed() {
+        let mut buf = msg(RTM_NEWNEIGH, 0, b"complete");
+        buf.extend(msg(RTM_NEWNEIGH, 0, b"cut short here"));
+        buf.truncate(buf.len() - 6);
+        let got = messages(&buf);
+        assert_eq!(got.len(), 1, "only the message that arrived whole");
+        assert_eq!(&got[0].payload[..8], b"complete");
+    }
+
+    #[test]
+    fn a_header_that_claims_less_than_a_header_stops_the_walk() {
+        let mut buf = msg(RTM_NEWNEIGH, 0, b"ok");
+        buf.extend_from_slice(&4u32.to_ne_bytes()); // len = 4, impossible
+        buf.extend_from_slice(&[0u8; 12]);
+        assert_eq!(messages(&buf).len(), 1);
+    }
+
+    #[test]
+    fn the_interrupted_dump_flag_survives_parsing() {
+        let buf = msg(RTM_NEWNEIGH, NLM_F_DUMP_INTR, b"x");
+        assert_ne!(messages(&buf)[0].flags & NLM_F_DUMP_INTR, 0);
+    }
+
+    #[test]
+    fn errors_and_acknowledgements_are_told_apart() {
+        assert!(nlmsg_error(&0i32.to_ne_bytes()).is_none(), "0 is an ack");
+        let e = nlmsg_error(&(-libc::EEXIST).to_ne_bytes()).expect("an error");
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+    }
+
+    #[test]
+    fn fdb_entries_are_classified() {
+        let learnt = FdbEntry {
+            ifindex: 1,
+            master: Some(2),
+            mac: [0, 1, 2, 3, 4, 5],
+            state: 0x02,
+            flags: 0,
+        };
+        assert!(learnt.is_learned() && !learnt.is_self() && learnt.is_unicast());
+
+        let own = FdbEntry {
+            state: NUD_PERMANENT,
+            ..learnt.clone()
+        };
+        assert!(
+            !own.is_learned(),
+            "a port's own address is configured, not learnt"
+        );
+
+        let filter = FdbEntry {
+            flags: NTF_SELF,
+            state: NUD_PERMANENT,
+            ..learnt.clone()
+        };
+        assert!(filter.is_self() && !filter.is_learned());
+
+        let external = FdbEntry {
+            state: NUD_NOARP,
+            flags: NTF_EXT_LEARNED,
+            ..learnt.clone()
+        };
+        assert!(
+            external.is_learned(),
+            "planted by an agent, but still says where a peer is"
+        );
+
+        let mcast = FdbEntry {
+            mac: [0x01, 0, 0x5e, 0, 0, 1],
+            ..learnt.clone()
+        };
+        assert!(!mcast.is_unicast());
+    }
+
+    #[test]
+    fn parse_fdb_reads_address_and_bridge() {
+        let body = ndmsg(7, 0x02, 0, Some([0xde, 0xad, 0xbe, 0xef, 0, 1]), Some(9));
+        let e = parse_fdb(&body).expect("parsed");
+        assert_eq!(e.ifindex, 7);
+        assert_eq!(e.master, Some(9));
+        assert_eq!(e.mac, [0xde, 0xad, 0xbe, 0xef, 0, 1]);
+    }
+
+    #[test]
+    fn an_entry_without_an_address_is_no_entry() {
+        assert!(parse_fdb(&ndmsg(7, 0x02, 0, None, Some(9))).is_none());
+        assert!(parse_fdb(&[0u8; 4]).is_none(), "too short to be an ndmsg");
+    }
+
+    #[test]
+    fn mac_round_trip() {
+        let m = [0x02, 0xe3, 0xc0, 0x01, 0x22, 0x75];
+        assert_eq!(format_mac(&m), "02:e3:c0:01:22:75");
+        assert_eq!(parse_mac("02:e3:c0:01:22:75"), Some(m));
+        assert_eq!(
+            parse_mac("02:E3:C0:01:22:75"),
+            Some(m),
+            "case does not matter"
+        );
+    }
+
+    #[test]
+    fn malformed_addresses_are_rejected() {
+        for bad in [
+            "",
+            "02:e3:c0:01:22",
+            "02:e3:c0:01:22:75:99",
+            "zz:e3:c0:01:22:75",
+            "2:e3:c0:01:22:75",
+        ] {
+            assert_eq!(parse_mac(bad), None, "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn attributes_are_padded_to_four_bytes() {
+        let mut v = Vec::new();
+        put_attr(&mut v, NDA_LLADDR, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(v.len(), 12, "4 header + 6 payload, padded to 12");
+        let got = attrs(&v);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, NDA_LLADDR);
+        assert_eq!(got[0].1, &[1, 2, 3, 4, 5, 6]);
     }
 }

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
+
+  static:
+    # The audience runs hypervisors, not build hosts. Prove that a binary can
+    # be produced that does not depend on the build machine's C library, so it
+    # can simply be copied onto an older distribution.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static build
+        run: RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
+      - name: It really is static
+        run: |
+          file target/release/sriov-mac-sync
+          ! ldd target/release/sriov-mac-sync 2>/dev/null | grep -q "=>" \
+            || (echo "binary still has dynamic dependencies" && exit 1)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sriov-mac-sync-static-x86_64
+          path: target/release/sriov-mac-sync

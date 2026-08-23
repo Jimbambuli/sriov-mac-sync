@@ -62,7 +62,9 @@ impl Topology {
             let mut link = Link {
                 name: name.clone(),
                 index,
-                mac: read_trim(base.join("address")).as_deref().and_then(parse_mac),
+                mac: read_trim(base.join("address"))
+                    .as_deref()
+                    .and_then(parse_mac),
                 master: link_target_name(base.join("master")),
                 is_bridge: base.join("bridge").is_dir(),
                 driver: link_target_name(base.join("device/driver")),
@@ -231,5 +233,213 @@ impl Topology {
             }
         }
         (pairs, skipped)
+    }
+}
+
+/// Building topologies by hand, so the logic above can be tested without a
+/// machine that happens to have the right hardware in it.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::{Link, Topology};
+    use std::collections::HashMap;
+
+    pub fn mac(last: u8) -> [u8; 6] {
+        [0x00, 0x11, 0x22, 0x33, 0x44, last]
+    }
+
+    pub struct Builder {
+        links: Vec<Link>,
+    }
+
+    impl Builder {
+        pub fn new() -> Self {
+            Builder { links: Vec::new() }
+        }
+
+        pub fn add(mut self, name: &str, index: u32, mac: Option<[u8; 6]>) -> Self {
+            self.links.push(Link {
+                name: name.to_string(),
+                index,
+                mac,
+                ..Default::default()
+            });
+            self
+        }
+
+        fn last(&mut self) -> &mut Link {
+            self.links.last_mut().expect("add a link first")
+        }
+
+        pub fn bridge(mut self) -> Self {
+            self.last().is_bridge = true;
+            self
+        }
+
+        pub fn master(mut self, m: &str) -> Self {
+            self.last().master = Some(m.to_string());
+            self
+        }
+
+        pub fn lower(mut self, l: &str) -> Self {
+            self.last().lowers.push(l.to_string());
+            self
+        }
+
+        pub fn vfs(mut self, n: u32) -> Self {
+            self.last().numvfs = n;
+            self
+        }
+
+        pub fn build(self) -> Topology {
+            let mut links = HashMap::new();
+            for l in self.links {
+                links.insert(l.name.clone(), l);
+            }
+            Topology { links }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::{mac, Builder};
+
+    /// A bridge with two NICs, a VLAN interface on top of it and a second
+    /// bridge on top of that - the shape a Proxmox SDN host has.
+    fn stacked() -> super::Topology {
+        Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("vmbr1")
+            .vfs(1)
+            .add("nic2", 3, Some(mac(2)))
+            .master("vmbr1")
+            .add("vmbr1", 10, Some(mac(1)))
+            .bridge()
+            .lower("nic1")
+            .lower("nic2")
+            .add("vmbr1.44", 11, Some(mac(1)))
+            .master("IOT")
+            .lower("vmbr1")
+            .add("IOT", 12, Some(mac(1)))
+            .bridge()
+            .lower("vmbr1.44")
+            .lower("veth0")
+            .add("veth0", 13, Some(mac(0x13)))
+            .master("IOT")
+            .build()
+    }
+
+    #[test]
+    fn leads_to_follows_stacking_upwards() {
+        let t = stacked();
+        assert!(
+            t.leads_to("vmbr1.44", "vmbr1"),
+            "a VLAN interface on the bridge"
+        );
+        assert!(
+            t.leads_to("IOT", "vmbr1"),
+            "a bridge on that VLAN interface"
+        );
+        assert!(t.leads_to("vmbr1", "vmbr1"), "itself");
+        assert!(!t.leads_to("nic2", "vmbr1"), "a port is below, not above");
+        assert!(!t.leads_to("veth0", "vmbr1"), "a guest port is below too");
+    }
+
+    #[test]
+    fn a_port_enslaved_directly_is_its_own_uplink() {
+        let t = stacked();
+        assert_eq!(
+            t.bridge_above("nic1"),
+            Some(("vmbr1".into(), "nic1".into()))
+        );
+        assert_eq!(t.uplink_port("nic1", "vmbr1"), "nic1");
+    }
+
+    #[test]
+    fn a_bond_is_followed_to_the_bridge_above_it() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("bond0")
+            .vfs(2)
+            .add("nic1b", 3, Some(mac(2)))
+            .master("bond0")
+            .add("bond0", 4, Some(mac(1)))
+            .master("br0")
+            .lower("nic1")
+            .lower("nic1b")
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("bond0")
+            .build();
+        assert_eq!(t.bridge_above("nic1"), Some(("br0".into(), "bond0".into())));
+        assert_eq!(
+            t.uplink_port("nic1", "br0"),
+            "bond0",
+            "the bond is the port"
+        );
+
+        // every member faces the wire, so every member's address is the host's
+        let mut macs = t.subtree_macs("bond0");
+        macs.sort();
+        assert_eq!(macs, vec![mac(1), mac(1), mac(2)]);
+    }
+
+    #[test]
+    fn uplink_port_falls_back_when_the_bridge_does_not_match() {
+        let t = stacked();
+        assert_eq!(t.uplink_port("nic1", "IOT"), "nic1");
+    }
+
+    #[test]
+    fn autodetect_wants_vfs_and_a_bridge() {
+        let t = Builder::new()
+            .add("withvfs", 2, Some(mac(1)))
+            .master("br0")
+            .vfs(1)
+            .add("novfs", 3, Some(mac(2)))
+            .master("br0")
+            .add("loose", 4, Some(mac(3)))
+            .vfs(4)
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("withvfs")
+            .lower("novfs")
+            .build();
+        let (pairs, skipped) = t.autodetect();
+        assert_eq!(pairs, vec![("withvfs".to_string(), "br0".to_string())]);
+        assert!(
+            skipped.iter().any(|s| s.contains("loose")),
+            "a NIC with VFs but no bridge is reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn autodetect_reports_the_bond_it_went_through() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("bond0")
+            .vfs(1)
+            .add("bond0", 4, Some(mac(1)))
+            .master("br0")
+            .lower("nic1")
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("bond0")
+            .build();
+        let (pairs, notes) = t.autodetect();
+        assert_eq!(pairs, vec![("nic1".to_string(), "br0".to_string())]);
+        assert!(notes.iter().any(|s| s.contains("bond0")));
+    }
+
+    #[test]
+    fn stacking_cycles_do_not_hang() {
+        let t = Builder::new()
+            .add("a", 1, None)
+            .lower("b")
+            .add("b", 2, None)
+            .lower("a")
+            .build();
+        assert!(!t.leads_to("a", "zz"));
+        assert_eq!(t.subtree_macs("a").len(), 0);
     }
 }
