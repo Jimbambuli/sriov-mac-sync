@@ -34,10 +34,10 @@ bridge         │           │       │             br0              │
                │           │       └───┬──────────────────────┬───┘
                │           │           │                      │
          ┌─────┴───────────┴───────────┴────────────┐   ┌─────┴─────┐
-NICs     │  NIC 1 — its own switch    PF            │   │   eth1    │
-         └────────────────────┬─────────────────────┘   └─────┬─────┘
-                              │                               │
-wires                      wire A                          wire B
+NICs     │  NIC 1 — its own switch  PF              │   │   eth1    │
+         └─────────────────────────────┬────────────┘   └─────┬─────┘
+                                       │                      │
+wires                               wire A                 wire B
 ```
 
 Read it from the bottom up. The two VFs come out of the NIC and go straight to
