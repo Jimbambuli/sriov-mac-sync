@@ -481,7 +481,6 @@ fn run() -> Result<bool, String> {
     }
 
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
-    syncer.max_macs = opts.max_macs;
     syncer.dry_run = opts.dry_run;
     // Only autodetection sees every uplink, so only autodetection may conclude
     // that a leftover note belongs to none of them.

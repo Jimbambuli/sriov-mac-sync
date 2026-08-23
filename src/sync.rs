@@ -33,7 +33,6 @@ pub struct Report {
 
 pub struct Syncer {
     pub pairs: Vec<Pair>,
-    pub max_macs: usize,
     pub exclude: HashSet<Mac>,
     /// addresses to register whether or not a bridge has learnt them
     pub extra: HashSet<Mac>,
@@ -50,7 +49,6 @@ impl Syncer {
     pub fn new(pairs: Vec<Pair>, state_dir: PathBuf) -> Self {
         Syncer {
             pairs,
-            max_macs: 128,
             exclude: HashSet::new(),
             extra: HashSet::new(),
             dry_run: false,
