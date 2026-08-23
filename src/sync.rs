@@ -79,6 +79,11 @@ impl Syncer {
     }
 
     fn save_owned(&mut self, dev: &str, set: &HashSet<Mac>) {
+        // Most passes change nothing. Rewriting the note every time would be
+        // pointless work on every host that is simply idle.
+        if self.owned.get(dev) == Some(set) && self.state_path(dev).exists() {
+            return;
+        }
         self.owned.insert(dev.to_string(), set.clone());
         if self.dry_run {
             return;
@@ -234,7 +239,13 @@ impl Syncer {
     pub fn reconcile(&mut self, sock: &mut Socket, apply: bool) -> io::Result<Vec<Report>> {
         let topo = Topology::load()?;
         let fdb = sock.dump_fdb()?;
-        let vf_macs = sock.dump_vf_macs().unwrap_or_default();
+        // Not `unwrap_or_default`: an empty list here does not mean "no virtual
+        // functions", it means we failed to ask. Carrying on with it would drop
+        // the VFs' own addresses out of the exclusions, and registering a VF's
+        // address in the uplink's filter tells the switch that the guest
+        // holding it lives behind the bridge - which sends its traffic past it.
+        // A failed pass is harmless; a pass on incomplete information is not.
+        let vf_macs = sock.dump_vf_macs()?;
         let mut reports = Vec::new();
 
         for pair in self.pairs.clone() {
@@ -677,5 +688,83 @@ mod extra_tests {
         let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
         assert!(!want.contains(&WIRE), "it lives out on the wire");
         assert!(!want.contains(&mac(1)), "it is the uplink's own address");
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sriov-mac-sync-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The note in /run is what keeps the daemon from deleting entries it never
+    /// made, so it has to survive a restart.
+    #[test]
+    fn ownership_survives_a_restart() {
+        let dir = scratch("restart");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+        set.insert(BEHIND_GUEST);
+
+        let mut before = Syncer::new(Vec::new(), dir.clone());
+        before.save_owned("nic1", &set);
+        assert!(dir.join("nic1.owned").exists());
+
+        let mut after = Syncer::new(Vec::new(), dir.clone());
+        assert_eq!(after.load_owned("nic1"), set);
+        assert!(
+            after.load_owned("nic0").is_empty(),
+            "an uplink with no note owns nothing"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Most passes change nothing; those must not touch the disk.
+    #[test]
+    fn an_unchanged_set_is_not_written_again() {
+        let dir = scratch("idle");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        fs::write(dir.join("nic1.owned"), "beruehrt\n").unwrap();
+        s.save_owned("nic1", &set);
+        assert_eq!(
+            fs::read_to_string(dir.join("nic1.owned")).unwrap(),
+            "beruehrt\n",
+            "unchanged means untouched"
+        );
+
+        set.insert(BEHIND_GUEST);
+        s.save_owned("nic1", &set);
+        assert_eq!(
+            fs::read_to_string(dir.join("nic1.owned"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "a changed set is written"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A note whose file was removed underneath us must be written again.
+    #[test]
+    fn a_vanished_note_is_recreated() {
+        let dir = scratch("vanish");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        fs::remove_file(dir.join("nic1.owned")).unwrap();
+        s.save_owned("nic1", &set);
+        assert!(dir.join("nic1.owned").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

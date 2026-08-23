@@ -431,6 +431,51 @@ mod tests {
         assert!(notes.iter().any(|s| s.contains("bond0")));
     }
 
+    /// The kernel reports a VLAN's parent, a VXLAN's underlay and a veth's
+    /// *peer* through the same-looking attributes. Only the first two are
+    /// stacking; treating a peer as one would send the uplink search sideways.
+    #[test]
+    fn netlink_tells_parents_from_peers() {
+        use crate::netlink::LinkInfo;
+        let l = |index, name: &str, kind: Option<&str>, link, master| LinkInfo {
+            index,
+            name: name.to_string(),
+            kind: kind.map(|k| k.to_string()),
+            link,
+            master,
+            ..Default::default()
+        };
+        let t = super::Topology::from_netlink(&[
+            l(1, "br0", Some("bridge"), None, None),
+            l(2, "eth0", None, None, Some(1)),
+            l(3, "br0.42", Some("vlan"), Some(1), None),
+            l(4, "veth-a", Some("veth"), Some(5), Some(1)),
+            l(5, "veth-b", Some("veth"), Some(4), None),
+            l(6, "vx0", Some("vxlan"), Some(1), None),
+        ]);
+        assert_eq!(t.get("br0").unwrap().lowers, vec!["eth0", "veth-a"]);
+        assert_eq!(
+            t.get("br0.42").unwrap().lowers,
+            vec!["br0"],
+            "a VLAN parent"
+        );
+        assert_eq!(
+            t.get("vx0").unwrap().lowers,
+            vec!["br0"],
+            "a VXLAN underlay"
+        );
+        assert!(
+            t.get("veth-a").unwrap().lowers.is_empty(),
+            "a veth peer is not something the interface is built on"
+        );
+        assert!(t.get("br0").unwrap().is_bridge);
+        assert!(t.leads_to("br0.42", "br0"));
+        assert!(
+            !t.leads_to("veth-b", "br0"),
+            "the peer must not lead anywhere"
+        );
+    }
+
     #[test]
     fn stacking_cycles_do_not_hang() {
         let t = Builder::new()
@@ -441,5 +486,147 @@ mod tests {
             .build();
         assert!(!t.leads_to("a", "zz"));
         assert_eq!(t.subtree_macs("a").len(), 0);
+    }
+}
+
+/// Interfaces that carry a `lower_<parent>` link in sysfs because they are
+/// stacked on that parent. A veth also reports a peer over netlink, and a tunnel
+/// reports its underlay - neither is stacking, and treating them as such would
+/// send the uplink search off in the wrong direction.
+const STACKED_ON_PARENT: &[&str] = &["vlan", "macvlan", "macvtap", "ipvlan", "vxlan"];
+
+impl Topology {
+    /// The same picture, built from one netlink dump instead of a walk over
+    /// `/sys/class/net`. Only the SR-IOV relationships still come from sysfs -
+    /// the kernel does not describe them over netlink - and those are read only
+    /// for interfaces that actually have a device behind them.
+    pub fn from_netlink(links: &[crate::netlink::LinkInfo]) -> Self {
+        use std::collections::HashMap as Map;
+        let name_of: Map<u32, &str> = links.iter().map(|l| (l.index, l.name.as_str())).collect();
+
+        let mut ports: Map<u32, Vec<String>> = Map::new();
+        for l in links {
+            if let Some(m) = l.master {
+                ports.entry(m).or_default().push(l.name.clone());
+            }
+        }
+
+        let mut out = HashMap::new();
+        for l in links {
+            let base = Path::new(NET).join(&l.name);
+            let has_device = base.join("device").exists();
+
+            let mut lowers = ports.remove(&l.index).unwrap_or_default();
+            if STACKED_ON_PARENT.contains(&l.kind.as_deref().unwrap_or("")) {
+                if let Some(parent) = l.link.and_then(|i| name_of.get(&i)) {
+                    lowers.push((*parent).to_string());
+                }
+            }
+            lowers.sort();
+
+            let mut link = Link {
+                name: l.name.clone(),
+                index: l.index,
+                mac: l.mac,
+                master: l
+                    .master
+                    .and_then(|i| name_of.get(&i))
+                    .map(|s| s.to_string()),
+                lowers,
+                is_bridge: l.kind.as_deref() == Some("bridge"),
+                numvfs: l.vf_macs.len() as u32,
+                driver: if has_device {
+                    link_target_name(base.join("device/driver"))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+
+            if has_device {
+                let physfn_net = base.join("device/physfn/net");
+                if let Ok(rd) = fs::read_dir(&physfn_net) {
+                    if let Some(e) = rd.flatten().next() {
+                        link.physfn = Some(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+                if link.numvfs > 0 {
+                    if let Ok(rd) = fs::read_dir(base.join("device")) {
+                        for e in rd.flatten() {
+                            if !e.file_name().to_string_lossy().starts_with("virtfn") {
+                                continue;
+                            }
+                            if let Ok(nets) = fs::read_dir(e.path().join("net")) {
+                                for n in nets.flatten() {
+                                    link.vf_netdevs
+                                        .push(n.file_name().to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.insert(l.name.clone(), link);
+        }
+        Topology { links: out }
+    }
+
+    /// Field-by-field differences against another picture of the same host.
+    /// Used to prove the netlink path agrees with the sysfs one before anything
+    /// depends on it.
+    pub fn differences(&self, other: &Topology) -> Vec<String> {
+        let mut d = Vec::new();
+        let mut names: Vec<&String> = self.links.keys().chain(other.links.keys()).collect();
+        names.sort();
+        names.dedup();
+        for n in names {
+            match (self.links.get(n), other.links.get(n)) {
+                (Some(a), Some(b)) => {
+                    let mut al = a.lowers.clone();
+                    let mut bl = b.lowers.clone();
+                    al.sort();
+                    bl.sort();
+                    let mut av = a.vf_netdevs.clone();
+                    let mut bv = b.vf_netdevs.clone();
+                    av.sort();
+                    bv.sort();
+                    for (field, x, y) in [
+                        ("index", a.index.to_string(), b.index.to_string()),
+                        ("mac", format!("{:?}", a.mac), format!("{:?}", b.mac)),
+                        (
+                            "master",
+                            format!("{:?}", a.master),
+                            format!("{:?}", b.master),
+                        ),
+                        ("lowers", format!("{al:?}"), format!("{bl:?}")),
+                        (
+                            "is_bridge",
+                            a.is_bridge.to_string(),
+                            b.is_bridge.to_string(),
+                        ),
+                        ("numvfs", a.numvfs.to_string(), b.numvfs.to_string()),
+                        (
+                            "driver",
+                            format!("{:?}", a.driver),
+                            format!("{:?}", b.driver),
+                        ),
+                        (
+                            "physfn",
+                            format!("{:?}", a.physfn),
+                            format!("{:?}", b.physfn),
+                        ),
+                        ("vf_netdevs", format!("{av:?}"), format!("{bv:?}")),
+                    ] {
+                        if x != y {
+                            d.push(format!("{n}.{field}: sysfs {x} vs netlink {y}"));
+                        }
+                    }
+                }
+                (Some(_), None) => d.push(format!("{n}: only in sysfs")),
+                (None, Some(_)) => d.push(format!("{n}: only in netlink")),
+                (None, None) => {}
+            }
+        }
+        d
     }
 }
