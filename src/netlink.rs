@@ -211,6 +211,9 @@ impl Socket {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        if n as usize != buf.len() {
+            return Err(io::Error::other("netlink request went out incomplete"));
+        }
         Ok(())
     }
 
@@ -248,6 +251,7 @@ impl Socket {
         &self,
         buf: &mut [u8],
         want: u16,
+        seq: u32,
         sink: &mut impl FnMut(&[u8]),
     ) -> io::Result<bool> {
         loop {
@@ -256,6 +260,11 @@ impl Socket {
                 return Ok(false); // did not fit
             }
             for msg in messages(&buf[..n]) {
+                // An answer to something else, or left over from a dump that
+                // was abandoned half-read. Netlink asks callers to check.
+                if msg.seq != seq {
+                    continue;
+                }
                 if msg.flags & NLM_F_DUMP_INTR != 0 {
                     return Ok(false); // inconsistent
                 }
@@ -277,11 +286,12 @@ impl Socket {
 
     /// Repeats `run_dump` with a growing buffer until it comes back trustworthy.
     fn dump(&mut self, request: &[u8], want: u16, sink: &mut impl FnMut(&[u8])) -> io::Result<()> {
+        let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
         let mut size = 256 * 1024;
         for _ in 0..6 {
             self.send(request)?;
             let mut buf = vec![0u8; size];
-            if self.run_dump(&mut buf, want, sink)? {
+            if self.run_dump(&mut buf, want, seq, sink)? {
                 return Ok(());
             }
             self.drain();
@@ -426,7 +436,7 @@ impl Socket {
         let mut buf = vec![0u8; 8192];
         let n = self.recv(&mut buf)?.min(buf.len());
         for msg in messages(&buf[..n]) {
-            if msg.kind == NLMSG_ERROR {
+            if msg.seq == seq && msg.kind == NLMSG_ERROR {
                 if let Some(e) = nlmsg_error(msg.payload) {
                     return Err(e);
                 }
@@ -510,6 +520,7 @@ fn put_attr_u32(buf: &mut Vec<u8>, kind: u16, value: u32) {
 pub struct Message<'a> {
     pub kind: u16,
     pub flags: u16,
+    pub seq: u32,
     pub payload: &'a [u8],
 }
 
@@ -532,6 +543,7 @@ impl<'a> Iterator for Messages<'a> {
         let len = u32::from_ne_bytes(self.buf[self.off..self.off + 4].try_into().unwrap()) as usize;
         let kind = u16::from_ne_bytes(self.buf[self.off + 4..self.off + 6].try_into().unwrap());
         let flags = u16::from_ne_bytes(self.buf[self.off + 6..self.off + 8].try_into().unwrap());
+        let seq = u32::from_ne_bytes(self.buf[self.off + 8..self.off + 12].try_into().unwrap());
         if len < NLMSG_HDR || self.off + len > self.buf.len() {
             return None;
         }
@@ -540,6 +552,7 @@ impl<'a> Iterator for Messages<'a> {
         Some(Message {
             kind,
             flags,
+            seq,
             payload,
         })
     }
