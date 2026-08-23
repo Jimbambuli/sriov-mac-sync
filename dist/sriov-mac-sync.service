@@ -11,12 +11,34 @@ Restart=always
 RestartSec=5
 KillMode=control-group
 
-# It writes hardware filters and reads /sys; nothing else is needed.
+# It writes hardware filters and reads /sys; nothing else is needed. It stays
+# root because programming a NIC's filters wants CAP_NET_ADMIN in the initial
+# user namespace, and everything below takes the rest of root away again.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# One netlink socket is the whole of its outside world.
+RestrictAddressFamilies=AF_NETLINK
+UMask=0077
 # Which entries are ours is noted here. Keep it across a restart, or the
 # daemon comes back unable to tell its own entries from anyone else's and
 # stops cleaning up after itself. /run is a tmpfs, so a reboot still clears

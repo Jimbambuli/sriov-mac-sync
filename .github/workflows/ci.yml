@@ -23,6 +23,14 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+  msrv:
+    # Cargo.toml claims a minimum Rust version. Claiming is not testing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install 1.74 --profile minimal
+      - run: cargo +1.74 test
+
   static:
     # The audience runs hypervisors, not build hosts. Prove that a binary can
     # be produced that does not depend on the build machine's C library, so it
