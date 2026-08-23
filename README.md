@@ -133,9 +133,17 @@ it is a property of the driver, and there is no way to ask. Test with traffic:
 If step 3 changes nothing, this approach does not work on your hardware and
 this daemon will not help you.
 
-Measured working: **Mellanox ConnectX-4 Lx** (`mlx5_core`), legacy eswitch
-mode, confirmed from a Linux network namespace and from a FreeBSD guest holding
-the VF.
+Measured working:
+
+| NIC | driver | confirmed with |
+|---|---|---|
+| Mellanox ConnectX-4 Lx | `mlx5_core` | a Linux network namespace on the VF, and a FreeBSD guest holding the VF |
+| Mellanox ConnectX-3 Pro | `mlx4_core` | a Linux network namespace on the VF |
+
+Both in legacy eswitch mode, and both with the same signature: unicast to a peer
+behind the bridge fails while ARP for it succeeds, registering the address fixes
+it, removing the registration breaks it again. Reports for other hardware are
+welcome — the four steps above are the whole test.
 
 ## Limits and things worth knowing
 
