@@ -135,8 +135,10 @@ Each bridge is handled on its own, and so is each uplink into it.
 * **Bonds are followed.** A PF enslaved to a bond that is the bridge port is
   found through the bond, and the whole bond — every member — counts as the
   wire side.
-* **The uplink need not be a PF.** If you bridge a VF instead, name the pair
-  with `--pair`; the mechanism is identical.
+* **The uplink need not be a PF.** A VF can carry the bridge just as well and
+  is picked up on its own; the mechanism is identical. It has to send with the
+  addresses of everything behind the bridge, so turn spoof checking off for it.
+  There is a reason to prefer this — see *when the wire goes dark* below.
 
 ## Build and install
 
@@ -280,6 +282,20 @@ nothing to do with any of the above: Linux puts a carrier-less port into the
 disabled state, and a disabled port passes nothing. A short cable between two
 ports of the machine is enough — but not two ports of the *same bridge*, which
 is a loop.
+
+**When the wire goes dark, the PF stops talking to its own VFs.** Switch the
+switch off and the PF loses carrier. The internal switch carries on forwarding
+between VFs, but the path between the PF and a VF stops dead in both
+directions — measured on a ConnectX-4 Lx with no bridge in the way at all. A
+bridge whose port is the PF therefore goes down with the cable, and takes the
+host with it: a guest on a VF can no longer reach a container on that bridge,
+though the two sit in the same machine.
+
+Giving the bridge a VF of its own instead removes that coupling. VF-to-VF
+traffic does not depend on the carrier — 0.13 ms with the cable out, where
+PF-to-VF lost every packet — and the registration described here is what steers
+it, so the host keeps talking to itself while the wire is dark. The PF then
+stays out of the bridge, but it still has to be `up`.
 
 **Intel: the VF's link follows the PF's.** `ip link set <pf> vf N state enable`
 is rejected outright by `ixgbe` (`NDO set VF 0 link state 1 - not supported`),

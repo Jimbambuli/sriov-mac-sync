@@ -206,9 +206,10 @@ impl Topology {
         out
     }
 
-    /// Interfaces with virtual functions that end up in a bridge, possibly
-    /// through a bond. Without a bridge there is nothing behind them that
-    /// their VFs could be missing.
+    /// Interfaces that carry a bridge over an eSwitch: a NIC with virtual
+    /// functions, or a virtual function itself where one stands in for the
+    /// physical port. Both have to end up in a bridge, possibly through a
+    /// bond - without one there is nothing behind them to be missed.
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut pairs = Vec::new();
         let mut skipped = Vec::new();
@@ -216,20 +217,36 @@ impl Topology {
         names.sort();
         for name in names {
             let link = &self.links[name];
-            if link.numvfs == 0 {
+            let has_vfs = link.numvfs > 0;
+            if !has_vfs && link.physfn.is_none() {
                 continue;
             }
             match self.bridge_above(name) {
                 Some((br, port)) => {
+                    // A VF cannot stand in for a port its own PF already
+                    // holds: both would claim the same addresses, on two
+                    // vports of one eSwitch.
+                    if let Some(pf) = &link.physfn {
+                        if self.bridge_above(pf).map(|(b, _)| b).as_deref() == Some(&br) {
+                            skipped.push(format!("skip {name}: {pf} already carries {br}"));
+                            continue;
+                        }
+                    }
                     if &port != name {
                         skipped.push(format!("{name} reaches {br} through {port}"));
                     }
                     pairs.push((name.clone(), br));
                 }
-                None => skipped.push(format!(
-                    "skip {name}: {} VF(s) but does not end up in a bridge",
-                    link.numvfs
-                )),
+                // A VF outside a bridge is the ordinary case - it belongs to
+                // a guest. Only a NIC handing out VFs is worth remarking on.
+                None => {
+                    if has_vfs {
+                        skipped.push(format!(
+                            "skip {name}: {} VF(s) but does not end up in a bridge",
+                            link.numvfs
+                        ));
+                    }
+                }
             }
         }
         (pairs, skipped)
@@ -287,6 +304,11 @@ pub(crate) mod fixture {
 
         pub fn vfs(mut self, n: u32) -> Self {
             self.last().numvfs = n;
+            self
+        }
+
+        pub fn physfn(mut self, pf: &str) -> Self {
+            self.last().physfn = Some(pf.to_string());
             self
         }
 
@@ -410,6 +432,56 @@ mod tests {
         assert!(
             skipped.iter().any(|s| s.contains("loose")),
             "a NIC with VFs but no bridge is reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn autodetect_takes_a_vf_that_carries_the_bridge() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .add("nic1v0", 3, Some(mac(2)))
+            .physfn("nic1")
+            .add("nic1v1", 4, Some(mac(3)))
+            .physfn("nic1")
+            .master("br0")
+            .add("br0", 10, Some(mac(3)))
+            .bridge()
+            .lower("nic1v1")
+            .build();
+        let (pairs, skipped) = t.autodetect();
+        assert_eq!(pairs, vec![("nic1v1".to_string(), "br0".to_string())]);
+        assert!(
+            !skipped.iter().any(|s| s.contains("nic1v0")),
+            "a VF sitting idle belongs to a guest and is not a finding"
+        );
+        assert!(
+            skipped.iter().any(|s| s.contains("skip nic1:")),
+            "the PF itself has VFs and no bridge, which is worth saying"
+        );
+    }
+
+    #[test]
+    fn autodetect_leaves_a_vf_alone_when_its_pf_holds_the_bridge() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .master("br0")
+            .add("nic1v0", 3, Some(mac(2)))
+            .physfn("nic1")
+            .master("br0")
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("nic1")
+            .lower("nic1v0")
+            .build();
+        let (pairs, skipped) = t.autodetect();
+        assert_eq!(pairs, vec![("nic1".to_string(), "br0".to_string())]);
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("nic1v0") && s.contains("already carries")),
+            "two vports must not claim the same addresses"
         );
     }
 
