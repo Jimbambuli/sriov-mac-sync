@@ -26,52 +26,54 @@ work, and that is exactly why the failure is so confusing: address resolution
 succeeds, and the unicast that follows disappears.
 
 ```
-   wire A ── NIC 1 ─┬─ PF1 ──┐
-                    └─ VF1   │              ┌── tap    (a VM)
-                             ├──── br0 ─────┼── veth   (a container)
-   wire B ── NIC 2 ─┬─ PF2 ──┘              └── eth1 ──── wire C
-                    └─ VF2
+   physical                        virtual
+   ────────                        ───────
+
+                            ┌─── VF1    (a guest)
+   wire A ────── PF ─┬──────┤
+                     │      └─── VF2    (another guest)
+                     │
+                     └── br0 ─┬─── tap    (a VM)
+                              ├─── veth   (a container)
+   wire B ──── eth1 ──────────┘
 ```
 
-Two SR-IOV NICs and one ordinary one, all three of them ports of `br0`, plus a
-VM and a container on the same bridge. `VF1` and `VF2` are ports of nothing:
-each hangs off its own NIC's internal switch, and that switch knows the
-addresses of that NIC's vports and nothing else.
+`wire A`, the `PF` and `eth1` are real; `VF1`, `VF2`, `tap` and `veth` are not.
+The junction at the PF is the NIC's own switch: it joins the wire, the PF and
+both VFs, and the only addresses it knows are those three vports'. `br0`'s
+ports are the `PF`, `eth1`, the `tap` and the `veth` — the VFs are ports of
+nothing.
 
 Here is every destination a guest holding `VF1` might want, and what becomes of
-it before this daemon does anything. `VF2` is the mirror image.
+it before this daemon does anything.
 
 | From VF1, to … | Without this daemon | Why |
 |---|---|---|
 | a peer on **wire A** | fine | the miss action is *send it out*, and out is where it is |
-| **another VF on NIC 1** | fine | same internal switch, and it knows its own vports |
-| the **host**, when `br0` carries PF1's address | fine | that is a vport address too |
-| the **host**, when `br0` carries an address of its own | **lost** | the switch has never heard of it |
-| **tap** — a VM on the bridge | **lost** | it is behind the uplink, and the frame goes past it onto the wire |
-| **veth** — a container on the bridge | **lost** | same |
-| a peer on **wire C**, behind the ordinary NIC | **lost** | reaching it means going *through* the bridge, not past it |
-| a peer on **wire B**, behind the *other* SR-IOV NIC | **lost** | out of NIC 1 is the wrong wire |
-| **VF2**, on the other NIC | **lost** | its address lives in NIC 2's switch, not in NIC 1's |
+| **VF2**, the other VF on the same NIC | fine | same switch, and it knows its own vports |
+| the **host**, when `br0` carries the PF's address | fine | that is a vport address too |
 | **broadcast or multicast**, anywhere | fine | flooded to every vport — which is exactly why ARP and ND mislead you |
+| the **host**, when `br0` carries an address of its own | **lost** | the switch has never heard of it |
+| **tap** — a VM on the bridge | **lost** | it sits behind the PF, and the frame goes past it onto the wire |
+| **veth** — a container on the bridge | **lost** | same |
+| a peer on **wire B**, behind the second NIC | **lost** | reaching it means going *through* the bridge, not past it |
 
-Two of those rows depend on how the cables are patched. If wire B or wire C is
-the same physical segment as wire A, frames sent out of NIC 1 do reach those
-peers — by luck rather than by design. The moment the segments differ, or that
-switch is powered down, they stop.
+That last row depends on how the cables are patched: if wire B is the same
+physical segment as wire A, frames sent out of the PF do reach those peers — by
+luck rather than by design, and the moment the segments differ, or that switch
+is powered down, they stop.
 
 The opposite direction never breaks, and neither does anything that does not
-involve a VF:
+involve a VF at all:
 
 | | | Why |
 |---|---|---|
 | anything → **VF1** | fine | a VF address is a vport address, and its own switch knows it |
-| tap ↔ veth, tap → wire, host → anything | fine | ordinary bridging; no internal switch is asked |
+| tap ↔ veth, tap → wire, host → anything | fine | ordinary bridging; the NIC's switch is never asked |
 
-Registering an address turns every **lost** above into **fine**: the switch
-then has a hit and hands the frame to the uplink, where the bridge takes over.
-With two SR-IOV NICs each keeps its own list, and an address on wire A — left
-out of NIC 1's list because that is where it already goes — is registered on
-NIC 2, which is what makes it reachable from `VF2` at all.
+Registering an address turns every **lost** above into **fine**: the switch has
+a hit, hands the frame to the PF, and the bridge takes over from there. Both
+VFs are served by the same list — one per uplink, not one per guest.
 
 ## The fix
 
