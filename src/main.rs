@@ -45,6 +45,7 @@ struct Options {
     interval: u64,
     max_macs: usize,
     exclude: Vec<String>,
+    extra: Vec<String>,
     dry_run: bool,
     verbose: bool,
 }
@@ -57,6 +58,7 @@ impl Default for Options {
             interval: 30,
             max_macs: 128,
             exclude: Vec::new(),
+            extra: Vec::new(),
             dry_run: false,
             verbose: false,
         }
@@ -81,13 +83,14 @@ usage: sriov-mac-sync [options]
   --interval SEC  full reconciliation interval (default 30)
   --max NUM       warn above this many addresses per uplink (default 128)
   --exclude MACS  comma separated addresses never to register
+  --extra MACS    comma separated addresses to register unconditionally
   -v, --verbose   explain what is skipped and why
   -h, --help      this text
       --version   print the version
 
 Pairs are found automatically: every interface with virtual functions that ends
 up in a bridge, following bonds. {CONF} may set PAIRS, RESYNC,
-MAX_MACS and EXCLUDE.
+MAX_MACS, EXCLUDE and EXTRA.
 "
     );
 }
@@ -117,6 +120,12 @@ fn load_conf(opts: &mut Options) {
                     opts.max_macs = v;
                 }
             }
+            "EXTRA" => opts.extra.extend(
+                value
+                    .split([',', ' '])
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            ),
             "EXCLUDE" => opts.exclude.extend(
                 value
                     .split([',', ' '])
@@ -155,6 +164,13 @@ fn parse_args(opts: &mut Options) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--max needs a number")?
             }
+            "--extra" => opts.extra.extend(
+                args.next()
+                    .ok_or("--extra needs addresses")?
+                    .split([',', ' '])
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            ),
             "--exclude" => opts.exclude.extend(
                 args.next()
                     .ok_or("--exclude needs addresses")?
@@ -325,6 +341,11 @@ fn run() -> Result<bool, String> {
     syncer.dry_run = opts.dry_run;
     syncer.exclude = opts
         .exclude
+        .iter()
+        .filter_map(|s| parse_mac(s))
+        .collect::<HashSet<_>>();
+    syncer.extra = opts
+        .extra
         .iter()
         .filter_map(|s| parse_mac(s))
         .collect::<HashSet<_>>();

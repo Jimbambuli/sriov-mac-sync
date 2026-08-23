@@ -35,6 +35,8 @@ pub struct Syncer {
     pub pairs: Vec<Pair>,
     pub max_macs: usize,
     pub exclude: HashSet<Mac>,
+    /// addresses to register whether or not a bridge has learnt them
+    pub extra: HashSet<Mac>,
     pub dry_run: bool,
     pub state_dir: PathBuf,
     owned: HashMap<String, HashSet<Mac>>,
@@ -46,6 +48,7 @@ impl Syncer {
             pairs,
             max_macs: 128,
             exclude: HashSet::new(),
+            extra: HashSet::new(),
             dry_run: false,
             state_dir,
             owned: HashMap::new(),
@@ -195,7 +198,23 @@ impl Syncer {
             }
         }
 
+        // Addresses pinned by configuration are registered even when nothing
+        // has been heard from them yet - for a device that never speaks first,
+        // or to close the gap before a guest's first frame.
+        want.extend(self.extra.iter().copied());
+
         want.retain(|m| !skip.contains(m) && m[0] & 1 == 0);
+
+        for m in &self.extra {
+            if !want.contains(m) {
+                eprintln!(
+                    "warning: {}: pinned address {} not registered - it is the host's own, \
+                     or the bridge has it out on the wire",
+                    pair.dev,
+                    format_mac(m)
+                );
+            }
+        }
         let mut stacked: Vec<String> = relevant.into_values().collect();
         stacked.sort();
         (want, stacked)
@@ -382,22 +401,22 @@ impl Syncer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::netlink::FdbEntry;
     use crate::sysfs::fixture::{mac, Builder};
 
-    const WIRE: Mac = [0xaa, 0, 0, 0, 0, 1]; // a peer out on the switch
-    const BEHIND_NIC: Mac = [0xaa, 0, 0, 0, 0, 2]; // on the bridge's other NIC
-    const BEHIND_GUEST: Mac = [0xaa, 0, 0, 0, 0, 3]; // a container, seen by a vnet
-    const UPLINK_WARD: Mac = [0xaa, 0, 0, 0, 0, 4]; // seen by a vnet on its way down
-    const OTHER_BRIDGE: Mac = [0xaa, 0, 0, 0, 0, 5]; // nothing to do with this uplink
-    const VF_ADMIN: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 1];
-    const MCAST: Mac = [0x01, 0x00, 0x5e, 0, 0, 1];
+    pub(crate) const WIRE: Mac = [0xaa, 0, 0, 0, 0, 1]; // a peer out on the switch
+    pub(crate) const BEHIND_NIC: Mac = [0xaa, 0, 0, 0, 0, 2]; // on the bridge's other NIC
+    pub(crate) const BEHIND_GUEST: Mac = [0xaa, 0, 0, 0, 0, 3]; // a container, seen by a vnet
+    pub(crate) const UPLINK_WARD: Mac = [0xaa, 0, 0, 0, 0, 4]; // seen by a vnet on its way down
+    pub(crate) const OTHER_BRIDGE: Mac = [0xaa, 0, 0, 0, 0, 5]; // nothing to do with this uplink
+    pub(crate) const VF_ADMIN: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 1];
+    pub(crate) const MCAST: Mac = [0x01, 0x00, 0x5e, 0, 0, 1];
 
     /// A learnt entry: not permanent, not `self`, so the bridge picked it up
     /// from traffic.
-    fn learned(ifindex: u32, master: u32, mac: Mac) -> FdbEntry {
+    pub(crate) fn learned(ifindex: u32, master: u32, mac: Mac) -> FdbEntry {
         FdbEntry {
             ifindex,
             master: Some(master),
@@ -409,7 +428,7 @@ mod tests {
 
     /// nic1 and nic2 in vmbr1, a vnet bridge IOT stacked on vmbr1.44 with a
     /// container on it, and an unrelated vmbr0 carrying a VM tap.
-    fn host(bridge_mac: [u8; 6]) -> crate::sysfs::Topology {
+    pub(crate) fn host(bridge_mac: [u8; 6]) -> crate::sysfs::Topology {
         Builder::new()
             .add("nic1", 2, Some(mac(1)))
             .master("vmbr1")
@@ -441,7 +460,7 @@ mod tests {
             .build()
     }
 
-    fn fdb() -> Vec<FdbEntry> {
+    pub(crate) fn fdb() -> Vec<FdbEntry> {
         vec![
             learned(2, 10, WIRE),          // on the uplink itself
             learned(3, 10, BEHIND_NIC),    // on the bridge's other NIC
@@ -460,11 +479,11 @@ mod tests {
         ]
     }
 
-    fn syncer() -> Syncer {
+    pub(crate) fn syncer() -> Syncer {
         Syncer::new(Vec::new(), PathBuf::from("/nonexistent"))
     }
 
-    fn pair() -> Pair {
+    pub(crate) fn pair() -> Pair {
         Pair {
             dev: "nic1".into(),
             bridge: "vmbr1".into(),
@@ -615,5 +634,37 @@ mod tests {
             !want.contains(&mac(2)),
             "a bond member's address is the host's own"
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::sysfs::fixture::mac;
+
+    #[test]
+    fn pinned_addresses_are_registered_without_being_learnt() {
+        let unheard: Mac = [0xaa, 0, 0, 0, 0, 0x42];
+        let topo = host(mac(1));
+        let mut s = syncer();
+        s.extra.insert(unheard);
+        let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        assert!(
+            want.contains(&unheard),
+            "nothing has ever been heard from it"
+        );
+    }
+
+    /// Pinning must not become a way to break the wire.
+    #[test]
+    fn pinning_cannot_override_the_wire_side() {
+        let topo = host(mac(1));
+        let mut s = syncer();
+        s.extra.insert(WIRE);
+        s.extra.insert(mac(1));
+        let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        assert!(!want.contains(&WIRE), "it lives out on the wire");
+        assert!(!want.contains(&mac(1)), "it is the uplink's own address");
     }
 }

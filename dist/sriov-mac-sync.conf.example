@@ -14,3 +14,7 @@
 
 # Addresses never to register, comma or space separated.
 #EXCLUDE=""
+
+# Addresses to register unconditionally, for a device that never speaks first.
+# The wire-side and own-address rules still override this.
+#EXTRA=""
