@@ -193,8 +193,17 @@ Measured working:
 |---|---|---|
 | Mellanox ConnectX-4 Lx | `mlx5_core` | a network namespace on the VF, and a FreeBSD guest holding the VF |
 | Mellanox ConnectX-3 Pro | `mlx4_core` | a network namespace on the VF |
-| Intel 82599ES | `ixgbe` | a network namespace on the VF, against the real neighbours of a live bridge |
+| Intel 82599ES | `ixgbe` | a network namespace and a Windows 11 guest, against the real neighbours of a live bridge |
 | Intel X710 | `i40e` | a network namespace on the VF |
+
+The clearest run was the Windows one, because the frames could be watched
+leaving. The uplink's wire went to a second NIC in the same machine, so both
+ends were visible at once. With nothing registered, 60 unicast frames from the
+guest went out onto the cable in twenty seconds and none reached the bridge —
+whose other ports were an inch away. One `--once` reversed it exactly: none on
+the cable, and they arrived. `--flush` sent them back out. Broadcast came
+through the whole time, which is why the guest had an address and looked
+connected.
 
 Two Mellanox generations and two Intel ones, all in legacy eswitch mode, all
 with the same signature: a peer behind the bridge is unreachable while ARP for
