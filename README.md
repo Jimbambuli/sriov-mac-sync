@@ -26,23 +26,27 @@ work, and that is exactly why the failure is so confusing: address resolution
 succeeds, and the unicast that follows disappears.
 
 ```
-   physical                        virtual
-   ────────                        ───────
-
-                            ┌─── VF1    (a guest)
-   wire A ────── PF ─┬──────┤
-                     │      └─── VF2    (another guest)
-                     │
-                     └── br0 ─┬─── tap    (a VM)
-                              ├─── veth   (a container)
-   wire B ──── eth1 ──────────┘
+guests        VF1         VF2               tap         veth
+            a guest     a guest            a VM      a container
+               │           │                 │            │
+               │           │       ┌─────────┴────────────┴───────┐
+bridge         │           │       │             br0              │
+               │           │       └───┬──────────────────────┬───┘
+               │           │           │                      │
+         ┌─────┴───────────┴───────────┴────────────┐   ┌─────┴─────┐
+NICs     │  NIC 1 — its own switch    PF            │   │   eth1    │
+         └────────────────────┬─────────────────────┘   └─────┬─────┘
+                              │                               │
+wires                      wire A                          wire B
 ```
 
-`wire A`, the `PF` and `eth1` are real; `VF1`, `VF2`, `tap` and `veth` are not.
-The junction at the PF is the NIC's own switch: it joins the wire, the PF and
-both VFs, and the only addresses it knows are those three vports'. `br0`'s
-ports are the `PF`, `eth1`, the `tap` and the `veth` — the VFs are ports of
-nothing.
+Read it from the bottom up. The two VFs come out of the NIC and go straight to
+their guests — past `br0`, not through it. The PF comes out of the same NIC and
+*is* a port of the bridge, alongside `eth1` and the guests' `tap` and `veth`.
+
+The junction inside NIC 1 is its own switch. The only addresses it knows are
+the three that hang off it: the PF's and the two VFs'. Everything in the bridge
+above is invisible to it.
 
 Here is every destination a guest holding `VF1` might want, and what becomes of
 it before this daemon does anything.
@@ -158,6 +162,10 @@ sriov-mac-sync --flush              remove what this daemon registered
 sriov-mac-sync -v ...               explain what is skipped, and list addresses
 ```
 
+`--extra <macs>` registers addresses unconditionally, for a device that never
+speaks first; the wire-side and own-address rules still override it, and you
+get a warning when they do. `--exclude <macs>` is its opposite.
+
 Pairs are found automatically: any interface with VFs that ends up in a bridge.
 Override with `--pair DEV:BRIDGE`, repeatable. `/etc/sriov-mac-sync.conf` may
 set `PAIRS`, `RESYNC`, `MAX_MACS` and `EXCLUDE`.
@@ -210,6 +218,21 @@ the next attempt to reach such a device starts with an ARP or ND, which is
 broadcast and gets through, and the reply repopulates both the bridge and the
 list.
 
+**The filter list knows nothing about VLANs.** There is no room for one:
+`bridge fdb add <mac> dev <uplink> self permanent vlan 22` is refused with
+`Invalid argument`. One entry covers a MAC in every VLAN, which is usually what
+you want — a router holding one address across a dozen VLANs collapses to a
+single entry, and a bridge that learnt it a dozen times still needs registering
+only once.
+
+The corollary is that registering is all-or-nothing. If an address is on the
+wire in one VLAN and behind the bridge in another, there is no way to say so,
+and this daemon takes the cautious side: an address the bridge has learnt on
+the uplink in *any* VLAN is left out entirely, because diverting working
+traffic is worse than leaving one path unreachable. Assigning a VF to a VLAN is
+a separate matter and works normally, either from the PF (`ip link set <pf> vf
+N vlan 22`) or by the guest itself when the VF is trusted.
+
 **This daemon only removes what it added.** It keeps a note in
 `/run/sriov-mac-sync/`; entries put there by something else are left alone.
 
@@ -233,6 +256,34 @@ own neighbour solicitations come back to it, FreeBSD spots the loop, restarts
 duplicate address detection, and never finishes — the address stays `tentative`
 and IPv6 on that interface is dead. Set both to `0`. This has nothing to do
 with this daemon, but you will hit it in the same afternoon.
+
+## Prior art
+
+The mechanism is not new. A [Proxmox forum
+thread](https://forum.proxmox.com/threads/communication-issue-between-sriov-vm-vf-and-ct-on-pf-bridge.68638/)
+worked it out years ago, and
+[jdlayman/pve-hookscript-sriov](https://github.com/jdlayman/pve-hookscript-sriov)
+packages it as a Proxmox hookscript: on guest start it reads the guest's MAC
+out of the PVE config, walks the bridge's ports to find one with virtual
+functions, follows bonds on the way, and registers the address — the same
+`bridge fdb add` this daemon issues over netlink. On guest stop it removes it
+again. If your guests are the only thing you need to reach, that script is
+smaller than this and does the job.
+
+Two things led to this being written instead:
+
+**Only configured guests are covered.** A hookscript knows what is in
+`/etc/pve`; it cannot know about the wireless client that just associated, the
+printer on the second NIC, or the host's own address on the bridge. Those are
+learnt, not configured, and they are the majority on a real segment.
+
+**A stacked bridge hides the uplink.** The hookscript looks for a NIC with VFs
+among the ports of the bridge named in the guest's config. On a VLAN-aware
+setup — Proxmox SDN vnets, for instance — that bridge's ports are a VLAN
+interface and some veths; the NIC is a layer further down and is never found,
+so nothing is registered at all. Working out the uplink structurally, through
+`master` chains and `lower_*` links, is most of what this daemon does before it
+registers anything.
 
 ## What this is not
 
