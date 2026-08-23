@@ -38,8 +38,12 @@ pub struct Syncer {
     /// addresses to register whether or not a bridge has learnt them
     pub extra: HashSet<Mac>,
     pub dry_run: bool,
+    /// Whether the pair list is the whole picture. It is when autodetection
+    /// drew it, and it is not when somebody named pairs by hand - and only
+    /// something that knows every uplink may decide that a note belongs to
+    /// none of them.
+    pub authoritative: bool,
     pub state_dir: PathBuf,
-    owned: HashMap<String, HashSet<Mac>>,
 }
 
 impl Syncer {
@@ -50,8 +54,8 @@ impl Syncer {
             exclude: HashSet::new(),
             extra: HashSet::new(),
             dry_run: false,
+            authoritative: false,
             state_dir,
-            owned: HashMap::new(),
         }
     }
 
@@ -62,10 +66,12 @@ impl Syncer {
     /// What this daemon put there itself. Kept on disk so a restart does not
     /// have to choose between forgetting its entries and claiming everybody
     /// else's.
-    fn load_owned(&mut self, dev: &str) -> HashSet<Mac> {
-        if let Some(set) = self.owned.get(dev) {
-            return set.clone();
-        }
+    /// Read afresh every time rather than from a copy in memory. `--once` and
+    /// `--flush` write these same files while the daemon runs, and a daemon
+    /// working from a remembered copy would carry on believing it owns
+    /// entries that somebody has since taken from it - and never clean them
+    /// up again.
+    fn load_owned(&self, dev: &str) -> HashSet<Mac> {
         let mut set = HashSet::new();
         if let Ok(text) = fs::read_to_string(self.state_path(dev)) {
             for line in text.lines() {
@@ -74,24 +80,86 @@ impl Syncer {
                 }
             }
         }
-        self.owned.insert(dev.to_string(), set.clone());
         set
     }
 
-    fn save_owned(&mut self, dev: &str, set: &HashSet<Mac>) {
-        // Most passes change nothing. Rewriting the note every time would be
-        // pointless work on every host that is simply idle.
-        if self.owned.get(dev) == Some(set) && self.state_path(dev).exists() {
-            return;
-        }
-        self.owned.insert(dev.to_string(), set.clone());
+    fn save_owned(&self, dev: &str, set: &HashSet<Mac>) {
         if self.dry_run {
             return;
         }
-        let _ = fs::create_dir_all(&self.state_dir);
         let mut lines: Vec<String> = set.iter().map(format_mac).collect();
         lines.sort();
-        let _ = fs::write(self.state_path(dev), lines.join("\n") + "\n");
+        let text = lines.join("\n") + "\n";
+        // Most passes change nothing, and rewriting the note every time would
+        // be pointless work on a host that is simply idle.
+        if fs::read_to_string(self.state_path(dev)).ok().as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let _ = fs::create_dir_all(&self.state_dir);
+        // Through a temporary file: a note truncated by a crash mid-write
+        // would read as "we own nothing" and strand every entry in it.
+        let tmp = self.state_path(&format!("{dev}.new"));
+        if fs::write(&tmp, &text).is_ok() && fs::rename(&tmp, self.state_path(dev)).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// Devices this daemon has a note for. A note outlives the pair it was
+    /// made for on purpose: when a bridge is taken apart, what we put in that
+    /// device's filter still has to come back out.
+    fn noted_devices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(&self.state_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if let Some(dev) = name.strip_suffix(".owned") {
+                    out.push(dev.to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Take back what was registered for a device that is no longer an uplink.
+    /// Left alone, the card goes on steering those addresses to a port that
+    /// leads nowhere, and nothing short of a reboot undoes it.
+    fn orphaned(&self) -> Vec<String> {
+        if !self.authoritative {
+            return Vec::new();
+        }
+        let live: HashSet<&str> = self.pairs.iter().map(|p| p.dev.as_str()).collect();
+        self.noted_devices()
+            .into_iter()
+            .filter(|d| !live.contains(d.as_str()))
+            .collect()
+    }
+
+    fn drop_orphans(&self, sock: &mut Socket, topo: &Topology, apply: bool) {
+        for dev in self.orphaned() {
+            let owned = self.load_owned(&dev);
+            if owned.is_empty() {
+                let _ = fs::remove_file(self.state_path(&dev));
+                continue;
+            }
+            if !apply || self.dry_run {
+                eprintln!(
+                    "{dev}: no longer an uplink, {} address(es) still registered",
+                    owned.len()
+                );
+                continue;
+            }
+            if let Some(link) = topo.get(&dev) {
+                for mac in &owned {
+                    let _ = sock.set_self_fdb(link.index, mac, false);
+                }
+            }
+            eprintln!(
+                "{dev}: no longer an uplink, removed {} address(es)",
+                owned.len()
+            );
+            let _ = fs::remove_file(self.state_path(&dev));
+        }
     }
 
     /// The addresses that belong in `pair`'s filter list, and the ones that
@@ -247,6 +315,7 @@ impl Syncer {
         // A failed pass is harmless; a pass on incomplete information is not.
         let vf_macs = sock.dump_vf_macs()?;
         let mut reports = Vec::new();
+        self.drop_orphans(sock, &topo, apply);
 
         for pair in self.pairs.clone() {
             let Some(dev_link) = topo.get(&pair.dev) else {
@@ -405,18 +474,21 @@ impl Syncer {
         Ok(())
     }
 
+    /// Over the notes rather than over the pairs: `--flush` promises to remove
+    /// every address this daemon registered, and some of them belong to
+    /// devices that have since stopped being an uplink.
     pub fn flush(&mut self, sock: &mut Socket) -> io::Result<()> {
         let topo = Topology::load()?;
-        for pair in self.pairs.clone() {
-            let owned = self.load_owned(&pair.dev);
+        for dev in self.noted_devices() {
+            let owned = self.load_owned(&dev);
             let n = owned.len();
-            if let Some(link) = topo.get(&pair.dev) {
+            if let Some(link) = topo.get(&dev) {
                 for mac in &owned {
                     let _ = sock.set_self_fdb(link.index, mac, false);
                 }
             }
-            self.save_owned(&pair.dev, &HashSet::new());
-            println!("{}: removed {} address(es)", pair.dev, n);
+            let _ = fs::remove_file(self.state_path(&dev));
+            println!("{dev}: removed {n} address(es)");
         }
         Ok(())
     }
@@ -711,11 +783,11 @@ mod state_tests {
         set.insert(BEHIND_NIC);
         set.insert(BEHIND_GUEST);
 
-        let mut before = Syncer::new(Vec::new(), dir.clone());
+        let before = Syncer::new(Vec::new(), dir.clone());
         before.save_owned("nic1", &set);
         assert!(dir.join("nic1.owned").exists());
 
-        let mut after = Syncer::new(Vec::new(), dir.clone());
+        let after = Syncer::new(Vec::new(), dir.clone());
         assert_eq!(after.load_owned("nic1"), set);
         assert!(
             after.load_owned("nic0").is_empty(),
@@ -725,29 +797,117 @@ mod state_tests {
     }
 
     /// Most passes change nothing; those must not touch the disk.
+    fn set_mtime(path: &std::path::Path, secs: i64) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let t = libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        };
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), [t, t].as_ptr()) }, 0);
+    }
+
+    fn mtime(path: &std::path::Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().mtime()
+    }
+
+    #[test]
+    fn a_device_that_stopped_being_an_uplink_is_noticed() {
+        let dir = scratch("orphan");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+
+        let mut s = Syncer::new(
+            vec![Pair {
+                dev: "nic1".into(),
+                bridge: "br0".into(),
+            }],
+            dir.clone(),
+        );
+        s.authoritative = true;
+        s.save_owned("nic1", &set);
+        s.save_owned("nic0", &set); // was an uplink once, is not one now
+        assert_eq!(
+            s.orphaned(),
+            vec!["nic0".to_string()],
+            "a note without a pair is an orphan; one with a pair is not"
+        );
+
+        let mut none = Syncer::new(Vec::new(), dir.clone());
+        none.authoritative = true;
+        assert_eq!(
+            none.orphaned(),
+            vec!["nic0".to_string(), "nic1".to_string()],
+            "with no pairs left, everything registered has to come back out"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_pairs_do_not_get_to_declare_anything_an_orphan() {
+        let dir = scratch("no-authority");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+
+        // `--once --pair nic0:vmbr0` next to a running daemon that also looks
+        // after nic1 must not take nic1's addresses away.
+        let s = Syncer::new(
+            vec![Pair {
+                dev: "nic0".into(),
+                bridge: "vmbr0".into(),
+            }],
+            dir.clone(),
+        );
+        s.save_owned("nic1", &set);
+        assert!(
+            s.orphaned().is_empty(),
+            "a hand-written pair list says nothing about the pairs it omits"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_changed_behind_our_back_is_put_right() {
+        let dir = scratch("stale-note");
+        let mut set = HashSet::new();
+        set.insert(BEHIND_NIC);
+
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        // What `--flush` from a second process leaves behind.
+        fs::write(dir.join("nic1.owned"), "").unwrap();
+
+        assert!(
+            s.load_owned("nic1").is_empty(),
+            "the file is the truth, not a copy in memory"
+        );
+        s.save_owned("nic1", &set);
+        assert_eq!(
+            s.load_owned("nic1"),
+            set,
+            "and a note that disagrees with the set gets written again"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_unchanged_set_is_not_written_again() {
         let dir = scratch("idle");
         let mut set = HashSet::new();
         set.insert(BEHIND_NIC);
 
-        let mut s = Syncer::new(Vec::new(), dir.clone());
+        let s = Syncer::new(Vec::new(), dir.clone());
         s.save_owned("nic1", &set);
-        fs::write(dir.join("nic1.owned"), "beruehrt\n").unwrap();
+        let path = dir.join("nic1.owned");
+        // Backdated, so a rewrite cannot hide in the clock's resolution.
+        set_mtime(&path, 1_000_000_000);
         s.save_owned("nic1", &set);
-        assert_eq!(
-            fs::read_to_string(dir.join("nic1.owned")).unwrap(),
-            "beruehrt\n",
-            "unchanged means untouched"
-        );
+        assert_eq!(mtime(&path), 1_000_000_000, "unchanged means untouched");
 
         set.insert(BEHIND_GUEST);
         s.save_owned("nic1", &set);
         assert_eq!(
-            fs::read_to_string(dir.join("nic1.owned"))
-                .unwrap()
-                .lines()
-                .count(),
+            fs::read_to_string(&path).unwrap().lines().count(),
             2,
             "a changed set is written"
         );
@@ -760,7 +920,7 @@ mod state_tests {
         let dir = scratch("vanish");
         let mut set = HashSet::new();
         set.insert(BEHIND_NIC);
-        let mut s = Syncer::new(Vec::new(), dir.clone());
+        let s = Syncer::new(Vec::new(), dir.clone());
         s.save_owned("nic1", &set);
         fs::remove_file(dir.join("nic1.owned")).unwrap();
         s.save_owned("nic1", &set);

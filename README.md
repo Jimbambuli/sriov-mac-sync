@@ -267,6 +267,15 @@ N vlan 22`) or by the guest itself when the VF is trusted.
 
 **This daemon only removes what it added.** It keeps a note in
 `/run/sriov-mac-sync/`; entries put there by something else are left alone.
+The note outlives the pair it was made for on purpose: when a device stops
+being an uplink - the bridge is taken apart, the port moves elsewhere - what
+was registered for it is taken back out. Left in place it would go on telling
+the card to steer those addresses at a port that leads nowhere, and nothing
+short of a reboot would undo it.
+
+Only autodetection may draw that conclusion. Naming pairs by hand with
+`--pair` says nothing about the pairs it omits, so a `--once --pair a:br0`
+run beside a daemon looking after `b` leaves `b` alone.
 
 **A bridge port without a carrier does not forward.** Testing this on a bench
 with nothing plugged into the SR-IOV NIC will fail for a reason that has

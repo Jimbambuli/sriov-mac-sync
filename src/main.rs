@@ -102,6 +102,23 @@ MAX_MACS, EXCLUDE and EXTRA.
     );
 }
 
+/// Addresses from the command line or the configuration file. A typo here
+/// used to vanish without a word - and an address that was meant to be pinned
+/// and silently was not is exactly the kind of thing somebody spends an
+/// evening looking for in the wrong place.
+fn macs(what: &str, given: &[String]) -> HashSet<[u8; 6]> {
+    let mut out = HashSet::new();
+    for s in given {
+        match parse_mac(s) {
+            Some(m) => {
+                out.insert(m);
+            }
+            None => eprintln!("warning: {what}: not an address, ignored: {s}"),
+        }
+    }
+    out
+}
+
 fn load_conf(opts: &mut Options) {
     let Ok(text) = std::fs::read_to_string(CONF) else {
         return;
@@ -117,16 +134,14 @@ fn load_conf(opts: &mut Options) {
             "PAIRS" => opts
                 .pairs
                 .extend(value.split_whitespace().map(|s| s.to_string())),
-            "RESYNC" => {
-                if let Ok(v) = value.parse() {
-                    opts.interval = v;
-                }
-            }
-            "MAX_MACS" => {
-                if let Ok(v) = value.parse() {
-                    opts.max_macs = v;
-                }
-            }
+            "RESYNC" => match value.parse() {
+                Ok(v) => opts.interval = v,
+                Err(_) => eprintln!("warning: {CONF}: RESYNC is not a number, ignored: {value}"),
+            },
+            "MAX_MACS" => match value.parse() {
+                Ok(v) => opts.max_macs = v,
+                Err(_) => eprintln!("warning: {CONF}: MAX_MACS is not a number, ignored: {value}"),
+            },
             "EXTRA" => opts.extra.extend(
                 value
                     .split([',', ' '])
@@ -139,7 +154,9 @@ fn load_conf(opts: &mut Options) {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
             ),
-            _ => {}
+            // Silently ignoring a misspelt key means the setting somebody
+            // wrote down never takes effect and nothing ever says so.
+            other => eprintln!("warning: {CONF}: unknown setting, ignored: {other}"),
         }
     }
 }
@@ -466,16 +483,11 @@ fn run() -> Result<bool, String> {
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
     syncer.max_macs = opts.max_macs;
     syncer.dry_run = opts.dry_run;
-    syncer.exclude = opts
-        .exclude
-        .iter()
-        .filter_map(|s| parse_mac(s))
-        .collect::<HashSet<_>>();
-    syncer.extra = opts
-        .extra
-        .iter()
-        .filter_map(|s| parse_mac(s))
-        .collect::<HashSet<_>>();
+    // Only autodetection sees every uplink, so only autodetection may conclude
+    // that a leftover note belongs to none of them.
+    syncer.authoritative = opts.pairs.is_empty();
+    syncer.exclude = macs("--exclude", &opts.exclude);
+    syncer.extra = macs("--extra", &opts.extra);
 
     match opts.mode {
         Mode::Flush => {
@@ -635,7 +647,11 @@ fn run() -> Result<bool, String> {
                 }
 
                 // Let a burst settle, then make the full pass due at once.
-                while mon.wait(200).unwrap_or(false) {
+                // Bounded, because on a host whose neighbour table never goes
+                // quiet for 200 ms this would wait for a lull that never comes
+                // and the pass would never happen at all.
+                let settle_until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < settle_until && mon.wait(200).unwrap_or(false) {
                     let _ = mon.recv_events();
                 }
                 next_full = Instant::now();
