@@ -4,9 +4,12 @@
 # virtual functions that ends up in a bridge, following bonds.
 #PAIRS="nic1:vmbr1 nic0:vmbr0"
 
-# Seconds between full reconciliations. Newly learnt addresses are registered
-# immediately on the netlink notification regardless; this is the safety net.
-#RESYNC=30
+# Seconds between full reconciliations. This is paranoia, not the mechanism.
+# Addresses are registered the moment the kernel reports them, removed when the
+# bridge ages them out, and interface changes - a new NIC, a new bridge, a VF
+# whose address was set from the host - arrive as link notifications. The timed
+# pass exists only in case one of those is ever missed.
+#RESYNC=300
 
 # Warn above this many addresses per uplink. The vport list on ConnectX-4 Lx
 # holds 128; other hardware differs and the size cannot be queried.

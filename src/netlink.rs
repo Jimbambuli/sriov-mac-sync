@@ -19,6 +19,7 @@ pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
 
 const NLMSG_NOOP: u16 = 1;
@@ -59,6 +60,7 @@ const IFLA_VF_INFO: u16 = 1;
 const IFLA_VF_MAC: u16 = 1;
 const RTEXT_FILTER_VF: u32 = 1;
 
+const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_NEIGH: u32 = 3;
 
 const NLMSG_HDR: usize = 16;
@@ -126,6 +128,14 @@ pub struct LinkInfo {
     pub vf_macs: Vec<[u8; 6]>,
 }
 
+/// A batch of notifications: forwarding entries that changed, and whether any
+/// interface changed at all.
+#[derive(Debug, Default)]
+pub struct Events {
+    pub fdb: Vec<(u16, FdbEntry)>,
+    pub links_changed: bool,
+}
+
 pub struct Socket {
     fd: OwnedFd,
     seq: u32,
@@ -136,9 +146,14 @@ impl Socket {
         Self::open(0)
     }
 
-    /// A socket that also receives FDB change notifications.
+    /// A socket that also receives forwarding and interface notifications.
+    ///
+    /// Interfaces matter as much as addresses here: a NIC that gets virtual
+    /// functions, a bridge built after boot, or a VF whose address is set from
+    /// the host all change what belongs in the filter, and none of them moves
+    /// a single forwarding entry.
     pub fn subscribed() -> io::Result<Self> {
-        Self::open(1 << (RTNLGRP_NEIGH - 1))
+        Self::open((1 << (RTNLGRP_NEIGH - 1)) | (1 << (RTNLGRP_LINK - 1)))
     }
 
     fn open(groups: u32) -> io::Result<Self> {
@@ -420,15 +435,18 @@ impl Socket {
         Ok(())
     }
 
-    /// Block until the kernel reports a change, then return everything that
-    /// arrived. `None` means the notification was of no interest.
-    pub fn recv_events(&self) -> io::Result<Vec<(u16, FdbEntry)>> {
+    /// What arrived on the subscription since the last look.
+    pub fn recv_events(&self) -> io::Result<Events> {
         let mut buf = vec![0u8; 64 * 1024];
         // A notification that did not fit is no loss worth chasing: the full
         // pass that follows every wake-up sees the same state anyway.
         let n = self.recv(&mut buf)?.min(buf.len());
-        let mut out = Vec::new();
+        let mut out = Events::default();
         for msg in messages(&buf[..n]) {
+            if msg.kind == RTM_NEWLINK || msg.kind == RTM_DELLINK {
+                out.links_changed = true;
+                continue;
+            }
             if msg.kind != RTM_NEWNEIGH && msg.kind != RTM_DELNEIGH {
                 continue;
             }
@@ -442,7 +460,7 @@ impl Socket {
                 continue;
             }
             if let Some(e) = parse_fdb(msg.payload) {
-                out.push((msg.kind, e));
+                out.fdb.push((msg.kind, e));
             }
         }
         Ok(out)

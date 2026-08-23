@@ -57,7 +57,7 @@ impl Default for Options {
         Options {
             mode: Mode::Daemon,
             pairs: Vec::new(),
-            interval: 30,
+            interval: 300,
             max_macs: 128,
             exclude: Vec::new(),
             extra: Vec::new(),
@@ -87,7 +87,7 @@ usage: sriov-mac-sync [options]
                   relies on the faster one.
   --dry-run       report changes without applying them
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
-  --interval SEC  full reconciliation interval (default 30)
+  --interval SEC  full reconciliation interval (default 60)
   --max NUM       warn above this many addresses per uplink (default 128)
   --exclude MACS  comma separated addresses never to register
   --extra MACS    comma separated addresses to register unconditionally
@@ -290,7 +290,13 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair]) -> bool {
     ok
 }
 
-fn report_changes(reports: &[sync::Report], dry_run: bool, max_macs: usize, verbose: bool) {
+fn report_changes(
+    reports: &[sync::Report],
+    dry_run: bool,
+    max_macs: usize,
+    verbose: bool,
+    trigger: &str,
+) {
     for r in reports {
         if r.wanted.len() > max_macs {
             eprintln!(
@@ -311,7 +317,7 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, max_macs: usize, verb
         if r.added > 0 || r.removed > 0 {
             if dry_run {
                 eprintln!(
-                    "{}: would be +{} -{}, {} address(es) in total",
+                    "{}: would be +{} -{}, {} address(es) in total [{trigger}]",
                     r.dev,
                     r.added,
                     r.removed,
@@ -319,7 +325,7 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, max_macs: usize, verb
                 );
             } else {
                 eprintln!(
-                    "{}: +{} -{}, {} address(es) registered",
+                    "{}: +{} -{}, {} address(es) registered [{trigger}]",
                     r.dev,
                     r.added,
                     r.removed,
@@ -508,7 +514,7 @@ fn run() -> Result<bool, String> {
             let reports = syncer
                 .reconcile(&mut sock, true)
                 .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose);
+            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
             Ok(true)
         }
         Mode::Daemon => {
@@ -530,6 +536,9 @@ fn run() -> Result<bool, String> {
             // A deadline, not a sleep. Wake-ups that turn out to be none of our
             // business must not push the full pass further away.
             let mut next_full = Instant::now();
+            // Which of the three reasons for a pass actually produced work is
+            // the only way to tell whether the timed one earns its keep.
+            let mut trigger = "start";
 
             loop {
                 if Instant::now() >= next_full {
@@ -565,9 +574,13 @@ fn run() -> Result<bool, String> {
                         }
                     } else {
                         match syncer.reconcile(&mut sock, true) {
-                            Ok(reports) => {
-                                report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose)
-                            }
+                            Ok(reports) => report_changes(
+                                &reports,
+                                opts.dry_run,
+                                opts.max_macs,
+                                opts.verbose,
+                                trigger,
+                            ),
                             // One failed pass is no reason to give up: the next
                             // is seconds away and starts from the kernel's
                             // state again.
@@ -575,6 +588,7 @@ fn run() -> Result<bool, String> {
                         }
                     }
                     next_full = Instant::now() + interval;
+                    trigger = "timed";
                 }
 
                 let due = next_full.saturating_duration_since(Instant::now());
@@ -601,14 +615,19 @@ fn run() -> Result<bool, String> {
                         continue;
                     }
                 };
-                if events.is_empty() {
+                if events.fdb.is_empty() && !events.links_changed {
                     continue; // something else's neighbour, not a bridge's
                 }
+                trigger = if events.fdb.is_empty() {
+                    "interface change"
+                } else {
+                    "forwarding change"
+                };
 
                 // Register what just appeared before anything else, so the
                 // first reply to it is not sent into the void.
                 if let Ok(topo) = Topology::load() {
-                    for (kind, entry) in events {
+                    for (kind, entry) in events.fdb {
                         if kind == netlink::RTM_NEWNEIGH {
                             let _ = syncer.fast_add(&mut sock, &topo, &entry);
                         }

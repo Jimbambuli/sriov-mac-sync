@@ -172,7 +172,32 @@ get a warning when they do. `--exclude <macs>` is its opposite.
 
 Pairs are found automatically: any interface with VFs that ends up in a bridge.
 Override with `--pair DEV:BRIDGE`, repeatable. `/etc/sriov-mac-sync.conf` may
-set `PAIRS`, `RESYNC`, `MAX_MACS` and `EXCLUDE`.
+set `PAIRS`, `RESYNC`, `MAX_MACS`, `EXCLUDE` and `EXTRA`.
+
+`--compare-topology` reads the interface layout twice — once out of `/sys` and
+once out of a single netlink dump — and reports any field where the two
+disagree. It changes nothing, and exists so the faster path can be trusted
+before anything depends on it. Reports from unusual setups are welcome.
+
+The daemon works from notifications. An address is registered as soon as the
+kernel says a bridge learnt it, dropped when the bridge ages it out, and the
+whole picture is rebuilt whenever an interface appears, disappears or is
+reconfigured — including a virtual function whose address was set from the
+host, which changes what must be excluded without moving a single forwarding
+entry.
+
+`RESYNC` is the interval of a timed pass on top of that, and it has never been
+seen to do anything. Run at ten seconds on a host while deleting filter entries
+by hand, reassigning a VF's address to one that was registered, adding and
+removing bridge ports, and creating and destroying a dozen veths with traffic,
+every one of twenty-five corrections came from a notification and none from the
+timer. It is kept because "nothing could be provoked" is not "nothing exists",
+and because the failure it guards against — a missed notification — would
+otherwise be silent and permanent. It also doubles as a canary: a log line
+ending in `[timed]` means the notification path missed something, and is worth
+looking into.
+
+Every log line names what triggered the pass, for exactly that reason.
 
 ## Verify it actually works
 
