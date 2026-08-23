@@ -26,26 +26,29 @@ work, and that is exactly why the failure is so confusing: address resolution
 succeeds, and the unicast that follows disappears.
 
 ```
-guests        VF1         VF2               tap         veth
-            a guest     a guest            a VM      a container
-               │           │                 │            │
-               │           │       ┌─────────┴────────────┴───────┐
-bridge         │           │       │             br0              │
-               │           │       └───┬──────────────────────┬───┘
-               │           │           │                      │
-         ┌─────┴───────────┴───────────┴────────────┐   ┌─────┴─────┐
-NICs     │  NIC 1 — its own switch    PF            │   │   eth1    │
-         └─────────────────────────────┬────────────┘   └─────┬─────┘
-                                       │                      │
-wires                               wire A                 wire B
+        ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐
+guests  │   guest   │  │   guest   │  │    VM     │  │ container │
+        └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
+              │ VF1          │ VF2          │ tap          │ veth
+              │              │   ┌──────────┴──────────────┴───────┐
+bridge        │              │   │               br0               │
+              │              │   └────┬───────────────────────┬────┘
+              │              │        │ PF                    │ eth1
+         ┌────┴──────────────┴────────┴────┐             ┌────┴────┐
+NICs     │              NIC 1              │             │  NIC 2  │
+         └────────────────────────────┬────┘             └────┬────┘
+wires                                 │ wire A                │ wire B
 ```
 
-Read it from the bottom up. The two VFs come out of the NIC and go straight to
-their guests — past `br0`, not through it. The PF comes out of the same NIC and
-*is* a port of the bridge, alongside `eth1` and the guests' `tap` and `veth`.
+Boxes are things; the labels on the lines are the interfaces that connect them.
+Read it from the bottom up.
 
-The junction inside NIC 1 is its own switch. The only addresses it knows are
-the three that hang off it: the PF's and the two VFs'. Everything in the bridge
+`VF1` and `VF2` leave NIC 1 and go straight to their guests — past `br0`, not
+through it. `PF` leaves the same NIC and *is* a port of the bridge, next to
+`eth1` from the second NIC and the `tap` and `veth` of the two other guests.
+
+NIC 1 is a switch in its own right, and the only addresses it knows are the
+three interfaces hanging off it: `PF`, `VF1` and `VF2`. Everything in the box
 above is invisible to it.
 
 Here is every destination a guest holding `VF1` might want, and what becomes of
