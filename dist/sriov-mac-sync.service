@@ -1,0 +1,24 @@
+[Unit]
+Description=Keep an SR-IOV uplink's unicast filter in step with the bridge behind it
+Documentation=https://github.com/Jimbambuli/sriov-mac-sync
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/sriov-mac-sync
+Restart=always
+RestartSec=5
+KillMode=control-group
+
+# It writes hardware filters and reads /sys; nothing else is needed.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+RuntimeDirectory=sriov-mac-sync
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

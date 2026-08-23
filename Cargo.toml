@@ -1,0 +1,21 @@
+[package]
+name = "sriov-mac-sync"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Make hosts behind a Linux bridge reachable from an SR-IOV virtual function"
+license = "MIT"
+repository = "https://github.com/Jimbambuli/sriov-mac-sync"
+readme = "README.md"
+keywords = ["sriov", "networking", "bridge", "netlink", "vf"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,16 @@
+# /etc/sriov-mac-sync.conf - all optional
+
+# Uplink/bridge pairs to manage. Empty means autodetect: every interface with
+# virtual functions that ends up in a bridge, following bonds.
+#PAIRS="nic1:vmbr1 nic0:vmbr0"
+
+# Seconds between full reconciliations. Newly learnt addresses are registered
+# immediately on the netlink notification regardless; this is the safety net.
+#RESYNC=30
+
+# Warn above this many addresses per uplink. The vport list on ConnectX-4 Lx
+# holds 128; other hardware differs and the size cannot be queried.
+#MAX_MACS=128
+
+# Addresses never to register, comma or space separated.
+#EXCLUDE=""
