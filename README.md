@@ -179,13 +179,16 @@ Measured working:
 
 | NIC | driver | confirmed with |
 |---|---|---|
-| Mellanox ConnectX-4 Lx | `mlx5_core` | a Linux network namespace on the VF, and a FreeBSD guest holding the VF |
-| Mellanox ConnectX-3 Pro | `mlx4_core` | a Linux network namespace on the VF |
+| Mellanox ConnectX-4 Lx | `mlx5_core` | a network namespace on the VF, and a FreeBSD guest holding the VF |
+| Mellanox ConnectX-3 Pro | `mlx4_core` | a network namespace on the VF |
+| Intel 82599ES | `ixgbe` | a network namespace on the VF, against the real neighbours of a live bridge |
+| Intel X710 | `i40e` | a network namespace on the VF |
 
-Both in legacy eswitch mode, and both with the same signature: unicast to a peer
-behind the bridge fails while ARP for it succeeds, registering the address fixes
-it, removing the registration breaks it again. Reports for other hardware are
-welcome — the four steps above are the whole test.
+Two Mellanox generations and two Intel ones, all in legacy eswitch mode, all
+with the same signature: a peer behind the bridge is unreachable while ARP for
+it resolves, registering its address fixes it, and removing the registration
+breaks it again. Reports for other hardware are welcome — the four steps above
+are the whole test.
 
 ## Limits and things worth knowing
 
@@ -209,6 +212,20 @@ list.
 
 **This daemon only removes what it added.** It keeps a note in
 `/run/sriov-mac-sync/`; entries put there by something else are left alone.
+
+**A bridge port without a carrier does not forward.** Testing this on a bench
+with nothing plugged into the SR-IOV NIC will fail for a reason that has
+nothing to do with any of the above: Linux puts a carrier-less port into the
+disabled state, and a disabled port passes nothing. A short cable between two
+ports of the machine is enough — but not two ports of the *same bridge*, which
+is a loop.
+
+**Intel: the VF's link follows the PF's.** `ip link set <pf> vf N state enable`
+is rejected outright by `ixgbe` (`NDO set VF 0 link state 1 - not supported`),
+so a VF on a NIC without a cable stays down and can do nothing at all. And once
+an address has been assigned to a VF from the PF side, the guest may not change
+it — `RTNETLINK answers: Operation not permitted` — so assign it before the VF
+driver binds, or rebind afterwards.
 
 **FreeBSD guests: turn off local loopback.** FreeBSD's `mlx5en` enables it by
 default (`dev.mce.N.conf.uc_local_lb` and `mc_local_lb`, both `1`). The guest's
