@@ -137,8 +137,9 @@ Each bridge is handled on its own, and so is each uplink into it.
   wire side.
 * **The uplink need not be a PF.** A VF can carry the bridge just as well and
   is picked up on its own; the mechanism is identical. It has to send with the
-  addresses of everything behind the bridge, so turn spoof checking off for it.
-  There is a reason to prefer this — see *when the wire goes dark* below.
+  addresses of everything behind the bridge, so turn spoof checking off for it,
+  and release its link state from the PF's. There is a reason to prefer this —
+  see *when the wire goes dark* below.
 
 ## Build and install
 
@@ -296,6 +297,21 @@ traffic does not depend on the carrier — 0.13 ms with the cable out, where
 PF-to-VF lost every packet — and the registration described here is what steers
 it, so the host keeps talking to itself while the wire is dark. The PF then
 stays out of the bridge, but it still has to be `up`.
+
+One setting decides whether that works at all. A VF follows its PF's link state
+by default, so when the cable goes the VF loses carrier too, and a carrier-less
+bridge port is disabled and forwards nothing — the very thing you were trying to
+avoid. Release it:
+
+```
+ip link set <pf> vf <n> state enable
+```
+
+Then the port stays *forwarding* with no cable in the machine. Measured that
+way, end to end and with nothing plugged in: a guest on one VF reached a
+container behind the bridge on the other in 0.15 ms, both directions, with the
+daemon doing the registration on its own. Do not set this on a VF that carries a
+WAN link — there a lost carrier is news the guest needs to hear.
 
 **Intel: the VF's link follows the PF's.** `ip link set <pf> vf N state enable`
 is rejected outright by `ixgbe` (`NDO set VF 0 link state 1 - not supported`),
