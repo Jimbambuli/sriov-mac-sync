@@ -707,11 +707,11 @@ mod tests {
 
     #[test]
     fn mac_round_trip() {
-        let m = [0x02, 0xe3, 0xc0, 0x01, 0x22, 0x75];
-        assert_eq!(format_mac(&m), "02:e3:c0:01:22:75");
-        assert_eq!(parse_mac("02:e3:c0:01:22:75"), Some(m));
+        let m = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01];
+        assert_eq!(format_mac(&m), "02:00:5e:10:00:01");
+        assert_eq!(parse_mac("02:00:5e:10:00:01"), Some(m));
         assert_eq!(
-            parse_mac("02:E3:C0:01:22:75"),
+            parse_mac("02:00:5E:10:00:01"),
             Some(m),
             "case does not matter"
         );
@@ -721,10 +721,10 @@ mod tests {
     fn malformed_addresses_are_rejected() {
         for bad in [
             "",
-            "02:e3:c0:01:22",
-            "02:e3:c0:01:22:75:99",
-            "zz:e3:c0:01:22:75",
-            "2:e3:c0:01:22:75",
+            "02:00:5e:10:00",
+            "02:00:5e:10:00:01:99",
+            "zz:00:5e:10:00:01",
+            "2:00:5e:10:00:01",
         ] {
             assert_eq!(parse_mac(bad), None, "{bad} should not parse");
         }
