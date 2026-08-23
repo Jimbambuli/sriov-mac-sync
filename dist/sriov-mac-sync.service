@@ -17,7 +17,12 @@ AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
+# Which entries are ours is noted here. Keep it across a restart, or the
+# daemon comes back unable to tell its own entries from anyone else's and
+# stops cleaning up after itself. /run is a tmpfs, so a reboot still clears
+# it - which is right, the card's filter is empty by then too.
 RuntimeDirectory=sriov-mac-sync
+RuntimeDirectoryPreserve=yes
 PrivateTmp=yes
 
 [Install]
