@@ -37,7 +37,8 @@ bridge        │              │   │               br0               │
          ┌────┴──────────────┴────────┴────┐             ┌────┴────┐
 NICs     │              NIC 1              │             │  NIC 2  │
          └────────────────────────────┬────┘             └────┬────┘
-wires                                 │ wire A                │ wire B
+                                      │                       │
+wires                              wire A                  wire B
 ```
 
 Boxes are things; the labels on the lines are the interfaces that connect them.
