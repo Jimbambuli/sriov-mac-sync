@@ -373,10 +373,20 @@ impl Socket {
         let n = self.recv(&mut buf)?.min(buf.len());
         let mut out = Vec::new();
         for msg in messages(&buf[..n]) {
-            if msg.kind == RTM_NEWNEIGH || msg.kind == RTM_DELNEIGH {
-                if let Some(e) = parse_fdb(msg.payload) {
-                    out.push((msg.kind, e));
-                }
+            if msg.kind != RTM_NEWNEIGH && msg.kind != RTM_DELNEIGH {
+                continue;
+            }
+            // RTNLGRP_NEIGH carries the whole neighbour table, not just the
+            // bridge's. On a normal host the ARP and ND cache churns several
+            // times a second - every failed lookup for a machine that is
+            // switched off is one - and none of it concerns us. Dropping it
+            // here is the difference between waking constantly and waking when
+            // a bridge actually learns something.
+            if msg.payload.first() != Some(&(libc::AF_BRIDGE as u8)) {
+                continue;
+            }
+            if let Some(e) = parse_fdb(msg.payload) {
+                out.push((msg.kind, e));
             }
         }
         Ok(out)
@@ -429,27 +439,40 @@ pub struct Message<'a> {
     pub payload: &'a [u8],
 }
 
-/// Walk the netlink messages in a received buffer. A trailing fragment that
-/// does not fit is dropped rather than parsed, so a short read cannot turn
-/// into nonsense.
-fn messages(buf: &[u8]) -> Vec<Message<'_>> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + NLMSG_HDR <= buf.len() {
-        let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-        let kind = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
-        let flags = u16::from_ne_bytes(buf[off + 6..off + 8].try_into().unwrap());
-        if len < NLMSG_HDR || off + len > buf.len() {
-            break;
+/// Walks the netlink messages in a received buffer. A trailing fragment that
+/// does not fit is dropped rather than parsed, so a short read cannot turn into
+/// nonsense. An iterator rather than a list: a dump of a large forwarding
+/// database arrives as thousands of messages per datagram, and none of them
+/// needs to be kept.
+struct Messages<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Iterator for Messages<'a> {
+    type Item = Message<'a>;
+    fn next(&mut self) -> Option<Message<'a>> {
+        if self.off + NLMSG_HDR > self.buf.len() {
+            return None;
         }
-        out.push(Message {
+        let len = u32::from_ne_bytes(self.buf[self.off..self.off + 4].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(self.buf[self.off + 4..self.off + 6].try_into().unwrap());
+        let flags = u16::from_ne_bytes(self.buf[self.off + 6..self.off + 8].try_into().unwrap());
+        if len < NLMSG_HDR || self.off + len > self.buf.len() {
+            return None;
+        }
+        let payload = &self.buf[self.off + NLMSG_HDR..self.off + len];
+        self.off += align4(len);
+        Some(Message {
             kind,
             flags,
-            payload: &buf[off + NLMSG_HDR..off + len],
-        });
-        off += align4(len);
+            payload,
+        })
     }
-    out
+}
+
+fn messages(buf: &[u8]) -> Messages<'_> {
+    Messages { buf, off: 0 }
 }
 
 fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
@@ -464,20 +487,32 @@ fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
     }
 }
 
-/// Walk the attributes of a message body.
-fn attrs(buf: &[u8]) -> Vec<(u16, &[u8])> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + RTATTR_HDR <= buf.len() {
-        let len = u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
-        let kind = u16::from_ne_bytes(buf[off + 2..off + 4].try_into().unwrap());
-        if len < RTATTR_HDR || off + len > buf.len() {
-            break;
+/// Walks the attributes of a message body, without collecting them: this runs
+/// once per forwarding entry, and there can be thousands.
+struct Attrs<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Iterator for Attrs<'a> {
+    type Item = (u16, &'a [u8]);
+    fn next(&mut self) -> Option<(u16, &'a [u8])> {
+        if self.off + RTATTR_HDR > self.buf.len() {
+            return None;
         }
-        out.push((kind, &buf[off + RTATTR_HDR..off + len]));
-        off += align4(len);
+        let len = u16::from_ne_bytes(self.buf[self.off..self.off + 2].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(self.buf[self.off + 2..self.off + 4].try_into().unwrap());
+        if len < RTATTR_HDR || self.off + len > self.buf.len() {
+            return None;
+        }
+        let value = &self.buf[self.off + RTATTR_HDR..self.off + len];
+        self.off += align4(len);
+        Some((kind, value))
     }
-    out
+}
+
+fn attrs(buf: &[u8]) -> Attrs<'_> {
+    Attrs { buf, off: 0 }
 }
 
 fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
@@ -605,7 +640,7 @@ mod tests {
     fn messages_walks_a_batch() {
         let mut buf = msg(RTM_NEWNEIGH, 0, b"one");
         buf.extend(msg(RTM_DELNEIGH, 0, b"twotwo"));
-        let got = messages(&buf);
+        let got: Vec<_> = messages(&buf).collect();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, RTM_NEWNEIGH);
         assert_eq!(&got[0].payload[..3], b"one");
@@ -620,7 +655,7 @@ mod tests {
         let mut buf = msg(RTM_NEWNEIGH, 0, b"complete");
         buf.extend(msg(RTM_NEWNEIGH, 0, b"cut short here"));
         buf.truncate(buf.len() - 6);
-        let got = messages(&buf);
+        let got: Vec<_> = messages(&buf).collect();
         assert_eq!(got.len(), 1, "only the message that arrived whole");
         assert_eq!(&got[0].payload[..8], b"complete");
     }
@@ -630,13 +665,13 @@ mod tests {
         let mut buf = msg(RTM_NEWNEIGH, 0, b"ok");
         buf.extend_from_slice(&4u32.to_ne_bytes()); // len = 4, impossible
         buf.extend_from_slice(&[0u8; 12]);
-        assert_eq!(messages(&buf).len(), 1);
+        assert_eq!(messages(&buf).count(), 1);
     }
 
     #[test]
     fn the_interrupted_dump_flag_survives_parsing() {
         let buf = msg(RTM_NEWNEIGH, NLM_F_DUMP_INTR, b"x");
-        assert_ne!(messages(&buf)[0].flags & NLM_F_DUMP_INTR, 0);
+        assert_ne!(messages(&buf).next().unwrap().flags & NLM_F_DUMP_INTR, 0);
     }
 
     #[test]
@@ -735,7 +770,7 @@ mod tests {
         let mut v = Vec::new();
         put_attr(&mut v, NDA_LLADDR, &[1, 2, 3, 4, 5, 6]);
         assert_eq!(v.len(), 12, "4 header + 6 payload, padded to 12");
-        let got = attrs(&v);
+        let got: Vec<_> = attrs(&v).collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, NDA_LLADDR);
         assert_eq!(got[0].1, &[1, 2, 3, 4, 5, 6]);

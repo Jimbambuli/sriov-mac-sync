@@ -21,6 +21,7 @@ mod sysfs;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use netlink::{format_mac, parse_mac, Socket};
 use sync::{Pair, Syncer};
@@ -405,84 +406,100 @@ fn run() -> Result<bool, String> {
             let mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
             let mut said_empty = false;
+            let interval = Duration::from_secs(opts.interval);
+            // A deadline, not a sleep. Wake-ups that turn out to be none of our
+            // business must not push the full pass further away.
+            let mut next_full = Instant::now();
 
             loop {
-                // Autodetection is redone every pass. A NIC that gets its VFs
-                // later, or a bridge built after boot, must not need a restart
-                // to be noticed - and starting before the network is up must
-                // not turn into a crash loop.
-                if auto {
-                    match Topology::load() {
-                        Ok(topo) => {
-                            let found: Vec<Pair> = topo
-                                .autodetect()
-                                .0
-                                .into_iter()
-                                .map(|(dev, bridge)| Pair { dev, bridge })
-                                .collect();
-                            if pair_names(&found) != pair_names(&syncer.pairs) {
-                                if !found.is_empty() {
-                                    eprintln!("now watching {}", pair_names(&found).join(" "));
-                                    said_empty = false;
+                if Instant::now() >= next_full {
+                    // Autodetection is redone every pass. A NIC that gets its
+                    // VFs later, or a bridge built after boot, must not need a
+                    // restart to be noticed - and starting before the network
+                    // is up must not turn into a crash loop.
+                    if auto {
+                        match Topology::load() {
+                            Ok(topo) => {
+                                let found: Vec<Pair> = topo
+                                    .autodetect()
+                                    .0
+                                    .into_iter()
+                                    .map(|(dev, bridge)| Pair { dev, bridge })
+                                    .collect();
+                                if pair_names(&found) != pair_names(&syncer.pairs) {
+                                    if !found.is_empty() {
+                                        eprintln!("now watching {}", pair_names(&found).join(" "));
+                                        said_empty = false;
+                                    }
+                                    syncer.pairs = found;
                                 }
-                                syncer.pairs = found;
                             }
+                            Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
                         }
-                        Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
                     }
+
+                    if syncer.pairs.is_empty() {
+                        if !said_empty {
+                            eprintln!("waiting for an SR-IOV interface to appear in a bridge");
+                            said_empty = true;
+                        }
+                    } else {
+                        match syncer.reconcile(&mut sock, true) {
+                            Ok(reports) => {
+                                report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose)
+                            }
+                            // One failed pass is no reason to give up: the next
+                            // is seconds away and starts from the kernel's
+                            // state again.
+                            Err(e) => eprintln!("warning: reconciliation failed: {e}"),
+                        }
+                    }
+                    next_full = Instant::now() + interval;
                 }
 
-                if syncer.pairs.is_empty() {
-                    if !said_empty {
-                        eprintln!("waiting for an SR-IOV interface to appear in a bridge");
-                        said_empty = true;
-                    }
-                } else {
-                    match syncer.reconcile(&mut sock, true) {
-                        Ok(reports) => {
-                            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose)
-                        }
-                        // One failed pass is no reason to give up: the next is
-                        // seconds away and starts from the kernel's state again.
-                        Err(e) => eprintln!("warning: reconciliation failed: {e}"),
-                    }
-                }
-
-                let woken = match mon.wait((opts.interval * 1000) as i32) {
+                let due = next_full.saturating_duration_since(Instant::now());
+                let woken = match mon.wait(due.as_millis().min(i32::MAX as u128) as i32) {
                     Ok(w) => w,
                     Err(e) => {
                         eprintln!("warning: waiting for events failed: {e}");
-                        false
+                        next_full = Instant::now();
+                        continue;
                     }
                 };
                 if !woken {
-                    continue;
+                    continue; // the deadline came round; the pass happens above
+                }
+
+                let events = match mon.recv_events() {
+                    Ok(events) => events,
+                    // ENOBUFS means the kernel dropped notifications because we
+                    // could not keep up. Losing them is survivable - a full pass
+                    // reads the real state - but exiting over it would not be.
+                    Err(e) => {
+                        eprintln!("warning: lost neighbour notifications: {e}");
+                        next_full = Instant::now();
+                        continue;
+                    }
+                };
+                if events.is_empty() {
+                    continue; // something else's neighbour, not a bridge's
                 }
 
                 // Register what just appeared before anything else, so the
                 // first reply to it is not sent into the void.
-                let topo = Topology::load().ok();
-                match mon.recv_events() {
-                    Ok(events) => {
-                        if let Some(topo) = topo.as_ref() {
-                            for (kind, entry) in events {
-                                if kind == netlink::RTM_NEWNEIGH {
-                                    let _ = syncer.fast_add(&mut sock, topo, &entry);
-                                }
-                            }
+                if let Ok(topo) = Topology::load() {
+                    for (kind, entry) in events {
+                        if kind == netlink::RTM_NEWNEIGH {
+                            let _ = syncer.fast_add(&mut sock, &topo, &entry);
                         }
                     }
-                    // ENOBUFS means the kernel dropped notifications because we
-                    // could not keep up. Losing them is survivable - the full
-                    // pass at the top of the loop reads the real state - but
-                    // exiting over it would not be.
-                    Err(e) => eprintln!("warning: lost neighbour notifications: {e}"),
                 }
 
-                // Let a burst settle before the full pass.
+                // Let a burst settle, then make the full pass due at once.
                 while mon.wait(200).unwrap_or(false) {
                     let _ = mon.recv_events();
                 }
+                next_full = Instant::now();
             }
         }
         Mode::Check => unreachable!(),

@@ -104,6 +104,25 @@ impl Syncer {
         };
         let port_index = topo.get(port).map(|l| l.index).unwrap_or(0);
 
+        // Which interfaces sit on top of the uplink bridge, by index. Worked
+        // out once here rather than per forwarding entry: a busy host has
+        // thousands of entries and a few dozen interfaces, and asking the same
+        // structural question thousands of times is what made this daemon show
+        // up in `top` at all.
+        let uplink_ward: HashSet<u32> = topo
+            .links
+            .values()
+            .filter(|l| topo.leads_to(&l.name, &pair.bridge))
+            .map(|l| l.index)
+            .collect();
+
+        let mut ports_of: HashMap<&str, Vec<&crate::sysfs::Link>> = HashMap::new();
+        for l in topo.links.values() {
+            if let Some(m) = &l.master {
+                ports_of.entry(m.as_str()).or_default().push(l);
+            }
+        }
+
         // Bridges stacked on the uplink bridge. Their tables hold the guests
         // whose addresses the lower bridge never learns: that traffic enters it
         // from the bridge's own local port, and a bridge does not learn from
@@ -113,13 +132,11 @@ impl Syncer {
             if b.name == pair.bridge {
                 continue;
             }
-            let ports: Vec<&String> = topo
-                .links
-                .values()
-                .filter(|l| l.master.as_deref() == Some(b.name.as_str()))
-                .map(|l| &l.name)
-                .collect();
-            if ports.iter().any(|p| topo.leads_to(p, &pair.bridge)) {
+            let stacked = ports_of
+                .get(b.name.as_str())
+                .map(|ps| ps.iter().any(|p| uplink_ward.contains(&p.index)))
+                .unwrap_or(false);
+            if stacked {
                 relevant.insert(b.index, b.name.clone());
             }
         }
@@ -141,14 +158,8 @@ impl Syncer {
                 } else {
                     want.insert(e.mac);
                 }
-            } else if relevant.contains_key(&master) {
-                let toward_uplink = topo
-                    .name_of(e.ifindex)
-                    .map(|n| topo.leads_to(n, &pair.bridge))
-                    .unwrap_or(false);
-                if !toward_uplink {
-                    want.insert(e.mac);
-                }
+            } else if relevant.contains_key(&master) && !uplink_ward.contains(&e.ifindex) {
+                want.insert(e.mac);
             }
         }
 
@@ -160,7 +171,7 @@ impl Syncer {
             want.insert(mac);
         }
         for link in topo.links.values() {
-            if link.name != pair.bridge && topo.leads_to(&link.name, &pair.bridge) {
+            if link.name != pair.bridge && uplink_ward.contains(&link.index) {
                 if let Some(mac) = link.mac {
                     want.insert(mac);
                 }
