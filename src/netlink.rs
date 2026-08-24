@@ -657,26 +657,20 @@ impl Socket {
             events: libc::POLLIN,
             revents: 0,
         };
-        // A deadline, not a restart: a signal in the middle must not push
-        // the wait out again from the beginning, or a steady trickle of
-        // signals postpones the timed pass forever.
-        let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let rc =
-                unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
-            if rc < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    if left.is_zero() {
-                        return Ok(false);
-                    }
-                    continue;
-                }
-                return Err(e);
+        // A signal returns "nothing arrived" rather than polling again. Every
+        // caller is in a loop against a deadline it holds itself and comes
+        // straight back if there is time left, so nothing is lost - and it
+        // gets a chance to look at why it was interrupted. A stop request
+        // that has to wait out a five-minute interval is not a stop request.
+        let rc = unsafe { libc::poll(&mut pfd, 1, millis.max(0)) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
             }
-            return Ok(rc > 0);
+            return Err(e);
         }
+        Ok(rc > 0)
     }
 }
 

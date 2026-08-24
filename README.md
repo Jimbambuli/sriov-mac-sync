@@ -307,6 +307,23 @@ queued address follows in the next pass the moment it does. In steady state -
 no interfaces coming or going - registrations run in well under a millisecond.
 
 
+**A guest that moves hosts is followed within the batch that says so.** When
+a VM migrates away, the bridge starts learning its address on the uplink's own
+port - it is out on the wire now. Until the registration goes, the eSwitch
+keeps handing that traffic to the uplink, where the bridge cannot send it back
+out of the port it arrived on, and it is dropped. The notification that brings
+the news is acted on directly: an address of ours seen on the uplink port is
+unregistered there and then, before anything else in the batch is registered.
+A deletion on its own is not acted on - a vlan-aware bridge learns one address
+once per VLAN and the filter holds a single entry for all of them, so only the
+full dump that follows can tell that the last one has gone.
+
+**Stopping the daemon leaves the filter as it is.** SIGTERM and SIGINT end the
+loop cleanly, but nothing is unregistered and the notes in `/run` stay - which
+is what makes restarting it, for an update say, invisible to every guest behind
+the bridge. It says on the way out how many addresses it left in place.
+`--flush` is how you ask for the card to be cleared.
+
 **The list is finite and its size cannot be queried.** On ConnectX-4 Lx it
 holds 128 entries. Beyond that the driver drops addresses silently, and *which*
 ones is not predictable — with 257 entries a given address still worked, with

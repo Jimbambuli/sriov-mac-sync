@@ -18,6 +18,19 @@ pub struct Pair {
     pub bridge: String,
 }
 
+/// One pair as the fast path needs it: the structural questions answered
+/// once for the whole batch, because a batch describes a single moment.
+struct FastPair {
+    dev: String,
+    bridge: String,
+    /// the interface of the bridge this uplink is enslaved through
+    port: String,
+    /// the uplink's own interface index, which the filter is written to
+    index: u32,
+    /// addresses that may not be registered for this uplink
+    skip: HashSet<Mac>,
+}
+
 pub struct Report {
     pub dev: String,
     pub bridge: String,
@@ -274,6 +287,17 @@ impl Syncer {
     /// Devices this daemon has a note for. A note outlives the pair it was
     /// made for on purpose: when a bridge is taken apart, what we put in that
     /// device's filter still has to come back out.
+    /// How many addresses this daemon currently has on record as its own,
+    /// across every device it has a note for. Read from the notes rather than
+    /// from memory, for the same reason everything else here is: a --flush
+    /// from a second process is a thing that happens.
+    pub fn registered(&self) -> usize {
+        self.noted_devices()
+            .iter()
+            .map(|dev| self.load_owned(dev).len())
+            .sum()
+    }
+
     fn noted_devices(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Ok(rd) = fs::read_dir(&self.state_dir) {
@@ -763,23 +787,36 @@ impl Syncer {
         Ok(reports)
     }
 
-    /// Register one address straight away, without waiting for the next full
-    /// pass. A device that has only just appeared would otherwise miss the
-    /// first reply sent to it.
-    /// Register everything a batch of notifications brought, before the pass
-    /// that follows gets to it.
+    /// Answer a batch of forwarding notifications straight away, before the
+    /// pass that follows gets to it. A device that has only just appeared
+    /// would otherwise miss the first reply sent to it.
+    ///
+    /// Two things are done here, and they are the same rule read in both
+    /// directions. An address learnt behind the bridge is registered. An
+    /// address learnt on the uplink's own port is *out on the wire*, and if
+    /// it is one of ours it comes back out of the filter at once: that is a
+    /// guest that has moved to another host, and until the entry goes, the
+    /// eSwitch keeps handing its traffic to the uplink, where the bridge
+    /// cannot send it back out of the port it arrived on. It is dropped.
+    ///
+    /// A `RTM_DELNEIGH` is deliberately not treated as a reason to remove
+    /// anything. One entry going says nothing about the address: a
+    /// vlan-aware bridge learns the same address once per VLAN and the
+    /// filter holds one entry for all of them, so only a full dump can tell
+    /// that the last one is gone. The pass that follows this batch does
+    /// exactly that.
     ///
     /// The ownership notes are read once per device and written once at the
     /// end. Doing it per address meant rewriting a growing file for every
     /// entry of a burst - work that squares with the size of the burst, which
     /// is exactly when there is least of it to spare.
-    pub fn fast_add_all(
+    pub fn fast_apply(
         &mut self,
         sock: &mut dyn FdbWriter,
         topo: &Topology,
-        entries: &[FdbEntry],
+        events: &[(u16, FdbEntry)],
     ) -> io::Result<()> {
-        if self.dry_run || entries.is_empty() {
+        if self.dry_run || events.is_empty() {
             return Ok(());
         }
         // Where each uplink sits in its bridge, and which addresses may never
@@ -807,7 +844,7 @@ impl Syncer {
                 fresh
             }
         };
-        let pairs: Vec<(&Pair, String, HashSet<Mac>)> = self
+        let mut pairs: Vec<FastPair> = self
             .pairs
             .iter()
             .map(|p| {
@@ -819,12 +856,88 @@ impl Syncer {
                 if let Some(wire) = self.carried_wire.get(&p.dev) {
                     skip.extend(wire.iter().copied());
                 }
-                (p, port, skip)
+                FastPair {
+                    dev: p.dev.clone(),
+                    bridge: p.bridge.clone(),
+                    index: topo.get(&p.dev).map(|l| l.index).unwrap_or(0),
+                    port,
+                    skip,
+                }
             })
             .collect();
 
+        // What this batch saw arrive on an uplink's own port, per uplink.
+        // Read before anything is registered, because within one batch the
+        // wire has the last word - the same reason the full pass subtracts
+        // its wire set from what it wants.
+        let mut reflected: HashMap<String, HashSet<Mac>> = HashMap::new();
+        for (kind, e) in events {
+            if *kind != crate::netlink::RTM_NEWNEIGH || !e.is_learned() || !e.is_unicast() {
+                continue;
+            }
+            let Some(name) = topo.name_of(e.ifindex) else {
+                continue;
+            };
+            for fp in &pairs {
+                if name == fp.port {
+                    reflected.entry(fp.dev.clone()).or_default().insert(e.mac);
+                }
+            }
+        }
+
+        for fp in &mut pairs {
+            let Some(macs) = reflected.get(&fp.dev) else {
+                continue;
+            };
+            let mut owned = self.load_owned(&fp.dev);
+            let mut changed = false;
+            for mac in macs {
+                // Only ever our own registrations. An address somebody else
+                // put in the filter is theirs to remove, on the wire or not.
+                if !owned.contains(mac) {
+                    continue;
+                }
+                match sock.set_self_fdb(fp.index, mac, false) {
+                    Ok(()) => {
+                        owned.remove(mac);
+                        changed = true;
+                        eprintln!(
+                            "{}: {} moved out onto the wire, unregistered [reflection]",
+                            fp.dev,
+                            format_mac(mac)
+                        );
+                    }
+                    // Already gone. The point was for it not to be there.
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                        owned.remove(mac);
+                        changed = true;
+                    }
+                    // Keep the note: an entry still in the card that nothing
+                    // owns is the orphan the notes exist to prevent.
+                    Err(e) => eprintln!(
+                        "warning: {}: cannot unregister {}: {e}",
+                        fp.dev,
+                        format_mac(mac)
+                    ),
+                }
+            }
+            if changed {
+                self.save_owned(&fp.dev, &owned);
+            }
+            // For the rest of this batch, and until the next full pass says
+            // otherwise, these are wire addresses.
+            fp.skip.extend(macs.iter().copied());
+            self.carried_wire
+                .entry(fp.dev.clone())
+                .or_default()
+                .extend(macs.iter().copied());
+        }
+
         let mut touched: HashMap<String, HashSet<Mac>> = HashMap::new();
-        for entry in entries {
+        for (kind, entry) in events {
+            if *kind != crate::netlink::RTM_NEWNEIGH {
+                continue;
+            }
             self.fast_add(sock, topo, entry, &pairs, &mut touched);
         }
         for (dev, set) in touched {
@@ -838,7 +951,7 @@ impl Syncer {
         sock: &mut dyn FdbWriter,
         topo: &Topology,
         entry: &FdbEntry,
-        pairs: &[(&Pair, String, HashSet<Mac>)],
+        pairs: &[FastPair],
         touched: &mut HashMap<String, HashSet<Mac>>,
     ) {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
@@ -850,15 +963,15 @@ impl Syncer {
         let Some(port_name) = topo.name_of(entry.ifindex).map(|s| s.to_string()) else {
             return;
         };
-        for (pair, port, skip) in pairs {
-            if skip.contains(&entry.mac) {
+        for fp in pairs {
+            if fp.skip.contains(&entry.mac) {
                 continue; // excluded, the host's own, a VF's, or out on the wire
             }
-            let Some(bridge_link) = topo.get(&pair.bridge) else {
+            let Some(bridge_link) = topo.get(&fp.bridge) else {
                 continue;
             };
-            if &port_name == port {
-                continue; // on the wire
+            if port_name == fp.port {
+                continue; // on the wire; handled before any of this
             }
             if master != bridge_link.index {
                 // only bridges stacked on the uplink bridge are of interest
@@ -871,21 +984,18 @@ impl Syncer {
                     .filter(|l| l.master.as_deref() == Some(master_name))
                     .map(|l| &l.name)
                     .collect();
-                if !ports.iter().any(|p| topo.leads_to(p, &pair.bridge)) {
+                if !ports.iter().any(|p| topo.leads_to(p, &fp.bridge)) {
                     continue;
                 }
             }
-            if topo.leads_to(&port_name, &pair.bridge) {
+            if topo.leads_to(&port_name, &fp.bridge) {
                 continue;
             }
-            let Some(dev_link) = topo.get(&pair.dev) else {
-                continue;
-            };
-            match sock.set_self_fdb(dev_link.index, &entry.mac, true) {
+            match sock.set_self_fdb(fp.index, &entry.mac, true) {
                 Ok(()) => {
                     touched
-                        .entry(pair.dev.clone())
-                        .or_insert_with(|| self.load_owned(&pair.dev))
+                        .entry(fp.dev.clone())
+                        .or_insert_with(|| self.load_owned(&fp.dev))
                         .insert(entry.mac);
                 }
                 // Already there, and unlike in a full pass nothing checked
@@ -895,7 +1005,7 @@ impl Syncer {
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
                 Err(e) => eprintln!(
                     "warning: {}: cannot register {}: {e}",
-                    pair.dev,
+                    fp.dev,
                     format_mac(&entry.mac)
                 ),
             }
@@ -1521,8 +1631,12 @@ mod state_tests {
 
         for entry in fdb() {
             let mut sock = FakeSock::default();
-            s.fast_add_all(&mut sock, &topo, std::slice::from_ref(&entry))
-                .unwrap();
+            s.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_NEWNEIGH, entry.clone())],
+            )
+            .unwrap();
             let registered = !sock.added.is_empty();
             // Only learned entries reach the fast path at all; desired() also
             // wants the host's own addresses, which never arrive as events.
@@ -1846,5 +1960,135 @@ mod state_tests {
             t2 / t0,
             work_ratio
         );
+    }
+
+    /// A guest that moves to another host takes its address with it, and the
+    /// bridge learns that address on the uplink's own port from then on. The
+    /// registration left behind is worse than useless: the eSwitch keeps
+    /// handing that traffic to the uplink, and the bridge cannot send it back
+    /// out of the port it came in on, so it is dropped. The batch that brings
+    /// the news has to undo it.
+    ///
+    /// Verified by mutation: with the reflection loop removed, nothing is
+    /// removed and the note keeps the address.
+    #[test]
+    fn an_address_that_reappears_on_the_wire_is_unregistered_at_once() {
+        let dir = scratch("reflection");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        // It was behind the bridge a moment ago, registered and noted.
+        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+
+        let mut sock = FakeSock::default();
+        // nic1 is the uplink and its own port in this fixture: index 2.
+        s.fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            sock.removed,
+            vec![(2, BEHIND_NIC)],
+            "the address is out on the wire now; the filter entry has to go"
+        );
+        assert!(
+            !s.load_owned("nic1").contains(&BEHIND_NIC),
+            "and the note with it, or the next pass counts it as somebody else's"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only ever our own registrations. An address somebody else put in the
+    /// filter stays there, wire or no wire - the same rule the full pass and
+    /// --flush follow.
+    #[test]
+    fn a_reflection_of_an_address_we_never_registered_is_left_alone() {
+        let dir = scratch("reflection-foreign");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+
+        let mut sock = FakeSock::default();
+        s.fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
+        )
+        .unwrap();
+
+        assert!(
+            sock.removed.is_empty(),
+            "nothing of ours was there to remove: {:?}",
+            sock.removed
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One batch is one moment, and in it the wire has the last word. An
+    /// address seen on the uplink port and behind the bridge in the same
+    /// batch must not end up registered - which is what happens if the
+    /// registrations are done first and the reflections after.
+    #[test]
+    fn within_one_batch_the_wire_wins() {
+        let dir = scratch("reflection-order");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+
+        let mut sock = FakeSock::default();
+        s.fast_apply(
+            &mut sock,
+            &topo,
+            &[
+                // behind the bridge, on the other NIC ...
+                (crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC)),
+                // ... and on the uplink's own port in the same breath
+                (crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC)),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            sock.added.is_empty(),
+            "the wire side of the same batch says this address is out there: {:?}",
+            sock.added
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A deletion is not evidence. A vlan-aware bridge learns one address once
+    /// per VLAN and the filter holds a single entry for all of them, so the
+    /// last of them going is something only a full dump can establish. The
+    /// fast path must not act on one notification - the pass that follows the
+    /// batch is what removes.
+    #[test]
+    fn a_deletion_alone_does_not_remove_a_registration() {
+        let dir = scratch("deletion");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+
+        let mut sock = FakeSock::default();
+        s.fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
+        )
+        .unwrap();
+
+        assert!(
+            sock.removed.is_empty(),
+            "one entry going is not the address going: {:?}",
+            sock.removed
+        );
+        assert!(
+            s.load_owned("nic1").contains(&BEHIND_NIC),
+            "the note stays until a full dump says otherwise"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

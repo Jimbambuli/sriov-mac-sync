@@ -21,6 +21,7 @@ mod sysfs;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use netlink::{format_mac, parse_mac, Socket};
@@ -64,6 +65,49 @@ impl Default for Options {
             dry_run: false,
             verbose: false,
             timings: false,
+        }
+    }
+}
+
+/// Set by the signal handler, read by the daemon loop.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_signal(_sig: libc::c_int) {
+    // The only thing a signal handler may safely do here.
+    STOPPING.store(true, Ordering::Relaxed);
+}
+
+fn stopping() -> bool {
+    STOPPING.load(Ordering::Relaxed)
+}
+
+/// Ask for SIGTERM and SIGINT rather than being killed by them.
+///
+/// Nothing is undone on the way out: the registrations stay in the card and
+/// the notes stay in /run, which is what makes restarting the daemon - for an
+/// update, say - invisible to every guest behind the bridge. Taking them out
+/// would put a gap there on every restart, and `--flush` is the way to say
+/// that is what you want.
+///
+/// What this buys is smaller and worth having anyway: the loop finishes what
+/// it is doing, says how it ended and how much is deliberately left behind,
+/// and systemd sees a service that stopped rather than one that was killed.
+/// `sigaction` without SA_RESTART, so the poll the daemon spends its life in
+/// returns instead of being restarted under us - with SA_RESTART a stop would
+/// wait out the full reconciliation interval.
+fn catch_signals() {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = note_signal as *const () as libc::sighandler_t;
+    action.sa_flags = 0;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
+                eprintln!(
+                    "warning: cannot catch signal {sig}: {} - a stop will be abrupt",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 }
@@ -539,6 +583,7 @@ fn run() -> Result<bool, String> {
                 },
                 opts.interval
             );
+            catch_signals();
             let mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
             let mut said_empty = false;
@@ -565,6 +610,9 @@ fn run() -> Result<bool, String> {
             let mut last_pass = Instant::now() - interval;
 
             loop {
+                if stopping() {
+                    break;
+                }
                 if Instant::now() >= next_full {
                     // The timed pass exists to catch what the events missed,
                     // an interface change whose notification never arrived
@@ -711,13 +759,13 @@ fn run() -> Result<bool, String> {
                     }
                 }
                 if let Some(topo) = held.as_ref() {
-                    let arrived: Vec<_> = events
-                        .fdb
-                        .into_iter()
-                        .filter(|(kind, _)| *kind == netlink::RTM_NEWNEIGH)
-                        .map(|(_, entry)| entry)
-                        .collect();
-                    let _ = syncer.fast_add_all(&mut sock, topo, &arrived);
+                    // The whole batch, both kinds. What each means is the
+                    // fast path's business: an address learnt behind the
+                    // bridge is registered, one learnt on the uplink's own
+                    // port is taken back out if it was ours, and a deletion
+                    // is left to the pass that follows - one entry going
+                    // does not mean the address is gone.
+                    let _ = syncer.fast_apply(&mut sock, topo, &events.fdb);
                 }
 
                 // The full pass still has to follow - it is what removes
@@ -734,6 +782,19 @@ fn run() -> Result<bool, String> {
                 let due = (last_pass + Duration::from_millis(200)).max(Instant::now());
                 next_full = next_full.min(due);
             }
+
+            // Deliberately without a flush. Everything registered stays where
+            // it is, and the notes in /run stay with it, so the daemon can be
+            // restarted without a single guest behind the bridge noticing.
+            // Say how much that is, so nobody has to wonder what was left
+            // behind - and so `--flush` is an obvious next step for anyone
+            // who wants the card cleared.
+            let held: usize = syncer.registered();
+            eprintln!(
+                "sriov-mac-sync: stopping; {held} address(es) left registered on purpose \
+                 (--flush removes them)"
+            );
+            Ok(true)
         }
         Mode::Check => unreachable!(),
     }
@@ -944,5 +1005,19 @@ mod tests {
         parse_args_from(&mut o, args(&[]).into_iter()).unwrap();
         assert!(matches!(o.mode, Mode::Daemon));
         assert!(!o.dry_run && !o.verbose);
+    }
+
+    /// The daemon asks for SIGTERM instead of being killed by it. If the
+    /// handler were not installed - or installed wrongly - this test would
+    /// not fail, it would take the whole test process down with it, which is
+    /// as clear a signal as a failure.
+    #[test]
+    fn a_termination_signal_is_caught_and_only_noted() {
+        catch_signals();
+        assert!(!stopping(), "nothing has asked us to stop yet");
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert!(stopping(), "the handler has to record the request");
+        // Other tests share this process.
+        STOPPING.store(false, Ordering::Relaxed);
     }
 }
