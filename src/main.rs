@@ -375,6 +375,7 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
     const ROUNDS: u32 = 20;
     let avg = |d: Duration| d / ROUNDS;
 
+    let mut t_carried = Duration::ZERO;
     let (mut t_sysfs, mut t_dump, mut t_build, mut t_fdb, mut t_vf, mut t_pass) = (
         Duration::ZERO,
         Duration::ZERO,
@@ -410,11 +411,22 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
     if !pairs.is_empty() {
         let mut syncer = Syncer::new(pairs.to_vec(), PathBuf::from("/nonexistent"));
         syncer.dry_run = true;
+        // Two kinds of pass now exist: one that reads the interfaces because
+        // something about them may have moved, and one woken by a forwarding
+        // entry, which works from the picture it already has. Time both - the
+        // second is the common one.
         let bench_topo = Topology::load()?;
         for _ in 0..ROUNDS {
             let s = Instant::now();
-            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO, true)?;
+            let topo = Topology::load()?;
+            let load = s.elapsed();
+            let _ = syncer.reconcile(sock, false, &topo, load, true)?;
             t_pass += s.elapsed();
+        }
+        for _ in 0..ROUNDS {
+            let s = Instant::now();
+            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO, false)?;
+            t_carried += s.elapsed();
         }
     }
 
@@ -433,7 +445,8 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
     println!("Die uebrigen Teile eines Durchgangs:");
     println!("  FDB-Dump ({entries} Eintraege) {:>9.2?}", avg(t_fdb));
     println!("  VF-Dump                 {:>9.2?}", avg(t_vf));
-    println!("  vollstaendiger Durchgang{:>9.2?}", avg(t_pass));
+    println!("  Durchgang, frisch gelesen{:>8.2?}", avg(t_pass));
+    println!("  Durchgang, uebernommen  {:>9.2?}", avg(t_carried));
     let share = |d: Duration| {
         if t_pass.is_zero() {
             String::new()
@@ -449,11 +462,23 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
         avg(t_sysfs),
         share(t_sysfs)
     );
-    println!(
-        "  Ersparnis beim Wechsel  {:>9.2?}{}",
-        avg(t_sysfs) - avg(t_dump + t_build),
-        share(t_sysfs - (t_dump + t_build))
-    );
+    // Which way round they come out is the question being asked, so it must
+    // not be assumed. Subtracting durations the wrong way round panics, and
+    // netlink being the slower of the two is a perfectly ordinary answer.
+    let netlink = t_dump + t_build;
+    if t_sysfs >= netlink {
+        println!(
+            "  Ersparnis beim Wechsel  {:>9.2?}{}",
+            avg(t_sysfs - netlink),
+            share(t_sysfs - netlink)
+        );
+    } else {
+        println!(
+            "  Mehrkosten beim Wechsel {:>9.2?}{}",
+            avg(netlink - t_sysfs),
+            share(netlink - t_sysfs)
+        );
+    }
 
     let from_sysfs = Topology::load()?;
     let from_netlink = Topology::from_netlink(&sock.dump_links()?);
