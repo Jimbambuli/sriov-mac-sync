@@ -59,6 +59,15 @@ impl Topology {
                 Some(i) => i,
                 None => continue,
             };
+            // Whether there is a PCI device behind this interface decides four
+            // of the reads below. Veth, VLAN and bridge interfaces have none -
+            // on a host carrying containers they are the large majority - and
+            // asking each of them for a driver, a VF count, a physical function
+            // and a VF list is four failed lookups apiece. One look answers all
+            // four.
+            let dev = base.join("device");
+            let has_dev = dev.is_dir();
+
             let mut link = Link {
                 name: name.clone(),
                 index,
@@ -67,10 +76,18 @@ impl Topology {
                     .and_then(parse_mac),
                 master: link_target_name(base.join("master")),
                 is_bridge: base.join("bridge").is_dir(),
-                driver: link_target_name(base.join("device/driver")),
-                numvfs: read_trim(base.join("device/sriov_numvfs"))
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0),
+                driver: if has_dev {
+                    link_target_name(dev.join("driver"))
+                } else {
+                    None
+                },
+                numvfs: if has_dev {
+                    read_trim(dev.join("sriov_numvfs"))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
                 ..Default::default()
             };
 
@@ -85,16 +102,18 @@ impl Topology {
 
             // A virtual function points back at its physical function; take the
             // PF's netdev name, not the PCI address.
-            let physfn_net = base.join("device/physfn/net");
-            if physfn_net.is_dir() {
-                if let Ok(rd) = fs::read_dir(&physfn_net) {
-                    if let Some(e) = rd.flatten().next() {
-                        link.physfn = Some(e.file_name().to_string_lossy().into_owned());
+            if has_dev {
+                let physfn_net = dev.join("physfn/net");
+                if physfn_net.is_dir() {
+                    if let Ok(rd) = fs::read_dir(&physfn_net) {
+                        if let Some(e) = rd.flatten().next() {
+                            link.physfn = Some(e.file_name().to_string_lossy().into_owned());
+                        }
                     }
                 }
             }
 
-            if let Ok(rd) = fs::read_dir(base.join("device")) {
+            if let Ok(rd) = fs::read_dir(&dev) {
                 for e in rd.flatten() {
                     let f = e.file_name().to_string_lossy().into_owned();
                     if !f.starts_with("virtfn") {
