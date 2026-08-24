@@ -478,6 +478,31 @@ Interfaces are held by index, the way every kernel message identifies them,
 and the graph carries both directions of each edge so "what sits on top of
 this bridge" is one walk rather than one per interface.
 
+### What a pass costs, and where
+
+Measured on a namespace built for the purpose - 406 interfaces, 9826
+forwarding entries, 4200 addresses wanted - because a normal host is too
+small to see anything:
+
+```
+pass total 19.45 ms          syscall time 19.11 ms  (98.2%)
+  fdb dump 17.70 ms            recvfrom   17.38 ms   49 calls
+  topology  1.28 ms            sendto      1.18 ms    3 calls
+  pairs     0.23 ms            statx       0.04 ms    4 calls
+```
+
+Everything this program does with the data it reads - parsing 9826 forwarding
+entries, building the interface graph, putting 4200 addresses through several
+sets - is the 0.35 ms that is not syscall time. The cost of a pass is the
+kernel serialising its tables, and on a normal host the whole pass is 2 ms of
+which 1.8 is one driver answering out of its firmware about its virtual
+functions.
+
+That is worth knowing before optimising anything else in here. Holding MAC
+addresses as integers rather than six-byte arrays, for instance, would work on
+a share of that 0.35 ms - under 1% of a pass, for a change that touches every
+type in the program.
+
 ## Development
 
 ```
