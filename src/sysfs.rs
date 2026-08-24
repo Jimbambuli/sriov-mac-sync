@@ -182,17 +182,21 @@ impl Topology {
     /// until a bridge is reached. Returns the bridge and the interface that is
     /// actually enslaved to it, which is what the bridge's tables refer to.
     pub fn bridge_above(&self, dev: &str) -> Option<(String, String)> {
+        // A seen-set, like every other walk here: a hop budget also stops a
+        // cycle, but it silently gives up on a legitimate stack that is
+        // merely deep.
+        let mut seen = HashSet::new();
         let mut cur = dev.to_string();
-        let mut hops = 0;
-        while hops < 16 {
-            hops += 1;
+        loop {
+            if !seen.insert(cur.clone()) {
+                return None; // a masters-cycle; nothing above is a bridge
+            }
             let master = self.get(&cur)?.master.clone()?;
             if self.is_bridge(&master) {
                 return Some((master, cur));
             }
             cur = master;
         }
-        None
     }
 
     /// The interface of `bridge` under which `dev` sits; `dev` itself when it
@@ -230,7 +234,7 @@ impl Topology {
     /// physical port. Both have to end up in a bridge, possibly through a
     /// bond - without one there is nothing behind them to be missed.
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         let mut skipped = Vec::new();
         let mut names: Vec<&String> = self.links.keys().collect();
         names.sort();
@@ -244,10 +248,25 @@ impl Topology {
                 Some((br, port)) => {
                     // A VF cannot stand in for a port its own PF already
                     // holds: both would claim the same addresses, on two
-                    // vports of one eSwitch.
+                    // vports of one eSwitch. The same goes for a sister VF
+                    // that was taken for this bridge a moment ago - the rule
+                    // is about the eSwitch, not about who is a PF.
                     if let Some(pf) = &link.physfn {
                         if self.bridge_above(pf).map(|(b, _)| b).as_deref() == Some(&br) {
                             skipped.push(format!("skip {name}: {pf} already carries {br}"));
+                            continue;
+                        }
+                        let sister = pairs.iter().find(|(taken, tbr)| {
+                            *tbr == br
+                                && self.get(taken.as_str()).and_then(|l| l.physfn.as_ref())
+                                    == Some(pf)
+                        });
+                        if let Some((taken, _)) = sister {
+                            eprintln!(
+                                "warning: skip {name}: {taken} of the same {pf} already \
+                                 carries {br} - two vports of one eSwitch cannot both \
+                                 claim the same addresses"
+                            );
                             continue;
                         }
                     }

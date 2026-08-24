@@ -131,8 +131,16 @@ fn macs(what: &str, given: &[String]) -> HashSet<[u8; 6]> {
 }
 
 fn load_conf(opts: &mut Options) {
-    let Ok(text) = std::fs::read_to_string(CONF) else {
-        return;
+    let text = match std::fs::read_to_string(CONF) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        // A file that exists but cannot be read is not the same as no file:
+        // the settings somebody wrote down are not taking effect, and only
+        // this line will ever say so.
+        Err(e) => {
+            eprintln!("warning: cannot read {CONF}: {e} - continuing without it");
+            return;
+        }
     };
     for line in text.lines() {
         let line = line.trim();
@@ -140,14 +148,23 @@ fn load_conf(opts: &mut Options) {
             continue;
         }
         let (key, value) = line.split_once('=').unwrap();
+        // "RESYNC=300  # seconds" means 300, not a parse warning. No value
+        // this file takes can legitimately contain a hash.
+        let value = value.split('#').next().unwrap_or("");
         let value = value.trim().trim_matches('"').trim_matches('\'');
         match key.trim() {
             "PAIRS" => opts
                 .pairs
                 .extend(value.split_whitespace().map(|s| s.to_string())),
-            "RESYNC" => match value.parse() {
+            "RESYNC" => match value
+                .parse()
+                .map_err(|_| ())
+                .and_then(|v| clamp_interval(v).map_err(|_| ()))
+            {
                 Ok(v) => opts.interval = v,
-                Err(_) => eprintln!("warning: {CONF}: RESYNC is not a number, ignored: {value}"),
+                Err(_) => eprintln!(
+                    "warning: {CONF}: RESYNC is not a usable number of seconds, ignored: {value}"
+                ),
             },
             "MAX_MACS" => match value.parse() {
                 Ok(v) => opts.max_macs = v,
@@ -172,6 +189,29 @@ fn load_conf(opts: &mut Options) {
     }
 }
 
+/// Two modes on one command line are a contradiction, and the last one
+/// winning in silence means somebody ran --flush thinking they ran --status.
+/// Zero would busy-loop - the deadline is always due, poll never sleeps -
+/// and u64::MAX overflows the Instant it is added to, which aborts. Both are
+/// answers to a typo, and neither is a sane one.
+fn clamp_interval(v: u64) -> Result<u64, String> {
+    const MAX: u64 = 30 * 24 * 3600;
+    if v == 0 || v > MAX {
+        return Err(format!(
+            "the interval has to be between 1 and {MAX} seconds"
+        ));
+    }
+    Ok(v)
+}
+
+fn set_mode(opts: &mut Options, mode: Mode, arg: &str) -> Result<(), String> {
+    if !matches!(opts.mode, Mode::Daemon) {
+        return Err(format!("{arg}: another mode is already given (pick one)"));
+    }
+    opts.mode = mode;
+    Ok(())
+}
+
 fn parse_args(opts: &mut Options) -> Result<(), String> {
     parse_args_from(opts, std::env::args().skip(1))
 }
@@ -180,11 +220,11 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
     let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--once" => opts.mode = Mode::Once,
-            "--status" => opts.mode = Mode::Status,
-            "--check" => opts.mode = Mode::Check,
-            "--flush" => opts.mode = Mode::Flush,
-            "--compare-topology" => opts.mode = Mode::CompareTopology,
+            "--once" => set_mode(opts, Mode::Once, &arg)?,
+            "--status" => set_mode(opts, Mode::Status, &arg)?,
+            "--check" => set_mode(opts, Mode::Check, &arg)?,
+            "--flush" => set_mode(opts, Mode::Flush, &arg)?,
+            "--compare-topology" => set_mode(opts, Mode::CompareTopology, &arg)?,
             "--dry-run" => opts.dry_run = true,
             "--timings" => opts.timings = true,
             "-v" | "--verbose" => opts.verbose = true,
@@ -192,11 +232,12 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                 .pairs
                 .push(args.next().ok_or("--pair needs DEV:BRIDGE")?),
             "--interval" => {
-                opts.interval = args
-                    .next()
-                    .ok_or("--interval needs seconds")?
-                    .parse()
-                    .map_err(|_| "--interval needs a number")?
+                opts.interval = clamp_interval(
+                    args.next()
+                        .ok_or("--interval needs seconds")?
+                        .parse()
+                        .map_err(|_| "--interval needs a number")?,
+                )?
             }
             "--max" => {
                 opts.max_macs = args
@@ -259,6 +300,24 @@ fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<V
             if !topo.is_bridge(bridge) {
                 return Err(format!("not a bridge: {bridge}"));
             }
+            // A pair whose device does not actually sit under that bridge
+            // disables the one protection that matters: nothing the bridge
+            // learnt counts as wire-side any more, so everything it learnt -
+            // the peers out on the cable included - would be written into
+            // the device's filter. A typo must fail here, not there.
+            if dev == bridge {
+                return Err(format!("{spec}: a bridge cannot be its own uplink"));
+            }
+            if topo.bridge_above(dev).map(|(b, _)| b).as_deref() != Some(bridge) {
+                return Err(format!(
+                    "{spec}: {dev} is not enslaved to {bridge}, directly or through a bond"
+                ));
+            }
+            // Two pairs on one device would share one ownership note and
+            // spend every pass undoing each other's work.
+            if pairs.iter().any(|p: &Pair| p.dev == dev) {
+                return Err(format!("{spec}: {dev} is already named by another pair"));
+            }
             pairs.push(Pair {
                 dev: dev.to_string(),
                 bridge: bridge.to_string(),
@@ -279,24 +338,49 @@ fn pair_names(pairs: &[Pair]) -> Vec<String> {
 
 /// Can this driver take entries at all? Only half an answer: it proves the
 /// kernel accepted the address, not that the hardware acts on it.
-fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair]) -> bool {
+fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> bool {
     let mut ok = true;
     for pair in pairs {
         let Some(link) = topo.get(&pair.dev) else {
+            println!("{}: skipped - the interface is gone", pair.dev);
             continue;
         };
-        let Some(mut probe) = link.mac else { continue };
+        let Some(mut probe) = link.mac else {
+            println!(
+                "{}: skipped - it has no address to derive a probe from",
+                pair.dev
+            );
+            continue;
+        };
         probe[0] = 0x02;
         probe[5] ^= 0x5a;
         let driver = link.driver.clone().unwrap_or_default();
 
-        if let Err(e) = sock.set_self_fdb(link.index, &probe, true) {
+        // The check *is* a write: it proves the driver accepts an entry by
+        // giving it one and taking it back. A dry run has nothing to probe
+        // with, and pretending otherwise would print an answer it never had.
+        if dry_run {
             println!(
-                "{} ({driver}): FAILED - the driver refuses unicast filter entries: {e}",
+                "{} ({driver}): skipped - the check works by writing a probe entry, \
+                 which --dry-run rules out",
                 pair.dev
             );
-            ok = false;
             continue;
+        }
+
+        match sock.set_self_fdb(link.index, &probe, true) {
+            Ok(()) => {}
+            // Left over from an earlier check that could not clean up. The
+            // driver plainly accepts entries - that is the question here.
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) => {
+                println!(
+                    "{} ({driver}): FAILED - the driver refuses unicast filter entries: {e}",
+                    pair.dev
+                );
+                ok = false;
+                continue;
+            }
         }
         let listed = sock
             .dump_fdb()
@@ -318,7 +402,13 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair]) -> bool {
             );
             ok = false;
         }
-        let _ = sock.set_self_fdb(link.index, &probe, false);
+        if let Err(e) = sock.set_self_fdb(link.index, &probe, false) {
+            eprintln!(
+                "warning: {}: the probe entry {} could not be taken back out: {e}",
+                pair.dev,
+                format_mac(&probe)
+            );
+        }
     }
     ok
 }
@@ -508,16 +598,22 @@ fn run() -> Result<bool, String> {
     let topo_started = Instant::now();
     let topo = Topology::load().map_err(|e| format!("cannot read /sys/class/net: {e}"))?;
     let topo_load = topo_started.elapsed();
+    // Flush and status must not require a pair to exist: the state they
+    // inspect - notes and filter entries - outlives the pair on purpose, and
+    // "the bridge is gone" is exactly when --flush is reached for.
     let pairs = resolve_pairs(
         &topo,
         &opts,
-        matches!(opts.mode, Mode::Daemon | Mode::CompareTopology),
+        matches!(
+            opts.mode,
+            Mode::Daemon | Mode::CompareTopology | Mode::Flush | Mode::Status
+        ),
     )?;
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
     if opts.mode == Mode::Check {
-        return Ok(check(&mut sock, &topo, &pairs));
+        return Ok(check(&mut sock, &topo, &pairs, opts.dry_run));
     }
 
     if opts.mode == Mode::CompareTopology {
@@ -533,10 +629,7 @@ fn run() -> Result<bool, String> {
     syncer.extra = macs("--extra", &opts.extra);
 
     match opts.mode {
-        Mode::Flush => {
-            syncer.flush(&mut sock).map_err(|e| e.to_string())?;
-            Ok(true)
-        }
+        Mode::Flush => syncer.flush(&mut sock).map_err(|e| e.to_string()),
         Mode::Status => {
             let reports = syncer
                 .reconcile(&mut sock, false, &topo, topo_load, true)
@@ -573,7 +666,9 @@ fn run() -> Result<bool, String> {
             if opts.timings {
                 eprint!("{}", syncer.timings.report());
             }
-            Ok(true)
+            // A oneshot that could not do what it was asked has to say so in
+            // its exit code - the warnings above scroll away, the code stays.
+            Ok(syncer.timings.failures.is_empty())
         }
         Mode::Daemon => {
             let auto = opts.pairs.is_empty();
@@ -657,12 +752,11 @@ fn run() -> Result<bool, String> {
                         }
                     }
 
-                    if syncer.pairs.is_empty() {
-                        if !said_empty {
-                            eprintln!("waiting for an SR-IOV interface to appear in a bridge");
-                            said_empty = true;
-                        }
-                    } else {
+                    if syncer.pairs.is_empty() && !said_empty {
+                        eprintln!("waiting for an SR-IOV interface to appear in a bridge");
+                        said_empty = true;
+                    }
+                    {
                         let Some((topo, topo_load)) = loaded else {
                             next_full = Instant::now() + interval;
                             trigger = "timed";
@@ -697,6 +791,8 @@ fn run() -> Result<bool, String> {
                     Err(e) => {
                         eprintln!("warning: waiting for events failed: {e}");
                         next_full = Instant::now();
+                        stale = true;
+                        trigger = "recovery";
                         continue;
                     }
                 };
@@ -715,6 +811,7 @@ fn run() -> Result<bool, String> {
                         // What was in the messages that never arrived is not
                         // knowable, so nothing carried over may be believed.
                         stale = true;
+                        trigger = "lost events";
                         continue;
                     }
                 };
@@ -766,7 +863,17 @@ fn run() -> Result<bool, String> {
                 // and the pass would never happen at all.
                 let settle_until = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < settle_until && mon.wait(200).unwrap_or(false) {
-                    let _ = mon.recv_events();
+                    // The batches read here are not acted on - the full pass
+                    // that follows covers their forwarding entries - but an
+                    // interface message among them still means the carried
+                    // picture is no longer true. Before this was looked at,
+                    // a container starting mid-burst had its veth ignored
+                    // until the next timed pass.
+                    match mon.recv_events() {
+                        Ok(ev) if ev.links_changed => stale = true,
+                        Ok(_) => {}
+                        Err(_) => stale = true,
+                    }
                 }
                 next_full = Instant::now();
             }

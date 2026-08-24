@@ -14,6 +14,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_DELNEIGH: u16 = 29;
@@ -233,14 +234,24 @@ impl Socket {
     /// Reads one datagram. `MSG_TRUNC` makes the kernel report the real size
     /// even when it did not fit, so a buffer that is too small shows up as a
     /// number larger than the buffer instead of as silently missing entries.
+    ///
+    /// Only the kernel is listened to. A netlink socket accepts unicast from
+    /// any local process, and everything downstream believes what arrives -
+    /// a forged NLMSG_DONE would end a dump early and an empty dump reads as
+    /// an empty forwarding table, which ends with every entry removed. The
+    /// sender's port id says who it was: zero is the kernel.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
             let n = unsafe {
-                libc::recv(
+                libc::recvfrom(
                     self.fd.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
                     libc::MSG_TRUNC,
+                    &mut from as *mut _ as *mut libc::sockaddr,
+                    &mut from_len,
                 )
             };
             if n < 0 {
@@ -250,7 +261,29 @@ impl Socket {
                 }
                 return Err(e);
             }
+            if from.nl_pid != 0 {
+                continue; // not the kernel talking
+            }
             return Ok(n as usize);
+        }
+    }
+
+    /// `recv`, but gives up when the deadline passes instead of blocking for
+    /// good. A reply that never comes - a dump whose final message was lost,
+    /// an acknowledgement that went missing - would otherwise stop the whole
+    /// daemon, and nothing upstream could even say why.
+    fn recv_deadline(&self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no answer from the kernel in time",
+                ));
+            }
+            if self.wait(left.as_millis().min(i32::MAX as u128) as i32)? {
+                return self.recv(buf);
+            }
         }
     }
 
@@ -265,10 +298,11 @@ impl Socket {
         buf: &mut [u8],
         want: u16,
         seq: u32,
+        deadline: Instant,
         sink: &mut impl FnMut(&[u8]),
     ) -> io::Result<bool> {
         loop {
-            let n = self.recv(buf)?;
+            let n = self.recv_deadline(buf, deadline)?;
             if n > buf.len() {
                 return Ok(false); // did not fit
             }
@@ -284,10 +318,14 @@ impl Socket {
                 match msg.kind {
                     NLMSG_DONE => return Ok(true),
                     NLMSG_ERROR => {
-                        if let Some(e) = nlmsg_error(msg.payload) {
-                            return Err(e);
-                        }
-                        return Ok(true);
+                        // The request asks for no acknowledgement, so an error
+                        // message is only ever bad news. One whose code reads
+                        // as zero - or one too short to carry a code - must
+                        // not pass for a finished dump: an "empty" forwarding
+                        // table would have every registration removed.
+                        return Err(nlmsg_error(msg.payload).unwrap_or_else(|| {
+                            io::Error::other("the dump ended in a malformed error message")
+                        }));
                     }
                     NLMSG_NOOP => continue,
                     k if k == want => sink(msg.payload),
@@ -312,9 +350,13 @@ impl Socket {
         let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
         self.send(request)?;
         let mut buf = vec![0u8; 128 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let n = self.recv(&mut buf)?;
+            let n = self.recv_deadline(&mut buf, deadline)?;
             if n > buf.len() {
+                // Whatever else the kernel sent for this question is still
+                // queued and would be read as the answer to the next one.
+                self.drain();
                 return Err(io::Error::other("the answer outgrew the buffer"));
             }
             for msg in messages(&buf[..n]) {
@@ -339,25 +381,54 @@ impl Socket {
         }
     }
 
-    /// Repeats `run_dump` with a growing buffer until it comes back trustworthy.
-    fn dump(&mut self, request: &[u8], want: u16, sink: &mut impl FnMut(&[u8])) -> io::Result<()> {
-        let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
-        let mut size = 256 * 1024;
+    /// Runs a dump to completion, retrying when the kernel flags it as
+    /// interrupted, and returns everything `parse` collected.
+    ///
+    /// The result belongs to this function so a retry starts from nothing -
+    /// collecting into a caller's list would keep the half-read attempt's
+    /// entries in front of the real ones. Each retry sends under a fresh
+    /// sequence number, so whatever an abandoned attempt left queued cannot
+    /// pass for the new answer. The buffer is one fixed 256 KiB: the kernel
+    /// caps a dump datagram far below that, so growing it never helped -
+    /// the retries only ever defend against NLM_F_DUMP_INTR.
+    fn dump<T>(
+        &mut self,
+        request: &[u8],
+        want: u16,
+        what: &str,
+        mut parse: impl FnMut(&[u8], &mut Vec<T>),
+    ) -> io::Result<Vec<T>> {
+        let mut req = request.to_vec();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut out = Vec::new();
         for _ in 0..6 {
-            self.send(request)?;
-            let mut buf = vec![0u8; size];
-            if self.run_dump(&mut buf, want, seq, sink)? {
-                return Ok(());
+            out.clear();
+            self.seq = self.seq.wrapping_add(1);
+            req[8..12].copy_from_slice(&self.seq.to_ne_bytes());
+            self.send(&req)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            match self.run_dump(&mut buf, want, self.seq, deadline, &mut |payload| {
+                parse(payload, &mut out)
+            }) {
+                Ok(true) => return Ok(out),
+                Ok(false) => self.drain(),
+                Err(e) => {
+                    self.drain();
+                    return Err(e);
+                }
             }
-            self.drain();
-            size *= 2;
         }
-        Err(io::Error::other(
-            "forwarding database dump kept changing or outgrew the buffer",
-        ))
+        Err(io::Error::other(format!(
+            "{what} dump kept being interrupted"
+        )))
     }
 
-    /// Throws away whatever is still queued from an abandoned dump.
+    /// Throws away whatever is still queued from an abandoned request.
+    ///
+    /// A signal must not end the draining early: what stays queued would be
+    /// read as the answer to the next question - the sequence number cannot
+    /// tell them apart when a retry reuses it, and an acknowledgement read
+    /// one question late misreports every call after it.
     fn drain(&self) {
         let mut buf = [0u8; 4096];
         loop {
@@ -369,6 +440,9 @@ impl Socket {
                     libc::MSG_DONTWAIT | libc::MSG_TRUNC,
                 )
             };
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             if n <= 0 {
                 return;
             }
@@ -377,14 +451,13 @@ impl Socket {
 
     /// Every forwarding database entry on the host, learnt and configured.
     pub fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
-        self.seq += 1;
         let mut req = Vec::with_capacity(NLMSG_HDR + NDMSG_LEN);
         put_nlmsghdr(
             &mut req,
             (NLMSG_HDR + NDMSG_LEN) as u32,
             RTM_GETNEIGH,
             NLM_F_REQUEST | NLM_F_DUMP,
-            self.seq,
+            0, // dump() assigns a fresh sequence number per attempt
         );
         req.push(libc::AF_BRIDGE as u8); // ndm_family
         req.push(0); // pad1
@@ -394,20 +467,17 @@ impl Socket {
         req.push(0); // flags
         req.push(0); // type
 
-        let mut out = Vec::new();
-        self.dump(&req, RTM_NEWNEIGH, &mut |payload| {
+        self.dump(&req, RTM_NEWNEIGH, "forwarding database", |payload, out| {
             if let Some(e) = parse_fdb(payload) {
                 out.push(e);
             }
-        })?;
-        Ok(out)
+        })
     }
 
     /// The administratively set MAC of every VF of every interface, keyed by
     /// the PF's interface index. This is the address the guest will use, and
     /// it exists whether or not the VF is bound on the host.
     pub fn dump_vf_macs(&mut self) -> io::Result<Vec<(u32, [u8; 6])>> {
-        self.seq += 1;
         let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
         let mut req = Vec::with_capacity(len);
         put_nlmsghdr(
@@ -415,7 +485,7 @@ impl Socket {
             len as u32,
             RTM_GETLINK,
             NLM_F_REQUEST | NLM_F_DUMP,
-            self.seq,
+            0, // dump() assigns a fresh sequence number per attempt
         );
         req.push(libc::AF_UNSPEC as u8);
         req.push(0);
@@ -425,11 +495,9 @@ impl Socket {
         req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
         put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
 
-        let mut out = Vec::new();
-        self.dump(&req, RTM_NEWLINK, &mut |payload| {
-            collect_vf_macs(payload, &mut out)
-        })?;
-        Ok(out)
+        self.dump(&req, RTM_NEWLINK, "interface", |payload, out| {
+            collect_vf_macs(payload, out)
+        })
     }
 
     /// The addresses administratively set on the virtual functions of the
@@ -447,7 +515,7 @@ impl Socket {
     pub fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, [u8; 6])>> {
         let mut out = Vec::new();
         for &index in indices {
-            self.seq += 1;
+            self.seq = self.seq.wrapping_add(1);
             let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
             let mut req = Vec::with_capacity(len);
             put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST, self.seq);
@@ -473,7 +541,6 @@ impl Socket {
     /// Every interface, as the kernel describes it. One dump instead of a walk
     /// over `/sys/class/net`, which costs a few hundred failed file probes.
     pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
-        self.seq += 1;
         let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
         let mut req = Vec::with_capacity(len);
         put_nlmsghdr(
@@ -481,7 +548,7 @@ impl Socket {
             len as u32,
             RTM_GETLINK,
             NLM_F_REQUEST | NLM_F_DUMP,
-            self.seq,
+            0, // dump() assigns a fresh sequence number per attempt
         );
         req.push(libc::AF_UNSPEC as u8);
         req.push(0);
@@ -491,19 +558,17 @@ impl Socket {
         req.extend_from_slice(&0u32.to_ne_bytes());
         put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
 
-        let mut out = Vec::new();
-        self.dump(&req, RTM_NEWLINK, &mut |payload| {
+        self.dump(&req, RTM_NEWLINK, "interface", |payload, out| {
             if let Some(l) = parse_link(payload) {
                 out.push(l);
             }
-        })?;
-        Ok(out)
+        })
     }
 
     /// Add or remove an address in an interface's own unicast filter list -
     /// the `bridge fdb ... self permanent` of iproute2.
     pub fn set_self_fdb(&mut self, ifindex: u32, mac: &[u8; 6], add: bool) -> io::Result<()> {
-        self.seq += 1;
+        self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         let len = NLMSG_HDR + NDMSG_LEN + RTATTR_HDR + 6 + 2; // lladdr is padded to 8
         let mut req = Vec::with_capacity(len);
@@ -526,24 +591,41 @@ impl Socket {
         put_attr(&mut req, NDA_LLADDR, mac);
         self.send(&req)?;
 
-        let mut buf = vec![0u8; 8192];
-        let n = self.recv(&mut buf)?.min(buf.len());
-        for msg in messages(&buf[..n]) {
-            if msg.seq == seq && msg.kind == NLMSG_ERROR {
-                if let Some(e) = nlmsg_error(msg.payload) {
-                    return Err(e);
+        // The request asks for an acknowledgement, so one message with this
+        // sequence number is coming. Reading exactly one datagram and hoping
+        // it is the right one is not the same thing: a stray message left
+        // over from an earlier error path would be read instead, the real
+        // acknowledgement would stay queued, and every call after this one
+        // would judge itself by its predecessor's answer.
+        let mut buf = [0u8; 8192];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = self.recv_deadline(&mut buf, deadline)?.min(buf.len());
+            for msg in messages(&buf[..n]) {
+                if msg.seq != seq {
+                    continue;
+                }
+                if msg.kind == NLMSG_ERROR {
+                    return match nlmsg_error(msg.payload) {
+                        Some(e) => Err(e),
+                        None => Ok(()), // the acknowledgement: an error of code zero
+                    };
                 }
             }
         }
-        Ok(())
     }
 
     /// What arrived on the subscription since the last look.
     pub fn recv_events(&self) -> io::Result<Events> {
         let mut buf = vec![0u8; 64 * 1024];
-        // A notification that did not fit is no loss worth chasing: the full
-        // pass that follows every wake-up sees the same state anyway.
-        let n = self.recv(&mut buf)?.min(buf.len());
+        // A notification that did not fit is a loss like ENOBUFS: what was in
+        // it is unknowable, so the caller has to stop trusting what it holds
+        // and read the real state - saying so is the difference between that
+        // and quietly working from half a batch.
+        let n = self.recv(&mut buf)?;
+        if n > buf.len() {
+            return Err(io::Error::other("a notification batch outgrew the buffer"));
+        }
         let mut out = Events::default();
         for msg in messages(&buf[..n]) {
             if msg.kind == RTM_NEWLINK || msg.kind == RTM_DELLINK {
@@ -576,11 +658,20 @@ impl Socket {
             events: libc::POLLIN,
             revents: 0,
         };
+        // A deadline, not a restart: a signal in the middle must not push
+        // the wait out again from the beginning, or a steady trickle of
+        // signals postpones the timed pass forever.
+        let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
         loop {
-            let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+            let left = deadline.saturating_duration_since(Instant::now());
+            let rc =
+                unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
+                    if left.is_zero() {
+                        return Ok(false);
+                    }
                     continue;
                 }
                 return Err(e);
@@ -836,7 +927,9 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut n = 0;
     for part in s.split(':') {
-        if n == 6 || part.len() != 2 {
+        // from_str_radix takes a leading sign, so "+f" reads as 15 - checking
+        // the characters is the only way to accept exactly two hex digits.
+        if n == 6 || part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         out[n] = u8::from_str_radix(part, 16).ok()?;

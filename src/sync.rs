@@ -32,6 +32,10 @@ pub struct Report {
     pub foreign: usize,
 }
 
+/// The virtual functions' addresses, remembered together with the physical
+/// functions they were read for.
+type CarriedVf = (Vec<u32>, Vec<(u32, Mac)>);
+
 pub struct Syncer {
     pub pairs: Vec<Pair>,
     pub exclude: HashSet<Mac>,
@@ -46,11 +50,19 @@ pub struct Syncer {
     pub state_dir: PathBuf,
     /// What the most recent pass cost.
     pub timings: Timings,
-    /// The virtual functions' addresses from the last pass. They are set
+    /// The virtual functions' addresses from the last pass, together with
+    /// the physical functions they were read for. They are set
     /// administratively and announced as link messages, so a pass that no
     /// interface message preceded works from these rather than asking the
-    /// driver again - which is the most expensive thing a pass does.
-    carried_vf: Option<Vec<(u32, Mac)>>,
+    /// driver again - which is the most expensive thing a pass does. The PF
+    /// list is kept so a pass over different pairs cannot inherit answers
+    /// that were never about them.
+    carried_vf: Option<CarriedVf>,
+    /// Which addresses the last pass saw out on the wire, per uplink. The
+    /// fast path has no forwarding dump to work this out from, and an address
+    /// that lives on the wire in one VLAN and behind the bridge in another
+    /// must not flap in and out of the filter on every learning event.
+    carried_wire: HashMap<String, HashSet<Mac>>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -124,6 +136,12 @@ impl Timings {
 /// pass asks the kernel about this interface's virtual functions, and the
 /// exclusion set looks the results up by its index. Two spellings of the same
 /// rule would silently stop excluding anything.
+/// Whether an address may appear in a unicast filter at all: unicast, and
+/// not the all-zero address a never-configured interface reports.
+fn is_registerable(mac: &Mac) -> bool {
+    mac[0] & 1 == 0 && *mac != [0u8; 6]
+}
+
 fn physical_function(topo: &Topology, dev: &str) -> String {
     topo.get(dev)
         .and_then(|l| l.physfn.clone())
@@ -141,6 +159,7 @@ impl Syncer {
             state_dir,
             timings: Timings::default(),
             carried_vf: None,
+            carried_wire: HashMap::new(),
         }
     }
 
@@ -158,12 +177,30 @@ impl Syncer {
     /// up again.
     fn load_owned(&self, dev: &str) -> HashSet<Mac> {
         let mut set = HashSet::new();
-        if let Ok(text) = fs::read_to_string(self.state_path(dev)) {
-            for line in text.lines() {
-                if let Some(mac) = crate::netlink::parse_mac(line.trim()) {
-                    set.insert(mac);
+        match fs::read_to_string(self.state_path(dev)) {
+            Ok(text) => {
+                for line in text.lines() {
+                    match crate::netlink::parse_mac(line.trim()) {
+                        Some(mac) => {
+                            set.insert(mac);
+                        }
+                        None if line.trim().is_empty() => {}
+                        // A line nobody can read is an entry nobody will ever
+                        // take back out of the card. Saying so is all that can
+                        // be done, but silence would look like health.
+                        None => eprintln!(
+                            "warning: {}: unreadable line in the ownership note, \
+                             the entry it named is now nobody's: {line}",
+                            self.state_path(dev).display()
+                        ),
+                    }
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "warning: cannot read {}: {e} - treating every entry there as foreign",
+                self.state_path(dev).display()
+            ),
         }
         set
     }
@@ -180,12 +217,28 @@ impl Syncer {
         if fs::read_to_string(self.state_path(dev)).ok().as_deref() == Some(text.as_str()) {
             return;
         }
-        let _ = fs::create_dir_all(&self.state_dir);
+        // A note that cannot be written strands every entry it should have
+        // named: the next pass reads nothing and counts them as foreign,
+        // forever. That must not happen in silence.
+        //
         // Through a temporary file: a note truncated by a crash mid-write
-        // would read as "we own nothing" and strand every entry in it.
-        let tmp = self.state_path(&format!("{dev}.new"));
-        if fs::write(&tmp, &text).is_ok() && fs::rename(&tmp, self.state_path(dev)).is_err() {
-            let _ = fs::remove_file(&tmp);
+        // would read as "we own nothing" just the same. The name is a hidden
+        // prefix, not a suffix - "eth0.new" is a perfectly legal interface
+        // name whose own note would otherwise be this file.
+        let write = || -> io::Result<()> {
+            fs::create_dir_all(&self.state_dir)?;
+            let tmp = self.state_dir.join(format!(".{dev}.owned.tmp"));
+            fs::write(&tmp, &text)?;
+            fs::rename(&tmp, self.state_path(dev)).map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                e
+            })
+        };
+        if let Err(e) = write() {
+            eprintln!(
+                "warning: cannot write the ownership note for {dev}: {e} - \
+                 what was just registered has no owner on record"
+            );
         }
     }
 
@@ -223,32 +276,117 @@ impl Syncer {
     fn drop_orphans(&self, sock: &mut Socket, topo: &Topology, apply: bool) {
         for dev in self.orphaned() {
             let owned = self.load_owned(&dev);
+            if !apply || self.dry_run {
+                if !owned.is_empty() {
+                    eprintln!(
+                        "{dev}: no longer an uplink, {} address(es) still registered",
+                        owned.len()
+                    );
+                }
+                continue;
+            }
             if owned.is_empty() {
                 let _ = fs::remove_file(self.state_path(&dev));
                 continue;
             }
-            if !apply || self.dry_run {
+            let (gone, kept) = match topo.get(&dev) {
+                Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
+                // The device itself is gone, and a unicast filter does not
+                // outlive its netdev - the entries died with it. (A device
+                // that was merely renamed keeps its entries under the new
+                // name, but a note under the old name could never reach them
+                // anyway.)
+                None => (owned.len(), HashSet::new()),
+            };
+            if kept.is_empty() {
+                eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
+                let _ = fs::remove_file(self.state_path(&dev));
+            } else {
+                // What could not be removed is still in the card; forgetting
+                // it here is how a registration becomes permanent.
                 eprintln!(
-                    "{dev}: no longer an uplink, {} address(es) still registered",
-                    owned.len()
+                    "{dev}: no longer an uplink, removed {gone} address(es), \
+                     {} could not be removed and stay on record",
+                    kept.len()
                 );
-                continue;
+                self.save_owned(&dev, &kept);
             }
-            if let Some(link) = topo.get(&dev) {
-                for mac in &owned {
-                    let _ = sock.set_self_fdb(link.index, mac, false);
+        }
+    }
+
+    /// Takes every one of `owned` back out of the filter. Returns how many
+    /// are gone - removed now, or found already absent - and the set that
+    /// could not be removed and therefore stays owned.
+    fn unregister_all(
+        &self,
+        sock: &mut Socket,
+        dev: &str,
+        ifindex: u32,
+        owned: &HashSet<Mac>,
+    ) -> (usize, HashSet<Mac>) {
+        let mut gone = 0usize;
+        let mut kept = HashSet::new();
+        for mac in owned {
+            match sock.set_self_fdb(ifindex, mac, false) {
+                Ok(()) => gone += 1,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => gone += 1,
+                Err(e) => {
+                    eprintln!("warning: {dev}: cannot unregister {}: {e}", format_mac(mac));
+                    kept.insert(*mac);
                 }
             }
-            eprintln!(
-                "{dev}: no longer an uplink, removed {} address(es)",
-                owned.len()
-            );
-            let _ = fs::remove_file(self.state_path(&dev));
         }
+        (gone, kept)
     }
 
     /// The addresses that belong in `pair`'s filter list, and the ones that
     /// must stay out of it.
+    /// The addresses that must never be registered for `pair`, no matter
+    /// where they were learnt: the operator's exclusions, everything stacked
+    /// on the uplink's wire side, the uplink's and its physical function's
+    /// own addresses, the addresses administratively given to the sister
+    /// virtual functions, and those of VFs bound on the host.
+    ///
+    /// One function, used by the full pass and the fast path alike. The fast
+    /// path once carried its own abbreviation of this list - it had none of
+    /// it - and registered a guest VF's own address, which tells the eSwitch
+    /// the guest lives behind the bridge and sends its traffic past it.
+    fn exclusions(
+        &self,
+        topo: &Topology,
+        pair: &Pair,
+        port: &str,
+        vf_macs: &[(u32, Mac)],
+    ) -> HashSet<Mac> {
+        let mut skip: HashSet<Mac> = HashSet::new();
+        skip.extend(self.exclude.iter().copied());
+        skip.extend(topo.subtree_macs(port));
+        if let Some(l) = topo.get(&pair.dev) {
+            if let Some(mac) = l.mac {
+                skip.insert(mac);
+            }
+        }
+        let pf = physical_function(topo, &pair.dev);
+        if let Some(pf_link) = topo.get(&pf) {
+            if let Some(mac) = pf_link.mac {
+                skip.insert(mac);
+            }
+            for (ifindex, mac) in vf_macs {
+                if *ifindex == pf_link.index {
+                    skip.insert(*mac);
+                }
+            }
+            for vf in &pf_link.vf_netdevs {
+                if let Some(l) = topo.get(vf) {
+                    if let Some(mac) = l.mac {
+                        skip.insert(mac);
+                    }
+                }
+            }
+        }
+        skip
+    }
+
     fn desired(
         &self,
         topo: &Topology,
@@ -256,9 +394,9 @@ impl Syncer {
         port: &str,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
-    ) -> (HashSet<Mac>, Vec<String>) {
+    ) -> (HashSet<Mac>, Vec<String>, HashSet<Mac>) {
         let Some(bridge_link) = topo.get(&pair.bridge) else {
-            return (HashSet::new(), Vec::new());
+            return (HashSet::new(), Vec::new(), HashSet::new());
         };
         let port_index = topo.get(port).map(|l| l.index).unwrap_or(0);
 
@@ -336,40 +474,17 @@ impl Syncer {
             }
         }
 
-        // Everything the host owns on this side of the uplink.
-        let mut skip: HashSet<Mac> = wire;
-        skip.extend(self.exclude.iter().copied());
-        skip.extend(topo.subtree_macs(port));
-        if let Some(l) = topo.get(&pair.dev) {
-            if let Some(mac) = l.mac {
-                skip.insert(mac);
-            }
-        }
-        let pf = physical_function(topo, &pair.dev);
-        if let Some(pf_link) = topo.get(&pf) {
-            if let Some(mac) = pf_link.mac {
-                skip.insert(mac);
-            }
-            for (ifindex, mac) in vf_macs {
-                if *ifindex == pf_link.index {
-                    skip.insert(*mac);
-                }
-            }
-            for vf in &pf_link.vf_netdevs {
-                if let Some(l) = topo.get(vf) {
-                    if let Some(mac) = l.mac {
-                        skip.insert(mac);
-                    }
-                }
-            }
-        }
+        // Everything the host owns on this side of the uplink, plus what the
+        // wire already carries.
+        let mut skip: HashSet<Mac> = self.exclusions(topo, pair, port, vf_macs);
+        skip.extend(wire.iter().copied());
 
         // Addresses pinned by configuration are registered even when nothing
         // has been heard from them yet - for a device that never speaks first,
         // or to close the gap before a guest's first frame.
         want.extend(self.extra.iter().copied());
 
-        want.retain(|m| !skip.contains(m) && m[0] & 1 == 0);
+        want.retain(|m| !skip.contains(m) && is_registerable(m));
 
         for m in &self.extra {
             if !want.contains(m) {
@@ -383,7 +498,7 @@ impl Syncer {
         }
         let mut stacked: Vec<String> = relevant.into_values().collect();
         stacked.sort();
-        (want, stacked)
+        (want, stacked, wire)
     }
 
     /// Bring the filter in line with the bridge.
@@ -407,6 +522,17 @@ impl Syncer {
             ..Default::default()
         };
 
+        // No pairs is not nothing to do: notes can outlive the last pair -
+        // a bridge taken apart leaves its uplink's filter full - and this is
+        // the only place that ever takes those entries back out. The dumps
+        // serve the pairs and are skipped.
+        if self.pairs.is_empty() {
+            self.drop_orphans(sock, topo, apply);
+            timings.total = topo_load + started.elapsed();
+            self.timings = timings;
+            return Ok(Vec::new());
+        }
+
         let mark = Instant::now();
         let fdb = sock.dump_fdb()?;
         timings.fdb = mark.elapsed();
@@ -428,8 +554,11 @@ impl Syncer {
                 }
             }
         }
+        // Carried answers count only when they were collected for these very
+        // physical functions - a pass over a different pair list must not
+        // inherit what was never about it.
         let vf_macs = match (&self.carried_vf, interfaces_moved) {
-            (Some(kept), false) => {
+            (Some((for_pfs, kept)), false) if *for_pfs == pfs => {
                 timings.vf_carried = true;
                 kept.clone()
             }
@@ -437,7 +566,7 @@ impl Syncer {
                 let mark = Instant::now();
                 let fresh = sock.vf_macs_of(&pfs)?;
                 timings.vf_macs = mark.elapsed();
-                self.carried_vf = Some(fresh.clone());
+                self.carried_vf = Some((pfs.clone(), fresh.clone()));
                 fresh
             }
         };
@@ -451,12 +580,27 @@ impl Syncer {
         let mark = Instant::now();
         for pair in self.pairs.clone() {
             let Some(dev_link) = topo.get(&pair.dev) else {
+                // The device is gone; its filter went with it. Nothing can be
+                // done here, and pretending otherwise by working from an
+                // empty picture would only produce removals.
                 continue;
             };
+            // Fail closed: a bridge that is missing from this reading makes
+            // every wanted address disappear, and the pass would take that
+            // for "remove everything". An ifreload rebuilding the bridge is
+            // a moment to wait out, not a state to act on.
+            if topo.get(&pair.bridge).is_none() {
+                eprintln!(
+                    "warning: {}: bridge {} not found, leaving the filter alone",
+                    pair.dev, pair.bridge
+                );
+                continue;
+            }
             let dev_index = dev_link.index;
             let driver = dev_link.driver.clone().unwrap_or_default();
             let port = topo.uplink_port(&pair.dev, &pair.bridge);
-            let (want, stacked) = self.desired(topo, &pair, &port, &fdb, &vf_macs);
+            let (want, stacked, wire) = self.desired(topo, &pair, &port, &fdb, &vf_macs);
+            self.carried_wire.insert(pair.dev.clone(), wire);
 
             let present: HashSet<Mac> = fdb
                 .iter()
@@ -482,10 +626,13 @@ impl Syncer {
                         Ok(()) => {
                             owned.insert(*mac);
                         }
-                        // The dump a moment ago said it was absent, so it
-                        // appeared in between - ours in all but timing.
+                        // The dump a moment ago said it was absent, so
+                        // somebody else put it there in between. Claiming it
+                        // would mean deleting somebody else's entry later -
+                        // the same call as --once from a second terminal is
+                        // somebody else. The next pass counts it as foreign.
                         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                            owned.insert(*mac);
+                            added -= 1;
                         }
                         Err(e) => {
                             eprintln!(
@@ -518,6 +665,14 @@ impl Syncer {
                     // note when the removal fails and let the next pass retry.
                     match sock.set_self_fdb(dev_index, &mac, false) {
                         Ok(()) => {
+                            owned.remove(&mac);
+                        }
+                        // Already gone - a driver that cleared its list on
+                        // link-down, or a flush from a second process. The
+                        // point was for it not to be there, and warning about
+                        // it on every pass forever is how a daemon trains its
+                        // operator to stop reading warnings.
+                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                             owned.remove(&mac);
                         }
                         Err(e) => {
@@ -583,19 +738,53 @@ impl Syncer {
         topo: &Topology,
         entries: &[FdbEntry],
     ) -> io::Result<()> {
-        // Where each uplink sits in its bridge is a property of the topology,
-        // which is the same for every entry in the batch. Worked out once
-        // instead of once per entry per pair - the same reason the pass stopped
-        // asking it per forwarding entry.
-        let pairs: Vec<(Pair, String)> = self
+        if self.dry_run || entries.is_empty() {
+            return Ok(());
+        }
+        // Where each uplink sits in its bridge, and which addresses may never
+        // be registered for it, are properties of the topology - the same for
+        // every entry in the batch. Worked out once instead of once per entry
+        // per pair, and taken from the very rule the full pass uses: the fast
+        // path once carried its own abbreviation and registered a guest VF's
+        // own address, which sends that guest's traffic past it.
+        //
+        // The virtual functions' addresses come carried from the last pass
+        // where they fit, else they are asked for now - never assumed empty.
+        let mut pfs: Vec<u32> = Vec::new();
+        for pair in &self.pairs {
+            if let Some(link) = topo.get(&physical_function(topo, &pair.dev)) {
+                if !pfs.contains(&link.index) {
+                    pfs.push(link.index);
+                }
+            }
+        }
+        let vf_macs = match &self.carried_vf {
+            Some((for_pfs, kept)) if *for_pfs == pfs => kept.clone(),
+            _ => {
+                let fresh = sock.vf_macs_of(&pfs)?;
+                self.carried_vf = Some((pfs.clone(), fresh.clone()));
+                fresh
+            }
+        };
+        let pairs: Vec<(Pair, String, HashSet<Mac>)> = self
             .pairs
             .iter()
-            .map(|p| (p.clone(), topo.uplink_port(&p.dev, &p.bridge)))
+            .map(|p| {
+                let port = topo.uplink_port(&p.dev, &p.bridge);
+                let mut skip = self.exclusions(topo, p, &port, &vf_macs);
+                // What the last full pass saw out on the wire. An address on
+                // the wire in one VLAN and behind the bridge in another must
+                // not flap into the filter on every learning event.
+                if let Some(wire) = self.carried_wire.get(&p.dev) {
+                    skip.extend(wire.iter().copied());
+                }
+                (p.clone(), port, skip)
+            })
             .collect();
 
         let mut touched: HashMap<String, HashSet<Mac>> = HashMap::new();
         for entry in entries {
-            self.fast_add(sock, topo, entry, &pairs, &mut touched)?;
+            self.fast_add(sock, topo, entry, &pairs, &mut touched);
         }
         for (dev, set) in touched {
             self.save_owned(&dev, &set);
@@ -608,19 +797,22 @@ impl Syncer {
         sock: &mut Socket,
         topo: &Topology,
         entry: &FdbEntry,
-        pairs: &[(Pair, String)],
+        pairs: &[(Pair, String, HashSet<Mac>)],
         touched: &mut HashMap<String, HashSet<Mac>>,
-    ) -> io::Result<()> {
-        if !entry.is_learned() || !entry.is_unicast() {
-            return Ok(());
+    ) {
+        if !entry.is_learned() || !is_registerable(&entry.mac) {
+            return;
         }
         let Some(master) = entry.master else {
-            return Ok(());
+            return;
         };
         let Some(port_name) = topo.name_of(entry.ifindex).map(|s| s.to_string()) else {
-            return Ok(());
+            return;
         };
-        for (pair, port) in pairs {
+        for (pair, port, skip) in pairs {
+            if skip.contains(&entry.mac) {
+                continue; // excluded, the host's own, a VF's, or out on the wire
+            }
             let Some(bridge_link) = topo.get(&pair.bridge) else {
                 continue;
             };
@@ -648,9 +840,6 @@ impl Syncer {
             let Some(dev_link) = topo.get(&pair.dev) else {
                 continue;
             };
-            if self.dry_run {
-                continue;
-            }
             match sock.set_self_fdb(dev_link.index, &entry.mac, true) {
                 Ok(()) => {
                     touched
@@ -670,26 +859,38 @@ impl Syncer {
                 ),
             }
         }
-        Ok(())
     }
 
     /// Over the notes rather than over the pairs: `--flush` promises to remove
     /// every address this daemon registered, and some of them belong to
     /// devices that have since stopped being an uplink.
-    pub fn flush(&mut self, sock: &mut Socket) -> io::Result<()> {
+    pub fn flush(&mut self, sock: &mut Socket) -> io::Result<bool> {
         let topo = Topology::load()?;
+        let mut clean = true;
         for dev in self.noted_devices() {
             let owned = self.load_owned(&dev);
-            let n = owned.len();
-            if let Some(link) = topo.get(&dev) {
-                for mac in &owned {
-                    let _ = sock.set_self_fdb(link.index, mac, false);
-                }
+            if self.dry_run {
+                println!("{dev}: would remove {} address(es)", owned.len());
+                continue;
             }
-            let _ = fs::remove_file(self.state_path(&dev));
-            println!("{dev}: removed {n} address(es)");
+            let (gone, kept) = match topo.get(&dev) {
+                Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
+                None => (owned.len(), HashSet::new()),
+            };
+            if kept.is_empty() {
+                let _ = fs::remove_file(self.state_path(&dev));
+                println!("{dev}: removed {gone} address(es)");
+            } else {
+                self.save_owned(&dev, &kept);
+                println!(
+                    "{dev}: removed {gone} address(es), {} could not be removed \
+                     and stay on record",
+                    kept.len()
+                );
+                clean = false;
+            }
         }
-        Ok(())
+        Ok(clean)
     }
 }
 
@@ -786,7 +987,7 @@ pub(crate) mod tests {
     #[test]
     fn registers_what_is_behind_the_bridge_and_nothing_else() {
         let topo = host(mac(1));
-        let (want, stacked) = syncer().desired(&topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
+        let (want, stacked, _) = syncer().desired(&topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
 
         assert!(want.contains(&BEHIND_NIC), "the bridge's other NIC");
         assert!(
@@ -840,14 +1041,14 @@ pub(crate) mod tests {
         };
 
         let odd = mac(0x99);
-        let (want, stacked) = syncer().desired(&plain(odd), &p, "nic1", &[], &[]);
+        let (want, stacked, _) = syncer().desired(&plain(odd), &p, "nic1", &[], &[]);
         assert!(
             want.contains(&odd),
             "a bridge address that is not the uplink's must be registered"
         );
         assert!(stacked.is_empty(), "nothing is stacked on this one");
 
-        let (want, _) = syncer().desired(&plain(mac(1)), &p, "nic1", &[], &[]);
+        let (want, _, _) = syncer().desired(&plain(mac(1)), &p, "nic1", &[], &[]);
         assert!(
             !want.contains(&mac(1)),
             "when it is the uplink's address there is nothing to do"
@@ -873,7 +1074,7 @@ pub(crate) mod tests {
             dev: "nic1".into(),
             bridge: "br0".into(),
         };
-        let (want, _) = syncer().desired(&topo, &p, "nic1", &[], &[]);
+        let (want, _, _) = syncer().desired(&topo, &p, "nic1", &[], &[]);
         assert!(want.contains(&vlan_mac));
     }
 
@@ -882,7 +1083,7 @@ pub(crate) mod tests {
         let topo = host(mac(1));
         let mut s = syncer();
         s.exclude.insert(BEHIND_GUEST);
-        let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
         assert!(!want.contains(&BEHIND_GUEST));
         assert!(want.contains(&BEHIND_NIC));
     }
@@ -917,7 +1118,7 @@ pub(crate) mod tests {
             dev: "nic1".into(),
             bridge: "br0".into(),
         };
-        let (want, _) = syncer().desired(&topo, &p, "bond0", &entries, &[]);
+        let (want, _, _) = syncer().desired(&topo, &p, "bond0", &entries, &[]);
         assert!(want.contains(&BEHIND_NIC));
         assert!(
             !want.contains(&WIRE),
@@ -942,7 +1143,7 @@ mod extra_tests {
         let topo = host(mac(1));
         let mut s = syncer();
         s.extra.insert(unheard);
-        let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
         assert!(
             want.contains(&unheard),
             "nothing has ever been heard from it"
@@ -956,7 +1157,7 @@ mod extra_tests {
         let mut s = syncer();
         s.extra.insert(WIRE);
         s.extra.insert(mac(1));
-        let (want, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
         assert!(!want.contains(&WIRE), "it lives out on the wire");
         assert!(!want.contains(&mac(1)), "it is the uplink's own address");
     }
