@@ -746,7 +746,7 @@ fn run() -> Result<bool, String> {
                 if events.links_changed {
                     stale = true;
                 }
-                trigger = if events.fdb.is_empty() {
+                let batch_trigger = if events.fdb.is_empty() {
                     "interface change"
                 } else {
                     "forwarding change"
@@ -768,6 +768,12 @@ fn run() -> Result<bool, String> {
                         Err(e) => eprintln!("warning: {e}"),
                     }
                 }
+                // Whether the batch left anything for a pass to do. A pass
+                // dumps the host's whole forwarding table, so a batch that
+                // was entirely somebody else's - learning on the wire that
+                // was never ours, entries on unrelated bridges - must not
+                // buy one. Link changes always do.
+                let mut worth_a_pass = events.links_changed;
                 if let Some(topo) = held.as_ref() {
                     // The whole batch, both kinds. What each means is the
                     // fast path's business: an address learnt behind the
@@ -775,8 +781,26 @@ fn run() -> Result<bool, String> {
                     // port is taken back out if it was ours, and a deletion
                     // is left to the pass that follows - one entry going
                     // does not mean the address is gone.
-                    let _ = syncer.fast_apply(&mut sock, topo, &events.fdb);
+                    match syncer.fast_apply(&mut sock, topo, &events.fdb) {
+                        Ok(worth) => worth_a_pass |= worth,
+                        // It could not do its work, so the pass has to.
+                        Err(e) => {
+                            eprintln!("warning: answering the batch failed: {e}");
+                            worth_a_pass = true;
+                        }
+                    }
+                } else {
+                    worth_a_pass = true; // no picture to judge it by
                 }
+                if !worth_a_pass {
+                    // Nothing to reconcile, so nothing is scheduled - and the
+                    // name of this batch is not carried into whatever pass
+                    // does come next. A pass that runs on the timer has to
+                    // say "timed", or the one line that tells whether the
+                    // timer ever catches anything stops meaning it.
+                    continue;
+                }
+                trigger = batch_trigger;
 
                 // The full pass still has to follow - it is what removes
                 // stale entries and reconciles the notes - but nothing waits

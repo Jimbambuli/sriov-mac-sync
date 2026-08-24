@@ -29,7 +29,9 @@ struct FastPair {
     port: u32,
     /// the uplink's own interface index, which the filter is written to
     index: u32,
-    /// addresses that may not be registered for this uplink
+    /// addresses that may not be registered for this uplink: the host's own,
+    /// the virtual functions', the configured exclusions, and whatever this
+    /// batch has just seen out on the wire
     skip: Set<Mac>,
 }
 
@@ -273,6 +275,25 @@ impl Syncer {
         let set = self.read_owned(dev);
         self.remember(dev, &set);
         set
+    }
+
+    /// Whether one address is on record as ours, without copying the record.
+    ///
+    /// `load_owned` hands back a set, which means cloning it. On the path
+    /// that answers a burst of learning that is all wire-side, that clone was
+    /// the whole cost: a set holding every address this uplink has registered,
+    /// copied once per batch, to establish that none of the batch is in it.
+    fn owns(&self, dev: &str, mac: &Mac) -> bool {
+        if let Ok(meta) = fs::metadata(self.state_path(dev)) {
+            if let Some(note) = self.notes.borrow().get(dev) {
+                if note.is_still(&meta) {
+                    return note.macs.contains(mac);
+                }
+            }
+        }
+        let set = self.read_owned(dev);
+        self.remember(dev, &set);
+        set.contains(mac)
     }
 
     /// Note what was just read or written, together with what the file looks
@@ -891,15 +912,33 @@ impl Syncer {
     /// end. Doing it per address meant rewriting a growing file for every
     /// entry of a burst - work that squares with the size of the burst, which
     /// is exactly when there is least of it to spare.
+    /// Returns whether the batch is worth a full pass. A batch of learning
+    /// that turns out to be entirely somebody else's - addresses appearing on
+    /// the wire that were never ours, entries on bridges that have nothing to
+    /// do with any uplink - leaves nothing for a pass to reconcile, and a
+    /// pass is the expensive thing here: it dumps the host's whole forwarding
+    /// table. On a busy host that is the difference between answering an
+    /// event and being flattened by it.
     pub fn fast_apply(
         &mut self,
         sock: &mut dyn FdbWriter,
         topo: &Topology,
         events: &[(u16, FdbEntry)],
-    ) -> io::Result<()> {
-        if self.dry_run || events.is_empty() {
-            return Ok(());
+    ) -> io::Result<bool> {
+        if events.is_empty() {
+            return Ok(false);
         }
+        // A dry run changes nothing, so nothing here can decide a pass is
+        // unnecessary - and the pass is where a dry run does its reporting.
+        if self.dry_run {
+            return Ok(true);
+        }
+        // A deletion is not acted on here, but it is a reason to look: it may
+        // have been the last copy of an address that is now to come out, and
+        // only a full dump can tell.
+        let mut worth_a_pass = events
+            .iter()
+            .any(|(kind, _)| *kind == crate::netlink::RTM_DELNEIGH);
         // Where each uplink sits in its bridge, and which addresses may never
         // be registered for it, are properties of the topology - the same for
         // every entry in the batch. Worked out once instead of once per entry
@@ -934,13 +973,7 @@ impl Syncer {
                 let dev = topo.index_of(&p.dev)?;
                 let bridge = topo.index_of(&p.bridge)?;
                 let port = topo.uplink_port(dev, bridge);
-                let mut skip = self.exclusions(topo, dev, port, &vf_macs);
-                // What the last full pass saw out on the wire. An address on
-                // the wire in one VLAN and behind the bridge in another must
-                // not flap into the filter on every learning event.
-                if let Some(wire) = self.carried_wire.get(&p.dev) {
-                    skip.extend(wire.iter().copied());
-                }
+                let skip = self.exclusions(topo, dev, port, &vf_macs);
                 Some(FastPair {
                     dev: p.dev.clone(),
                     bridge,
@@ -971,8 +1004,20 @@ impl Syncer {
             let Some(macs) = reflected.get(&fp.dev) else {
                 continue;
             };
+            // For the rest of this batch these are wire addresses - the whole
+            // batch is one moment, and in it the wire has the last word.
+            fp.skip.extend(macs.iter().copied());
+            // Nothing of ours among them is the ordinary case on a busy
+            // segment: every address the switch carries is learnt here
+            // sooner or later. Establishing it without copying the record of
+            // what we own is the difference between answering that traffic
+            // and being buried by it.
+            if !macs.iter().any(|m| self.owns(&fp.dev, m)) {
+                continue;
+            }
             let mut owned = self.load_owned(&fp.dev);
             let mut changed = false;
+            let mut taken_back: Vec<Mac> = Vec::new();
             for mac in macs {
                 // Only ever our own registrations. An address somebody else
                 // put in the filter is theirs to remove, on the wire or not.
@@ -983,6 +1028,8 @@ impl Syncer {
                     Ok(()) => {
                         owned.remove(mac);
                         changed = true;
+                        worth_a_pass = true;
+                        taken_back.push(*mac);
                         eprintln!(
                             "{}: {} moved out onto the wire, unregistered [reflection]",
                             fp.dev,
@@ -1006,13 +1053,20 @@ impl Syncer {
             if changed {
                 self.save_owned(&fp.dev, &owned);
             }
-            // For the rest of this batch, and until the next full pass says
-            // otherwise, these are wire addresses.
-            fp.skip.extend(macs.iter().copied());
-            self.carried_wire
-                .entry(fp.dev.clone())
-                .or_default()
-                .extend(macs.iter().copied());
+            // Beyond the batch, only the ones actually taken out of the
+            // filter are remembered, so that the next batch does not put back
+            // what this one removed. Remembering every address ever seen on
+            // the wire would be a set that only grows: the full pass replaces
+            // this set from the real forwarding table, and a run of wire-side
+            // learning no longer schedules one - which is precisely when the
+            // growth would be unbounded, and each batch would then be paying
+            // to copy it.
+            if !taken_back.is_empty() {
+                self.carried_wire
+                    .entry(fp.dev.clone())
+                    .or_default()
+                    .extend(taken_back);
+            }
         }
 
         let mut touched: Map<String, Set<Mac>> = crate::hash::map();
@@ -1020,14 +1074,20 @@ impl Syncer {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
             }
-            self.fast_add(sock, topo, entry, &pairs, &mut touched);
+            if self.fast_add(sock, topo, entry, &pairs, &mut touched) {
+                worth_a_pass = true;
+            }
         }
         for (dev, set) in touched {
             self.save_owned(&dev, &set);
         }
-        Ok(())
+        Ok(worth_a_pass)
     }
 
+    /// Returns whether this entry was any of our business - registered,
+    /// refused, or something the full pass will have to look at. An entry
+    /// that concerns none of the pairs returns false, and a batch made
+    /// entirely of those does not earn a pass.
     fn fast_add(
         &self,
         sock: &mut dyn FdbWriter,
@@ -1035,19 +1095,37 @@ impl Syncer {
         entry: &FdbEntry,
         pairs: &[FastPair],
         touched: &mut Map<String, Set<Mac>>,
-    ) {
+    ) -> bool {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
-            return;
+            return false;
         }
         let Some(master) = entry.master else {
-            return;
+            return false;
         };
         if topo.at(entry.ifindex).is_none() {
-            return; // an interface this reading does not have
+            return false; // an interface this reading does not have
         }
+        let mut ours = false;
         for fp in pairs {
             if fp.skip.contains(&entry.mac) {
                 continue; // excluded, the host's own, a VF's, or out on the wire
+            }
+            // What the last full pass saw out on the wire. An address on the
+            // wire in one VLAN and behind the bridge in another must not flap
+            // into the filter on every learning event.
+            //
+            // Looked up here rather than folded into `skip` when the batch is
+            // prepared: on a busy segment that set holds every address the
+            // switch carries - fourteen thousand of them on the host this was
+            // measured on - and copying it into the skip set cost 550 us per
+            // batch, which is to say per address learnt anywhere on the
+            // bridge. Two lookups are two lookups whatever the set holds.
+            if self
+                .carried_wire
+                .get(&fp.dev)
+                .is_some_and(|w| w.contains(&entry.mac))
+            {
+                continue;
             }
             if entry.ifindex == fp.port {
                 continue; // on the wire; handled before any of this
@@ -1068,6 +1146,7 @@ impl Syncer {
             if topo.leads_to(entry.ifindex, fp.bridge) {
                 continue;
             }
+            ours = true;
             match sock.set_self_fdb(fp.index, &entry.mac, true) {
                 Ok(()) => {
                     touched
@@ -1087,6 +1166,7 @@ impl Syncer {
                 ),
             }
         }
+        ours
     }
 
     /// Over the notes rather than over the pairs: `--flush` promises to remove
@@ -2263,6 +2343,83 @@ mod state_tests {
             s.load_owned("nic1"),
             [BEHIND_GUEST].into_iter().collect::<Set<_>>(),
             "a note whose timestamp is not older than the read has to be read"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pass dumps the host's whole forwarding table, so what a batch is
+    /// worth has to be decided before one is scheduled. These are the four
+    /// answers - and the difference between the first two is what the eBPF
+    /// experiment measured as 3.5 seconds of CPU for nothing.
+    ///
+    /// Verified by mutation: returning true unconditionally makes the
+    /// wire-side cases fail; returning false makes the others fail.
+    #[test]
+    fn only_a_batch_with_something_in_it_earns_a_pass() {
+        let dir = scratch("worth");
+        let topo = host(mac(1));
+        let vf = vec![(2, VF_ADMIN)];
+
+        let mut s = ready_syncer(&dir);
+        s.carried_vf = Some((vec![2], vf.clone()));
+        let mut sock = FakeSock::default();
+
+        // Somebody else's address, learnt out on the wire. Nothing of ours.
+        assert!(
+            !s.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))]
+            )
+            .unwrap(),
+            "learning on the wire that was never ours leaves nothing to reconcile"
+        );
+
+        // An entry on a bridge that has nothing to do with this uplink.
+        assert!(
+            !s.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_NEWNEIGH, learned(22, 20, OTHER_BRIDGE))]
+            )
+            .unwrap(),
+            "another bridge's forwarding is not this uplink's business"
+        );
+
+        // A guest behind the bridge: registered, and the pass reconciles.
+        assert!(
+            s.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))]
+            )
+            .unwrap(),
+            "an address behind the bridge is ours"
+        );
+
+        // A deletion: only a full dump can say whether that was the last copy.
+        assert!(
+            s.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))]
+            )
+            .unwrap(),
+            "a deletion has to be looked at, even though it is not acted on"
+        );
+
+        // One of ours turning up on the wire: unregistered here, reconciled there.
+        let mut s2 = ready_syncer(&dir);
+        s2.carried_vf = Some((vec![2], vf));
+        s2.save_owned("nic1", &[BEHIND_GUEST].into_iter().collect::<Set<_>>());
+        assert!(
+            s2.fast_apply(
+                &mut sock,
+                &topo,
+                &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))]
+            )
+            .unwrap(),
+            "taking one of ours back out is a change the pass has to see"
         );
         let _ = fs::remove_dir_all(&dir);
     }
