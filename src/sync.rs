@@ -264,36 +264,28 @@ impl Syncer {
     /// read is never believed either, since a write in the same clock tick as
     /// the read cannot be told from one before it.
     fn load_owned(&self, dev: &str) -> Set<Mac> {
-        let path = self.state_path(dev);
-        if let Ok(meta) = fs::metadata(&path) {
-            if let Some(note) = self.notes.borrow().get(dev) {
-                if note.is_still(&meta) {
-                    return note.macs.clone();
-                }
-            }
-        }
-        let set = self.read_owned(dev);
-        self.remember(dev, &set);
-        set
+        self.with_owned(dev, |s| s.clone())
     }
 
-    /// Whether one address is on record as ours, without copying the record.
-    ///
-    /// `load_owned` hands back a set, which means cloning it. On the path
-    /// that answers a burst of learning that is all wire-side, that clone was
-    /// the whole cost: a set holding every address this uplink has registered,
-    /// copied once per batch, to establish that none of the batch is in it.
-    fn owns(&self, dev: &str, mac: &Mac) -> bool {
-        if let Ok(meta) = fs::metadata(self.state_path(dev)) {
-            if let Some(note) = self.notes.borrow().get(dev) {
-                if note.is_still(&meta) {
-                    return note.macs.contains(mac);
-                }
-            }
+    /// The note, without copying it. One check of the file, then the answer.
+    fn with_owned<R>(&self, dev: &str, f: impl FnOnce(&Set<Mac>) -> R) -> R {
+        let usable = match fs::metadata(self.state_path(dev)) {
+            Ok(meta) => self
+                .notes
+                .borrow()
+                .get(dev)
+                .is_some_and(|note| note.is_still(&meta)),
+            Err(_) => false,
+        };
+        if !usable {
+            let set = self.read_owned(dev);
+            self.remember(dev, &set);
         }
-        let set = self.read_owned(dev);
-        self.remember(dev, &set);
-        set.contains(mac)
+        match self.notes.borrow().get(dev) {
+            Some(note) => f(&note.macs),
+            // Nothing on record: no file, or one that could not be read.
+            None => f(&crate::hash::set()),
+        }
     }
 
     /// Note what was just read or written, together with what the file looks
@@ -414,10 +406,13 @@ impl Syncer {
     /// learning 200 addresses a second: 1878 rewrites of a growing file in ten
     /// seconds, and the sorting was the single largest thing the daemon did.
     ///
-    /// The file stops being sorted and may hold an address twice; both are
-    /// fine, because it is read into a set and the next full pass rewrites it
-    /// properly. What matters is that a line, once written, is on disk - the
-    /// note has to name an entry before the entry is anybody's to remove.
+    /// The file stops being sorted, which nothing reads it for - it is read
+    /// into a set. A full pass rewrites it in order only when the set of
+    /// addresses has changed, so an unsorted file can stay unsorted for a
+    /// long time; that is fine, and saying so here is better than implying
+    /// somebody tidies up afterwards. What matters is that a line, once
+    /// written, is in the file before the entry it names is anybody's to
+    /// remove.
     fn append_owned(&self, dev: &str, added: &[Mac]) {
         if self.dry_run || added.is_empty() {
             return;
@@ -1104,7 +1099,10 @@ impl Syncer {
             // sooner or later. Establishing it without copying the record of
             // what we own is the difference between answering that traffic
             // and being buried by it.
-            if !macs.iter().any(|m| self.owns(&fp.dev, m)) {
+            // One look at the note answers for the whole batch. Asking per
+            // address would be a stat per address, on the path whose whole
+            // point is that it is cheap when the answer is no.
+            if !self.with_owned(&fp.dev, |o| macs.iter().any(|m| o.contains(m))) {
                 continue;
             }
             let mut owned = self.load_owned(&fp.dev);
