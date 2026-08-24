@@ -68,7 +68,14 @@ impl Default for Options {
 }
 
 fn usage() {
-    print!(
+    print!("{}", usage_text());
+}
+
+/// The help text, separate from printing it so a test can read it: the
+/// defaults are written out here by hand and drifted from the code once
+/// already.
+fn usage_text() -> String {
+    format!(
         "\
 sriov-mac-sync {VERSION} - keep an SR-IOV uplink's unicast filter in step with
 the bridge behind it
@@ -87,7 +94,7 @@ usage: sriov-mac-sync [options]
                   relies on the faster one.
   --dry-run       report changes without applying them
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
-  --interval SEC  full reconciliation interval (default 60)
+  --interval SEC  full reconciliation interval (default 300)
   --max NUM       warn above this many addresses per uplink (default 128)
   --exclude MACS  comma separated addresses never to register
   --extra MACS    comma separated addresses to register unconditionally
@@ -99,7 +106,7 @@ Pairs are found automatically: every interface with virtual functions that ends
 up in a bridge, following bonds. {CONF} may set PAIRS, RESYNC,
 MAX_MACS, EXCLUDE and EXTRA.
 "
-    );
+    )
 }
 
 /// Addresses from the command line or the configuration file. A typo here
@@ -162,7 +169,11 @@ fn load_conf(opts: &mut Options) {
 }
 
 fn parse_args(opts: &mut Options) -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
+    parse_args_from(opts, std::env::args().skip(1))
+}
+
+fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> Result<(), String> {
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => opts.mode = Mode::Once,
@@ -668,5 +679,132 @@ fn main() -> ExitCode {
             eprintln!("sriov-mac-sync: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The help text names the defaults in prose. It said 60 while the code
+    /// said 300, and nothing noticed until somebody read both.
+    #[test]
+    fn help_states_the_defaults_the_code_actually_uses() {
+        let d = Options::default();
+        let text = usage_text();
+        assert!(
+            text.contains(&format!("(default {})", d.interval)),
+            "help does not name the real interval default of {}:\n{text}",
+            d.interval
+        );
+        assert!(
+            text.contains(&format!("(default {})", d.max_macs)),
+            "help does not name the real max default of {}:\n{text}",
+            d.max_macs
+        );
+    }
+
+    #[test]
+    fn every_documented_option_is_accepted() {
+        let text = usage_text();
+        // The long options the help offers, minus the two that exit the process.
+        for opt in text
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.starts_with("--"))
+            .filter(|w| !matches!(*w, "--help" | "--version"))
+        {
+            let mut o = Options::default();
+            let with_value = match opt {
+                "--pair" => Some("nic0:vmbr0"),
+                "--interval" => Some("42"),
+                "--max" => Some("7"),
+                "--exclude" | "--extra" => Some("02:00:00:00:00:01"),
+                _ => None,
+            };
+            let argv = match with_value {
+                Some(v) => args(&[opt, v]),
+                None => args(&[opt]),
+            };
+            assert!(
+                parse_args_from(&mut o, argv.into_iter()).is_ok(),
+                "help offers {opt}, but parsing it fails"
+            );
+        }
+    }
+
+    #[test]
+    fn values_reach_the_options() {
+        let mut o = Options::default();
+        parse_args_from(
+            &mut o,
+            args(&["--interval", "42", "--max", "7"]).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(o.interval, 42);
+        assert_eq!(o.max_macs, 7);
+    }
+
+    #[test]
+    fn a_pair_is_kept_verbatim_and_repeatable() {
+        let mut o = Options::default();
+        parse_args_from(
+            &mut o,
+            args(&["--pair", "nic0:vmbr0", "--pair", "nic1:vmbr1"]).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(o.pairs, vec!["nic0:vmbr0", "nic1:vmbr1"]);
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_rather_than_ignored() {
+        let mut o = Options::default();
+        let e = parse_args_from(&mut o, args(&["--nonsense"]).into_iter()).unwrap_err();
+        assert!(
+            e.contains("--nonsense"),
+            "the message hides the option: {e}"
+        );
+    }
+
+    #[test]
+    fn an_option_missing_its_value_is_refused() {
+        for opt in ["--pair", "--interval", "--max", "--exclude", "--extra"] {
+            let mut o = Options::default();
+            assert!(
+                parse_args_from(&mut o, args(&[opt]).into_iter()).is_err(),
+                "{opt} without a value was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_number_is_refused_rather_than_silently_default() {
+        let mut o = Options::default();
+        assert!(parse_args_from(&mut o, args(&["--interval", "soon"]).into_iter()).is_err());
+        let mut o = Options::default();
+        assert!(parse_args_from(&mut o, args(&["--max", "lots"]).into_iter()).is_err());
+    }
+
+    #[test]
+    fn addresses_are_parsed_and_typos_dropped_not_guessed() {
+        let good = macs("extra", &args(&["02:00:00:00:00:01", "aa:bb:cc:dd:ee:ff"]));
+        assert_eq!(good.len(), 2);
+        assert!(good.contains(&[0x02, 0, 0, 0, 0, 0x01]));
+
+        // A typo must not turn into some other address.
+        let bad = macs("extra", &args(&["02:00:00:00:00:0", "not-an-address", ""]));
+        assert!(bad.is_empty(), "a malformed address was accepted: {bad:?}");
+    }
+
+    #[test]
+    fn the_daemon_is_the_mode_without_arguments() {
+        let mut o = Options::default();
+        parse_args_from(&mut o, args(&[]).into_iter()).unwrap();
+        assert!(matches!(o.mode, Mode::Daemon));
+        assert!(!o.dry_run && !o.verbose);
     }
 }
