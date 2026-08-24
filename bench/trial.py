@@ -5,7 +5,7 @@ One run provokes the situations the daemon exists for, verifies that each
 came out right, and reports what it cost:
 
   S1  eight addresses learnt one at a time   -> fast-path latency, each
-  S2  four addresses landing mid-settle      -> full-pass latency, separately
+  S2  pairs sent 50 ms apart                 -> close-succession latency
   S3  a burst of sixteen at once             -> burst turnaround, one figure
   S4  a hundred cold passes of --once        -> per-phase min/median/p95/max
   S5  the test port deleted                  -> everything taken back, bounded
@@ -106,6 +106,7 @@ class Cleanup:
             return
         self.done = True
         subprocess.run(["ip", "link", "del", VETH], capture_output=True)
+        purge_learned_residue()
         # No note surgery, ever: the daemon's ENOENT path heals the notes on
         # the next pass once the entries are gone from the card.
 
@@ -192,6 +193,33 @@ def watched_pairs(binary):
 def self_macs(uplink):
     out = run(["bridge", "fdb", "show", "dev", uplink]).stdout
     return sorted(l.split()[0] for l in out.splitlines() if " self permanent" in " " + l)
+
+
+def purge_learned_residue():
+    """A bridge carrying stacked vnets is promiscuous: every injected frame
+    gets a host-bound copy regardless of its destination, and the vnet
+    bridges above learn the test sources from it. The copies never leave the
+    host, but the learned entries would sit there for the 300 s ageing time -
+    so they are taken out, and only they: learned master entries under our
+    prefixes, never anything self or foreign."""
+    out = run(["bridge", "fdb", "show"]).stdout
+    removed = 0
+    for line in out.splitlines():
+        f = line.split()
+        if not f or not f[0].startswith(("02:be:5c", "fe:be:5c")):
+            continue
+        if "master" in f and "self" not in f and "permanent" not in f:
+            dev = f[f.index("dev") + 1]
+            run(["bridge", "fdb", "del", f[0], "dev", dev, "master"])
+            removed += 1
+    return removed
+
+
+def fdb_residue():
+    return [
+        l for l in run(["bridge", "fdb", "show"]).stdout.splitlines()
+        if l.startswith(("02:be:5c", "fe:be:5c"))
+    ]
 
 
 def note_bytes(uplink):
@@ -282,13 +310,17 @@ class Trial:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}: {detail}")
 
     def setup_port(self):
-        # addrgenmode none, and the VLAN before anything comes up: a veth
-        # that goes up starts IPv6 address configuration, and its multicast
-        # would land in the default PVID - the real network - sourced from a
-        # MAC the daemon would then dutifully register.
+        # IPv6 fully off on both ends, and the VLAN before anything comes
+        # up: addrgenmode none alone only withholds the address - the stack
+        # still emits an MLD report from the port's MAC, which the bridge
+        # floods out of the uplink into the real network. Found the honest
+        # way: a later run on the neighbour host refused itself because it
+        # discovered exactly that MAC learnt on its wire side.
         cmds = [
             ["ip", "link", "add", VETH, "address", PORT_MAC,
              "type", "veth", "peer", "name", VETH_PEER, "address", PEER_MAC],
+            ["sysctl", "-qw", f"net.ipv6.conf.{VETH}.disable_ipv6=1"],
+            ["sysctl", "-qw", f"net.ipv6.conf.{VETH_PEER}.disable_ipv6=1"],
             ["ip", "link", "set", VETH, "addrgenmode", "none"],
             ["ip", "link", "set", VETH_PEER, "addrgenmode", "none"],
             ["ip", "link", "set", VETH, "master", self.args.bridge],
@@ -305,19 +337,19 @@ class Trial:
             if r.returncode != 0:
                 fail(f"{' '.join(cmd)}: {r.stderr.strip()}")
         self.port_idx = int(read(f"/sys/class/net/{VETH}/ifindex"))
-        # dst = bench0's own address: our `bridge vlan add dev bench0` gives
-        # that MAC a local FDB entry in the test VLAN itself, so the frame
-        # terminates at the ingress port in the plain and the VLAN-aware case
-        # alike. The bridge's own MAC would NOT do: on a VLAN-aware bridge it
-        # is local only in the VIDs of the bridge-self port, and everything
-        # else is unknown unicast - flooded out of the uplink into the real
-        # network.
-        self.dst = mac_bytes(PORT_MAC)
         self.tx = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
         self.tx.bind((VETH_PEER, 0))
 
     def send(self, mac):
-        self.tx.send(self.dst + mac + ETHERTYPE.to_bytes(2, "big") + b"\x00" * 46)
+        # dst == src: the bridge learns the source at ingress, then finds the
+        # destination on that very port and drops the frame - source-port
+        # suppression. Nothing leaves bench0, in any VLAN, yet the learn
+        # notification fires all the same. Every cleverer destination leaked
+        # somewhere: the bridge's own MAC is unknown unicast outside the
+        # bridge-self VIDs (flooded to the wire), and the port's own MAC is a
+        # LOCAL entry - "deliver to the host" - which climbs the VLAN stack
+        # into the bridges above and their guests.
+        self.tx.send(mac + mac + ETHERTYPE.to_bytes(2, "big") + b"\x00" * 46)
         return time.monotonic_ns()
 
     def await_registered(self, mon, macs, deadline_ns):
@@ -357,7 +389,7 @@ class Trial:
         for m in macs:
             self.send(m)
             self.await_registered(mon, [m], time.monotonic_ns() + 3_000_000_000)
-            time.sleep(0.3)  # stay clear of the 200 ms settle lull on purpose
+            time.sleep(0.3)  # generous spacing: each address stands alone
         mon.pump(time.monotonic_ns() + 200_000_000)
         for m in macs:
             l = self.latency(mon, m)
@@ -371,25 +403,25 @@ class Trial:
         self.verdict("fast path", ok, detail)
 
     def s2_settle_path(self, mon):
-        print("\nS2  an address arriving mid-settle (the slow, ordinary case)")
+        print("\nS2  the second of two addresses sent 50 ms apart")
         lats = []
         pairs_ok = 0
         for _ in range(4):
             a, b = self.macs(2)
             self.send(a)
-            time.sleep(0.05)  # b lands inside a's settle window
+            time.sleep(0.05)  # b follows a closely, as devices in a burst do
             self.send(b)
             self.await_registered(mon, [a, b], time.monotonic_ns() + 6_000_000_000)
             l = self.latency(mon, b)
             if l is not None and self.noted(a) and self.noted(b):
                 pairs_ok += 1
                 lats.append(l)
-            time.sleep(3)  # let settle + pass finish before the next pair
+            time.sleep(3)  # let the follow-up pass finish before the next pair
         ok = pairs_ok == 4
         lats.sort()
         detail = (f"{pairs_ok}/4 pairs; second-address latency min {fmt_ms(lats[0])} "
                   f"median {fmt_ms(percentile(lats, 0.5))} max {fmt_ms(lats[-1])} "
-                  f"(includes the daemon's settle window by design)" if lats else "none made it")
+                  f"(the price of arriving in close succession)" if lats else "none made it")
         self.verdict("settle path", ok, detail)
 
     def s3_burst(self, mon):
@@ -452,6 +484,10 @@ class Trial:
         print("\nS5  the port disappears; everything has to come back out")
         t0 = time.monotonic_ns()
         run(["ip", "link", "del", VETH])
+        purged = purge_learned_residue()
+        if purged:
+            print(f"      ({purged} learned copies swept out of the stacked "
+                  f"bridges - a promiscuous bridge hands every frame upstairs)")
         deadline = t0 + 15_000_000_000
         clean = False
         while time.monotonic_ns() < deadline and not clean:
@@ -462,8 +498,8 @@ class Trial:
                 and b"fe:be:5c" not in note_bytes(u)
                 for u in self.uplinks
             )
-        # A bound, not a latency: the figure is dominated by the daemon's own
-        # 2 s settle window, so anything inside the bound is simply correct.
+        # A bound, not a latency: removal is full-pass work and the pass is
+        # rate-limited, so anything inside the bound is simply correct.
         detail = (f"filters and notes clean on all uplinks within "
                   f"{(time.monotonic_ns() - t0) / 1e9:.1f} s (bound 15 s)"
                   if clean else "TEST ENTRIES LEFT BEHIND - see cleanup advice below")
@@ -487,7 +523,7 @@ class Trial:
             for u in self.uplinks
             for m in post[u][0]
             if m.startswith(("02:be:5c", "fe:be:5c"))
-        ]
+        ] + fdb_residue()
         drift = {
             u
             for u in self.uplinks
@@ -540,7 +576,7 @@ def main():
 
     t = Trial(args, args.binary, uplinks)
     t.setup_port()
-    time.sleep(2.5)  # the port add is an interface event; let its settle pass
+    time.sleep(2.5)  # the port add is an interface event; let its pass run
 
     t.s1_fast_path(mon)
     t.s2_settle_path(mon)
