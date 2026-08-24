@@ -410,9 +410,10 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
     if !pairs.is_empty() {
         let mut syncer = Syncer::new(pairs.to_vec(), PathBuf::from("/nonexistent"));
         syncer.dry_run = true;
+        let bench_topo = Topology::load()?;
         for _ in 0..ROUNDS {
             let s = Instant::now();
-            let _ = syncer.reconcile(sock, false)?;
+            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO)?;
             t_pass += s.elapsed();
         }
     }
@@ -479,7 +480,9 @@ fn run() -> Result<bool, String> {
     load_conf(&mut opts);
     parse_args(&mut opts)?;
 
+    let topo_started = Instant::now();
     let topo = Topology::load().map_err(|e| format!("cannot read /sys/class/net: {e}"))?;
+    let topo_load = topo_started.elapsed();
     let pairs = resolve_pairs(
         &topo,
         &opts,
@@ -511,7 +514,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Status => {
             let reports = syncer
-                .reconcile(&mut sock, false)
+                .reconcile(&mut sock, false, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             for r in &reports {
                 println!("{} on {} ({})", r.dev, r.bridge, r.driver);
@@ -539,7 +542,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Once => {
             let reports = syncer
-                .reconcile(&mut sock, true)
+                .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
             if opts.timings {
@@ -576,24 +579,30 @@ fn run() -> Result<bool, String> {
                     // VFs later, or a bridge built after boot, must not need a
                     // restart to be noticed - and starting before the network
                     // is up must not turn into a crash loop.
-                    if auto {
-                        match Topology::load() {
-                            Ok(topo) => {
-                                let found: Vec<Pair> = topo
-                                    .autodetect()
-                                    .0
-                                    .into_iter()
-                                    .map(|(dev, bridge)| Pair { dev, bridge })
-                                    .collect();
-                                if pair_names(&found) != pair_names(&syncer.pairs) {
-                                    if !found.is_empty() {
-                                        eprintln!("now watching {}", pair_names(&found).join(" "));
-                                        said_empty = false;
-                                    }
-                                    syncer.pairs = found;
-                                }
+                    // One reading of /sys serves both the autodetection and
+                    // the pass. They ask about the same moment, and reading it
+                    // twice was work nobody asked for.
+                    let load_started = Instant::now();
+                    let loaded = match Topology::load() {
+                        Ok(t) => Some((t, load_started.elapsed())),
+                        Err(e) => {
+                            eprintln!("warning: cannot read /sys/class/net: {e}");
+                            None
+                        }
+                    };
+                    if let (true, Some((topo, _))) = (auto, loaded.as_ref()) {
+                        let found: Vec<Pair> = topo
+                            .autodetect()
+                            .0
+                            .into_iter()
+                            .map(|(dev, bridge)| Pair { dev, bridge })
+                            .collect();
+                        if pair_names(&found) != pair_names(&syncer.pairs) {
+                            if !found.is_empty() {
+                                eprintln!("now watching {}", pair_names(&found).join(" "));
+                                said_empty = false;
                             }
-                            Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
+                            syncer.pairs = found;
                         }
                     }
 
@@ -603,7 +612,12 @@ fn run() -> Result<bool, String> {
                             said_empty = true;
                         }
                     } else {
-                        match syncer.reconcile(&mut sock, true) {
+                        let Some((topo, topo_load)) = loaded.as_ref() else {
+                            next_full = Instant::now() + interval;
+                            trigger = "timed";
+                            continue;
+                        };
+                        match syncer.reconcile(&mut sock, true, topo, *topo_load) {
                             Ok(reports) => {
                                 report_changes(
                                     &reports,

@@ -373,13 +373,25 @@ impl Syncer {
         (want, stacked)
     }
 
-    pub fn reconcile(&mut self, sock: &mut Socket, apply: bool) -> io::Result<Vec<Report>> {
+    /// Bring the filter in line with the bridge.
+    ///
+    /// The topology is handed in rather than read here. The caller needs it
+    /// anyway - autodetection runs off the same picture - and reading it twice
+    /// for one pass is work nobody asked for. `topo_load` is how long the
+    /// caller took over it, so the report still accounts for the whole pass.
+    pub fn reconcile(
+        &mut self,
+        sock: &mut Socket,
+        apply: bool,
+        topo: &Topology,
+        topo_load: Duration,
+    ) -> io::Result<Vec<Report>> {
         let started = Instant::now();
-        let mut timings = Timings::default();
-
-        let topo = Topology::load()?;
-        timings.topology = started.elapsed();
-        timings.links = topo.links.len();
+        let mut timings = Timings {
+            topology: topo_load,
+            links: topo.links.len(),
+            ..Default::default()
+        };
 
         let mark = Instant::now();
         let fdb = sock.dump_fdb()?;
@@ -396,7 +408,7 @@ impl Syncer {
         // reach them.
         let mut pfs: Vec<u32> = Vec::new();
         for pair in &self.pairs {
-            if let Some(link) = topo.get(&physical_function(&topo, &pair.dev)) {
+            if let Some(link) = topo.get(&physical_function(topo, &pair.dev)) {
                 if !pfs.contains(&link.index) {
                     pfs.push(link.index);
                 }
@@ -409,7 +421,7 @@ impl Syncer {
 
         let mut reports = Vec::new();
         let mark = Instant::now();
-        self.drop_orphans(sock, &topo, apply);
+        self.drop_orphans(sock, topo, apply);
         timings.orphans = mark.elapsed();
 
         let mark = Instant::now();
@@ -420,7 +432,7 @@ impl Syncer {
             let dev_index = dev_link.index;
             let driver = dev_link.driver.clone().unwrap_or_default();
             let port = topo.uplink_port(&pair.dev, &pair.bridge);
-            let (want, stacked) = self.desired(&topo, &pair, &port, &fdb, &vf_macs);
+            let (want, stacked) = self.desired(topo, &pair, &port, &fdb, &vf_macs);
 
             let present: HashSet<Mac> = fdb
                 .iter()
@@ -524,7 +536,9 @@ impl Syncer {
         timings.pairs = mark.elapsed();
         timings.added = reports.iter().map(|r| r.added).sum();
         timings.removed = reports.iter().map(|r| r.removed).sum();
-        timings.total = started.elapsed();
+        // The caller's reading of /sys belongs to this pass even though it
+        // happened before the clock below started.
+        timings.total = topo_load + started.elapsed();
         self.timings = timings;
         Ok(reports)
     }
