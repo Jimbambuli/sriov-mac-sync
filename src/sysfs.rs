@@ -35,6 +35,10 @@ pub struct Link {
 #[derive(Debug, Default)]
 pub struct Topology {
     pub links: HashMap<String, Link>,
+    /// Interface names by index. The forwarding paths ask this once per
+    /// entry, and a linear scan there is O(entries x pairs x links) exactly
+    /// where the least time is to spare.
+    by_index: HashMap<u32, String>,
 }
 
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
@@ -93,7 +97,10 @@ impl Topology {
 
             if let Ok(rd) = fs::read_dir(&base) {
                 for e in rd.flatten() {
-                    let f = e.file_name().to_string_lossy().into_owned();
+                    // A Cow: nothing is allocated for the ~40 entries that do
+                    // not start with lower_, which is nearly all of them.
+                    let f = e.file_name();
+                    let f = f.to_string_lossy();
                     if let Some(rest) = f.strip_prefix("lower_") {
                         link.lowers.push(rest.to_string());
                     }
@@ -103,26 +110,30 @@ impl Topology {
             // A virtual function points back at its physical function; take the
             // PF's netdev name, not the PCI address.
             if has_dev {
-                let physfn_net = dev.join("physfn/net");
-                if physfn_net.is_dir() {
-                    if let Ok(rd) = fs::read_dir(&physfn_net) {
-                        if let Some(e) = rd.flatten().next() {
-                            link.physfn = Some(e.file_name().to_string_lossy().into_owned());
-                        }
+                // read_dir on a missing directory fails by itself; asking
+                // twice was one syscall per interface for nothing.
+                if let Ok(rd) = fs::read_dir(dev.join("physfn/net")) {
+                    if let Some(e) = rd.flatten().next() {
+                        link.physfn = Some(e.file_name().to_string_lossy().into_owned());
                     }
                 }
             }
 
-            if let Ok(rd) = fs::read_dir(&dev) {
-                for e in rd.flatten() {
-                    let f = e.file_name().to_string_lossy().into_owned();
-                    if !f.starts_with("virtfn") {
-                        continue;
-                    }
-                    if let Ok(nets) = fs::read_dir(e.path().join("net")) {
-                        for n in nets.flatten() {
-                            link.vf_netdevs
-                                .push(n.file_name().to_string_lossy().into_owned());
+            // A PCI device directory holds fifty-odd entries; walking it on
+            // an interface that has no virtual functions finds nothing, fifty
+            // times, on every reading.
+            if link.numvfs > 0 {
+                if let Ok(rd) = fs::read_dir(&dev) {
+                    for e in rd.flatten() {
+                        let f = e.file_name();
+                        if !f.to_string_lossy().starts_with("virtfn") {
+                            continue;
+                        }
+                        if let Ok(nets) = fs::read_dir(e.path().join("net")) {
+                            for n in nets.flatten() {
+                                link.vf_netdevs
+                                    .push(n.file_name().to_string_lossy().into_owned());
+                            }
                         }
                     }
                 }
@@ -130,7 +141,8 @@ impl Topology {
 
             links.insert(name, link);
         }
-        Ok(Topology { links })
+        let by_index = links.values().map(|l| (l.index, l.name.clone())).collect();
+        Ok(Topology { links, by_index })
     }
 
     pub fn get(&self, name: &str) -> Option<&Link> {
@@ -138,10 +150,7 @@ impl Topology {
     }
 
     pub fn name_of(&self, index: u32) -> Option<&str> {
-        self.links
-            .values()
-            .find(|l| l.index == index)
-            .map(|l| l.name.as_str())
+        self.by_index.get(&index).map(|s| s.as_str())
     }
 
     pub fn is_bridge(&self, name: &str) -> bool {
@@ -161,18 +170,21 @@ impl Topology {
         if dev == target {
             return true;
         }
-        let mut seen = HashSet::new();
-        let mut stack = vec![dev.to_string()];
+        // Every name in here lives in self.links and outlives the walk -
+        // borrowing them is the same walk without an allocation per node,
+        // in the one routine the whole pass leans on.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![dev];
         while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
+            if !seen.insert(cur) {
                 continue;
             }
-            let Some(link) = self.get(&cur) else { continue };
+            let Some(link) = self.get(cur) else { continue };
             for low in &link.lowers {
                 if low == target {
                     return true;
                 }
-                stack.push(low.clone());
+                stack.push(low.as_str());
             }
         }
         false
@@ -212,18 +224,18 @@ impl Topology {
     /// address plus every member's - all of them face the wire.
     pub fn subtree_macs(&self, dev: &str) -> Vec<[u8; 6]> {
         let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack = vec![dev.to_string()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![dev];
         while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
+            if !seen.insert(cur) {
                 continue;
             }
-            let Some(link) = self.get(&cur) else { continue };
+            let Some(link) = self.get(cur) else { continue };
             if let Some(mac) = link.mac {
                 out.push(mac);
             }
             for low in &link.lowers {
-                stack.push(low.clone());
+                stack.push(low.as_str());
             }
         }
         out
@@ -355,7 +367,8 @@ pub(crate) mod fixture {
             for l in self.links {
                 links.insert(l.name.clone(), l);
             }
-            Topology { links }
+            let by_index = links.values().map(|l| (l.index, l.name.clone())).collect();
+            Topology { links, by_index }
         }
     }
 }

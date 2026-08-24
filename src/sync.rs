@@ -58,6 +58,11 @@ pub struct Syncer {
     /// list is kept so a pass over different pairs cannot inherit answers
     /// that were never about them.
     carried_vf: Option<CarriedVf>,
+    /// Pinned addresses already warned about, per uplink, so the warning
+    /// appears when the situation arises and not once per pass forever -
+    /// seventeen thousand identical journal lines a day teach an operator
+    /// to stop reading warnings.
+    warned_extra: HashMap<String, HashSet<Mac>>,
     /// Which addresses the last pass saw out on the wire, per uplink. The
     /// fast path has no forwarding dump to work this out from, and an address
     /// that lives on the wire in one VLAN and behind the bridge in another
@@ -160,6 +165,7 @@ impl Syncer {
             timings: Timings::default(),
             carried_vf: None,
             carried_wire: HashMap::new(),
+            warned_extra: HashMap::new(),
         }
     }
 
@@ -486,16 +492,6 @@ impl Syncer {
 
         want.retain(|m| !skip.contains(m) && is_registerable(m));
 
-        for m in &self.extra {
-            if !want.contains(m) {
-                eprintln!(
-                    "warning: {}: pinned address {} not registered - it is the host's own, \
-                     or the bridge has it out on the wire",
-                    pair.dev,
-                    format_mac(m)
-                );
-            }
-        }
         let mut stacked: Vec<String> = relevant.into_values().collect();
         stacked.sort();
         (want, stacked, wire)
@@ -600,6 +596,27 @@ impl Syncer {
             let driver = dev_link.driver.clone().unwrap_or_default();
             let port = topo.uplink_port(&pair.dev, &pair.bridge);
             let (want, stacked, wire) = self.desired(topo, &pair, &port, &fdb, &vf_macs);
+
+            // Pinned addresses that did not make it, said once per change.
+            let unpinned: HashSet<Mac> = self
+                .extra
+                .iter()
+                .filter(|m| !want.contains(*m))
+                .copied()
+                .collect();
+            let warned = self.warned_extra.entry(pair.dev.clone()).or_default();
+            for m in &unpinned {
+                if !warned.contains(m) {
+                    eprintln!(
+                        "warning: {}: pinned address {} not registered - it is excluded, \
+                         multicast, the host's own, or the bridge has it out on the wire",
+                        pair.dev,
+                        format_mac(m)
+                    );
+                }
+            }
+            *warned = unpinned;
+
             self.carried_wire.insert(pair.dev.clone(), wire);
 
             let present: HashSet<Mac> = fdb
@@ -696,8 +713,9 @@ impl Syncer {
                 self.save_owned(&pair.dev, &owned);
             }
 
-            let mut wanted: Vec<Mac> = want.into_iter().collect();
-            wanted.sort();
+            // Unsorted on purpose: outside --status only its length is read,
+            // and the status page sorts for display itself.
+            let wanted: Vec<Mac> = want.into_iter().collect();
             reports.push(Report {
                 dev: pair.dev.clone(),
                 bridge: pair.bridge.clone(),
@@ -766,7 +784,7 @@ impl Syncer {
                 fresh
             }
         };
-        let pairs: Vec<(Pair, String, HashSet<Mac>)> = self
+        let pairs: Vec<(&Pair, String, HashSet<Mac>)> = self
             .pairs
             .iter()
             .map(|p| {
@@ -778,7 +796,7 @@ impl Syncer {
                 if let Some(wire) = self.carried_wire.get(&p.dev) {
                     skip.extend(wire.iter().copied());
                 }
-                (p.clone(), port, skip)
+                (p, port, skip)
             })
             .collect();
 
@@ -793,11 +811,11 @@ impl Syncer {
     }
 
     fn fast_add(
-        &mut self,
+        &self,
         sock: &mut Socket,
         topo: &Topology,
         entry: &FdbEntry,
-        pairs: &[(Pair, String, HashSet<Mac>)],
+        pairs: &[(&Pair, String, HashSet<Mac>)],
         touched: &mut HashMap<String, HashSet<Mac>>,
     ) {
         if !entry.is_learned() || !is_registerable(&entry.mac) {

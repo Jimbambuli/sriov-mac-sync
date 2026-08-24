@@ -506,7 +506,9 @@ fn run() -> Result<bool, String> {
                     }
                 );
                 if opts.verbose {
-                    for mac in &r.wanted {
+                    let mut wanted = r.wanted.clone();
+                    wanted.sort();
+                    for mac in &wanted {
                         println!("    {}", format_mac(mac));
                     }
                 }
