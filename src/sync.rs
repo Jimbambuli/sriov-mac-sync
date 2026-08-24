@@ -22,10 +22,11 @@ pub struct Pair {
 /// One pair as the fast path needs it: the structural questions answered
 /// once for the whole batch, because a batch describes a single moment.
 struct FastPair {
+    /// kept for the messages a person reads
     dev: String,
-    bridge: String,
+    bridge: u32,
     /// the interface of the bridge this uplink is enslaved through
-    port: String,
+    port: u32,
     /// the uplink's own interface index, which the filter is written to
     index: u32,
     /// addresses that may not be registered for this uplink
@@ -166,19 +167,19 @@ impl Timings {
     /// One line per phase, widest first, so the expensive one is obvious.
     pub fn report(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        let mut out = format!("  pass total {:.2} ms\n", ms(self.total));
+        let mut out = format!("  pass total {:.3} ms\n", ms(self.total));
         out += &format!(
-            "    topology  {:7.2} ms  {} links\n",
+            "    topology  {:7.3} ms  {} links\n",
             ms(self.topology),
             self.links
         );
         out += &format!(
-            "    fdb dump  {:7.2} ms  {} entries\n",
+            "    fdb dump  {:7.3} ms  {} entries\n",
             ms(self.fdb),
             self.fdb_entries
         );
         out += &format!(
-            "    vf macs   {:7.2} ms  {} addresses{}\n",
+            "    vf macs   {:7.3} ms  {} addresses{}\n",
             ms(self.vf_macs),
             self.vf_addresses,
             if self.vf_carried {
@@ -187,9 +188,9 @@ impl Timings {
                 ""
             }
         );
-        out += &format!("    orphans   {:7.2} ms\n", ms(self.orphans));
+        out += &format!("    orphans   {:7.3} ms\n", ms(self.orphans));
         out += &format!(
-            "    pairs     {:7.2} ms  +{} -{}\n",
+            "    pairs     {:7.3} ms  +{} -{}\n",
             ms(self.pairs),
             self.added,
             self.removed
@@ -214,10 +215,8 @@ fn is_registerable(mac: &Mac) -> bool {
     mac[0] & 1 == 0 && *mac != [0u8; 6]
 }
 
-fn physical_function(topo: &Topology, dev: &str) -> String {
-    topo.get(dev)
-        .and_then(|l| l.physfn.clone())
-        .unwrap_or_else(|| dev.to_string())
+fn physical_function(topo: &Topology, dev: u32) -> u32 {
+    topo.at(dev).and_then(|l| l.physfn).unwrap_or(dev)
 }
 
 impl Syncer {
@@ -496,20 +495,20 @@ impl Syncer {
     fn exclusions(
         &self,
         topo: &Topology,
-        pair: &Pair,
-        port: &str,
+        dev: u32,
+        port: u32,
         vf_macs: &[(u32, Mac)],
     ) -> HashSet<Mac> {
         let mut skip: HashSet<Mac> = HashSet::new();
         skip.extend(self.exclude.iter().copied());
         skip.extend(topo.subtree_macs(port));
-        if let Some(l) = topo.get(&pair.dev) {
+        if let Some(l) = topo.at(dev) {
             if let Some(mac) = l.mac {
                 skip.insert(mac);
             }
         }
-        let pf = physical_function(topo, &pair.dev);
-        if let Some(pf_link) = topo.get(&pf) {
+        let pf = physical_function(topo, dev);
+        if let Some(pf_link) = topo.at(pf) {
             if let Some(mac) = pf_link.mac {
                 skip.insert(mac);
             }
@@ -519,7 +518,7 @@ impl Syncer {
                 }
             }
             for vf in &pf_link.vf_netdevs {
-                if let Some(l) = topo.get(vf) {
+                if let Some(l) = topo.at(*vf) {
                     if let Some(mac) = l.mac {
                         skip.insert(mac);
                     }
@@ -532,34 +531,24 @@ impl Syncer {
     fn desired(
         &self,
         topo: &Topology,
-        pair: &Pair,
-        port: &str,
+        bridge: u32,
+        dev: u32,
+        port: u32,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
     ) -> (HashSet<Mac>, Vec<String>, HashSet<Mac>) {
-        let Some(bridge_link) = topo.get(&pair.bridge) else {
+        let Some(bridge_link) = topo.at(bridge) else {
             return (HashSet::new(), Vec::new(), HashSet::new());
         };
-        let port_index = topo.get(port).map(|l| l.index).unwrap_or(0);
+        let port_index = port;
 
-        // Which interfaces sit on top of the uplink bridge, by index. Worked
-        // out once here rather than per forwarding entry: a busy host has
-        // thousands of entries and a few dozen interfaces, and asking the same
-        // structural question thousands of times is what made this daemon show
-        // up in `top` at all.
-        let uplink_ward: HashSet<u32> = topo
-            .links
-            .values()
-            .filter(|l| topo.leads_to(&l.name, &pair.bridge))
-            .map(|l| l.index)
-            .collect();
-
-        let mut ports_of: HashMap<&str, Vec<&crate::sysfs::Link>> = HashMap::new();
-        for l in topo.links.values() {
-            if let Some(m) = &l.master {
-                ports_of.entry(m.as_str()).or_default().push(l);
-            }
-        }
+        // Which interfaces sit on top of the uplink bridge. One walk up from
+        // the bridge, rather than asking every interface on the host whether
+        // it leads down to it: same edges, walked once instead of once per
+        // interface. A busy host has thousands of forwarding entries and a
+        // few dozen interfaces, and asking the same structural question over
+        // and over is what made this daemon show up in `top` at all.
+        let uplink_ward: HashSet<u32> = topo.stacked_above(bridge);
 
         // Bridges stacked on the uplink bridge. Their tables hold the guests
         // whose addresses the lower bridge never learns: that traffic enters it
@@ -567,14 +556,10 @@ impl Syncer {
         // itself.
         let mut relevant: HashMap<u32, String> = HashMap::new();
         for b in topo.bridges() {
-            if b.name == pair.bridge {
+            if b.index == bridge {
                 continue;
             }
-            let stacked = ports_of
-                .get(b.name.as_str())
-                .map(|ps| ps.iter().any(|p| uplink_ward.contains(&p.index)))
-                .unwrap_or(false);
-            if stacked {
+            if b.slaves.iter().any(|p| uplink_ward.contains(p)) {
                 relevant.insert(b.index, b.name.clone());
             }
         }
@@ -608,17 +593,18 @@ impl Syncer {
         if let Some(mac) = bridge_link.mac {
             want.insert(mac);
         }
-        for link in topo.links.values() {
-            if link.name != pair.bridge && uplink_ward.contains(&link.index) {
-                if let Some(mac) = link.mac {
-                    want.insert(mac);
-                }
+        for index in &uplink_ward {
+            if *index == bridge {
+                continue;
+            }
+            if let Some(mac) = topo.at(*index).and_then(|l| l.mac) {
+                want.insert(mac);
             }
         }
 
         // Everything the host owns on this side of the uplink, plus what the
         // wire already carries.
-        let mut skip: HashSet<Mac> = self.exclusions(topo, pair, port, vf_macs);
+        let mut skip: HashSet<Mac> = self.exclusions(topo, dev, port, vf_macs);
         skip.extend(wire.iter().copied());
 
         // Addresses pinned by configuration are registered even when nothing
@@ -680,10 +666,12 @@ impl Syncer {
         // reach them.
         let mut pfs: Vec<u32> = Vec::new();
         for pair in &self.pairs {
-            if let Some(link) = topo.get(&physical_function(topo, &pair.dev)) {
-                if !pfs.contains(&link.index) {
-                    pfs.push(link.index);
-                }
+            let Some(dev) = topo.index_of(&pair.dev) else {
+                continue;
+            };
+            let pf = physical_function(topo, dev);
+            if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                pfs.push(pf);
             }
         }
         // Carried answers count only when they were collected for these very
@@ -730,8 +718,14 @@ impl Syncer {
             }
             let dev_index = dev_link.index;
             let driver = dev_link.driver.clone().unwrap_or_default();
-            let port = topo.uplink_port(&pair.dev, &pair.bridge);
-            let (want, stacked, wire) = self.desired(topo, &pair, &port, &fdb, &vf_macs);
+            let bridge_index = match topo.index_of(&pair.bridge) {
+                Some(i) => i,
+                None => continue,
+            };
+            let port = topo.uplink_port(dev_index, bridge_index);
+            let port_name = topo.name_of(port).unwrap_or(&pair.dev).to_string();
+            let (want, stacked, wire) =
+                self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
 
             // Pinned addresses that did not make it, said once per change.
             let unpinned: HashSet<Mac> = self
@@ -855,7 +849,7 @@ impl Syncer {
             reports.push(Report {
                 dev: pair.dev.clone(),
                 bridge: pair.bridge.clone(),
-                port,
+                port: port_name,
                 driver,
                 owned: owned.len(),
                 present: present.len(),
@@ -919,10 +913,12 @@ impl Syncer {
         // where they fit, else they are asked for now - never assumed empty.
         let mut pfs: Vec<u32> = Vec::new();
         for pair in &self.pairs {
-            if let Some(link) = topo.get(&physical_function(topo, &pair.dev)) {
-                if !pfs.contains(&link.index) {
-                    pfs.push(link.index);
-                }
+            let Some(dev) = topo.index_of(&pair.dev) else {
+                continue;
+            };
+            let pf = physical_function(topo, dev);
+            if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                pfs.push(pf);
             }
         }
         let vf_macs = match &self.carried_vf {
@@ -936,22 +932,24 @@ impl Syncer {
         let mut pairs: Vec<FastPair> = self
             .pairs
             .iter()
-            .map(|p| {
-                let port = topo.uplink_port(&p.dev, &p.bridge);
-                let mut skip = self.exclusions(topo, p, &port, &vf_macs);
+            .filter_map(|p| {
+                let dev = topo.index_of(&p.dev)?;
+                let bridge = topo.index_of(&p.bridge)?;
+                let port = topo.uplink_port(dev, bridge);
+                let mut skip = self.exclusions(topo, dev, port, &vf_macs);
                 // What the last full pass saw out on the wire. An address on
                 // the wire in one VLAN and behind the bridge in another must
                 // not flap into the filter on every learning event.
                 if let Some(wire) = self.carried_wire.get(&p.dev) {
                     skip.extend(wire.iter().copied());
                 }
-                FastPair {
+                Some(FastPair {
                     dev: p.dev.clone(),
-                    bridge: p.bridge.clone(),
-                    index: topo.get(&p.dev).map(|l| l.index).unwrap_or(0),
+                    bridge,
+                    index: dev,
                     port,
                     skip,
-                }
+                })
             })
             .collect();
 
@@ -964,11 +962,8 @@ impl Syncer {
             if *kind != crate::netlink::RTM_NEWNEIGH || !e.is_learned() || !e.is_unicast() {
                 continue;
             }
-            let Some(name) = topo.name_of(e.ifindex) else {
-                continue;
-            };
             for fp in &pairs {
-                if name == fp.port {
+                if e.ifindex == fp.port {
                     reflected.entry(fp.dev.clone()).or_default().insert(e.mac);
                 }
             }
@@ -1049,35 +1044,30 @@ impl Syncer {
         let Some(master) = entry.master else {
             return;
         };
-        let Some(port_name) = topo.name_of(entry.ifindex).map(|s| s.to_string()) else {
-            return;
-        };
+        if topo.at(entry.ifindex).is_none() {
+            return; // an interface this reading does not have
+        }
         for fp in pairs {
             if fp.skip.contains(&entry.mac) {
                 continue; // excluded, the host's own, a VF's, or out on the wire
             }
-            let Some(bridge_link) = topo.get(&fp.bridge) else {
-                continue;
-            };
-            if port_name == fp.port {
+            if entry.ifindex == fp.port {
                 continue; // on the wire; handled before any of this
             }
-            if master != bridge_link.index {
+            if master != fp.bridge {
                 // only bridges stacked on the uplink bridge are of interest
-                let Some(master_name) = topo.name_of(master) else {
+                let Some(master_link) = topo.at(master) else {
                     continue;
                 };
-                let ports: Vec<&String> = topo
-                    .links
-                    .values()
-                    .filter(|l| l.master.as_deref() == Some(master_name))
-                    .map(|l| &l.name)
-                    .collect();
-                if !ports.iter().any(|p| topo.leads_to(p, &fp.bridge)) {
+                if !master_link
+                    .slaves
+                    .iter()
+                    .any(|p| topo.leads_to(*p, fp.bridge))
+                {
                     continue;
                 }
             }
-            if topo.leads_to(&port_name, &fp.bridge) {
+            if topo.leads_to(entry.ifindex, fp.bridge) {
                 continue;
             }
             match sock.set_self_fdb(fp.index, &entry.mac, true) {
@@ -1213,6 +1203,24 @@ pub(crate) mod tests {
         ]
     }
 
+    /// `desired` as the tests think about it: by name. The production callers
+    /// hold indices already, having just looked the pair up.
+    pub(crate) fn desired_named(
+        s: &Syncer,
+        topo: &crate::sysfs::Topology,
+        pair: &Pair,
+        port: &str,
+        fdb: &[FdbEntry],
+        vf_macs: &[(u32, Mac)],
+    ) -> (HashSet<Mac>, Vec<String>, HashSet<Mac>) {
+        let dev = topo
+            .index_of(&pair.dev)
+            .expect("fixture has no such device");
+        let bridge = topo.index_of(&pair.bridge).unwrap_or(0);
+        let port = topo.index_of(port).unwrap_or(dev);
+        s.desired(topo, bridge, dev, port, fdb, vf_macs)
+    }
+
     pub(crate) fn syncer() -> Syncer {
         Syncer::new(Vec::new(), PathBuf::from("/nonexistent"))
     }
@@ -1227,7 +1235,8 @@ pub(crate) mod tests {
     #[test]
     fn registers_what_is_behind_the_bridge_and_nothing_else() {
         let topo = host(mac(1));
-        let (want, stacked, _) = syncer().desired(&topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
+        let (want, stacked, _) =
+            desired_named(&syncer(), &topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
 
         assert!(want.contains(&BEHIND_NIC), "the bridge's other NIC");
         assert!(
@@ -1281,14 +1290,14 @@ pub(crate) mod tests {
         };
 
         let odd = mac(0x99);
-        let (want, stacked, _) = syncer().desired(&plain(odd), &p, "nic1", &[], &[]);
+        let (want, stacked, _) = desired_named(&syncer(), &plain(odd), &p, "nic1", &[], &[]);
         assert!(
             want.contains(&odd),
             "a bridge address that is not the uplink's must be registered"
         );
         assert!(stacked.is_empty(), "nothing is stacked on this one");
 
-        let (want, _, _) = syncer().desired(&plain(mac(1)), &p, "nic1", &[], &[]);
+        let (want, _, _) = desired_named(&syncer(), &plain(mac(1)), &p, "nic1", &[], &[]);
         assert!(
             !want.contains(&mac(1)),
             "when it is the uplink's address there is nothing to do"
@@ -1314,7 +1323,7 @@ pub(crate) mod tests {
             dev: "nic1".into(),
             bridge: "br0".into(),
         };
-        let (want, _, _) = syncer().desired(&topo, &p, "nic1", &[], &[]);
+        let (want, _, _) = desired_named(&syncer(), &topo, &p, "nic1", &[], &[]);
         assert!(want.contains(&vlan_mac));
     }
 
@@ -1323,7 +1332,7 @@ pub(crate) mod tests {
         let topo = host(mac(1));
         let mut s = syncer();
         s.exclude.insert(BEHIND_GUEST);
-        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[]);
         assert!(!want.contains(&BEHIND_GUEST));
         assert!(want.contains(&BEHIND_NIC));
     }
@@ -1358,7 +1367,7 @@ pub(crate) mod tests {
             dev: "nic1".into(),
             bridge: "br0".into(),
         };
-        let (want, _, _) = syncer().desired(&topo, &p, "bond0", &entries, &[]);
+        let (want, _, _) = desired_named(&syncer(), &topo, &p, "bond0", &entries, &[]);
         assert!(want.contains(&BEHIND_NIC));
         assert!(
             !want.contains(&WIRE),
@@ -1383,7 +1392,7 @@ mod extra_tests {
         let topo = host(mac(1));
         let mut s = syncer();
         s.extra.insert(unheard);
-        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[]);
         assert!(
             want.contains(&unheard),
             "nothing has ever been heard from it"
@@ -1397,7 +1406,7 @@ mod extra_tests {
         let mut s = syncer();
         s.extra.insert(WIRE);
         s.extra.insert(mac(1));
-        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[]);
+        let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[]);
         assert!(!want.contains(&WIRE), "it lives out on the wire");
         assert!(!want.contains(&mac(1)), "it is the uplink's own address");
     }
@@ -1690,7 +1699,7 @@ mod state_tests {
             .unwrap();
 
         let registered: HashSet<Mac> = sock.added.iter().map(|(_, m)| *m).collect();
-        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
+        let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
         assert_eq!(
             registered, want,
             "the pass wrote something desired() does not want"
@@ -1714,7 +1723,7 @@ mod state_tests {
         let topo = host(mac(1));
         let vf = vec![(2, VF_ADMIN)];
         let mut s = ready_syncer(&dir);
-        let (want, _, wire) = s.desired(&topo, &pair(), "nic1", &fdb(), &vf);
+        let (want, _, wire) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &vf);
         s.carried_wire.insert("nic1".into(), wire);
         s.carried_vf = Some((vec![2], vf.clone()));
 
@@ -1899,7 +1908,7 @@ mod state_tests {
         // is 1 and the vf list is keyed by it.
         let entries = vec![learned(11, 10, sister)];
         let s = syncer();
-        let (want, _, _) = s.desired(&topo, &p, "pf0v1", &entries, &[(1, sister)]);
+        let (want, _, _) = desired_named(&s, &topo, &p, "pf0v1", &entries, &[(1, sister)]);
         assert!(
             !want.contains(&sister),
             "a sister VF's address made it past the PF-keyed exclusions"

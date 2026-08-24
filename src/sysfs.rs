@@ -14,31 +14,54 @@ use crate::netlink::parse_mac;
 
 const NET: &str = "/sys/class/net";
 
+/// One interface, with its relations held as interface indices rather than
+/// names. The kernel identifies interfaces by index in every message the
+/// daemon reads, the walks below follow these relations constantly, and a
+/// name is a heap allocation that has to be hashed character by character
+/// every time it is looked up. The name is kept for one purpose: saying
+/// which interface is meant in a message a person will read.
 #[derive(Debug, Clone, Default)]
 pub struct Link {
     pub name: String,
     pub index: u32,
     pub mac: Option<[u8; 6]>,
     /// what this interface is enslaved to - a bridge, a bond, a team
-    pub master: Option<String>,
+    pub master: Option<u32>,
     /// what is enslaved to, or stacked under, this interface
-    pub lowers: Vec<String>,
+    pub lowers: Vec<u32>,
     pub is_bridge: bool,
     pub numvfs: u32,
     pub driver: Option<String>,
     /// the PF, when this interface is a virtual function
-    pub physfn: Option<String>,
+    pub physfn: Option<u32>,
     /// netdevs of this interface's VFs, as far as they are bound on the host
-    pub vf_netdevs: Vec<String>,
+    pub vf_netdevs: Vec<u32>,
+    /// what has this interface as a lower - the inverse of `lowers`, worked
+    /// out once when the topology is built. Without it, "which interfaces sit
+    /// on top of this bridge" is answered by asking every interface on the
+    /// host whether it leads to the bridge, which walks the same edges once
+    /// per interface instead of once.
+    pub uppers: Vec<u32>,
+    /// what is enslaved to this interface - the inverse of `master`
+    pub slaves: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
 pub struct Topology {
-    pub links: HashMap<String, Link>,
-    /// Interface names by index. The forwarding paths ask this once per
-    /// entry, and a linear scan there is O(entries x pairs x links) exactly
-    /// where the least time is to spare.
-    by_index: HashMap<u32, String>,
+    pub links: HashMap<u32, Link>,
+    /// Indices by name, for the few places that start from one: a --pair on
+    /// the command line, a bridge named in the configuration.
+    by_name: HashMap<String, u32>,
+}
+
+/// What an interface's relations look like in /sys before they are resolved:
+/// names, which is all that is there until every interface has been seen.
+#[derive(Default)]
+struct Names {
+    master: Option<String>,
+    lowers: Vec<String>,
+    physfn: Option<String>,
+    vf_netdevs: Vec<String>,
 }
 
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
@@ -53,7 +76,12 @@ fn link_target_name(path: impl AsRef<Path>) -> Option<String> {
 
 impl Topology {
     pub fn load() -> std::io::Result<Self> {
-        let mut links = HashMap::new();
+        // Relations come out of /sys as names - a symlink's target, a
+        // lower_* entry - and are turned into indices once every interface
+        // has been seen. Anything naming an interface that is not there any
+        // more is dropped: it went while this was being read, and the next
+        // reading is the one that will have it right.
+        let mut named: Vec<(Link, Names)> = Vec::new();
         for entry in fs::read_dir(NET)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -72,13 +100,16 @@ impl Topology {
             let dev = base.join("device");
             let has_dev = dev.is_dir();
 
-            let mut link = Link {
+            let mut names = Names {
+                master: link_target_name(base.join("master")),
+                ..Default::default()
+            };
+            let link = Link {
                 name: name.clone(),
                 index,
                 mac: read_trim(base.join("address"))
                     .as_deref()
                     .and_then(parse_mac),
-                master: link_target_name(base.join("master")),
                 is_bridge: base.join("bridge").is_dir(),
                 driver: if has_dev {
                     link_target_name(dev.join("driver"))
@@ -102,7 +133,7 @@ impl Topology {
                     let f = e.file_name();
                     let f = f.to_string_lossy();
                     if let Some(rest) = f.strip_prefix("lower_") {
-                        link.lowers.push(rest.to_string());
+                        names.lowers.push(rest.to_string());
                     }
                 }
             }
@@ -114,7 +145,7 @@ impl Topology {
                 // twice was one syscall per interface for nothing.
                 if let Ok(rd) = fs::read_dir(dev.join("physfn/net")) {
                     if let Some(e) = rd.flatten().next() {
-                        link.physfn = Some(e.file_name().to_string_lossy().into_owned());
+                        names.physfn = Some(e.file_name().to_string_lossy().into_owned());
                     }
                 }
             }
@@ -131,7 +162,8 @@ impl Topology {
                         }
                         if let Ok(nets) = fs::read_dir(e.path().join("net")) {
                             for n in nets.flatten() {
-                                link.vf_netdevs
+                                names
+                                    .vf_netdevs
                                     .push(n.file_name().to_string_lossy().into_owned());
                             }
                         }
@@ -139,22 +171,102 @@ impl Topology {
                 }
             }
 
-            links.insert(name, link);
+            named.push((link, names));
         }
-        let by_index = links.values().map(|l| (l.index, l.name.clone())).collect();
-        Ok(Topology { links, by_index })
+
+        let by_name: HashMap<String, u32> = named
+            .iter()
+            .map(|(l, _)| (l.name.clone(), l.index))
+            .collect();
+        let mut links: Vec<Link> = Vec::with_capacity(named.len());
+        for (mut link, names) in named {
+            let idx = |n: &String| by_name.get(n).copied();
+            link.master = names.master.as_ref().and_then(idx);
+            link.lowers = names.lowers.iter().filter_map(idx).collect();
+            link.physfn = names.physfn.as_ref().and_then(idx);
+            link.vf_netdevs = names.vf_netdevs.iter().filter_map(idx).collect();
+            links.push(link);
+        }
+        // The name index is already built; handing it over rather than
+        // building a second one is the difference between one pass over the
+        // names and two.
+        Ok(Topology::assemble(links, by_name))
     }
 
+    /// Build a topology from links whose relations are already indices, and
+    /// work out the inverse relations. Both the reading of /sys and the test
+    /// fixtures come through here, so neither can end up with a view of the
+    /// host the other does not have.
+    pub(crate) fn assemble(links: Vec<Link>, by_name: HashMap<String, u32>) -> Self {
+        // Collected while the links are still a list: reading them out of the
+        // map afterwards is a second walk over every one of them, and on a
+        // host with hundreds of interfaces that showed up in the measurement.
+        let mut edges: Vec<(u32, u32, bool)> = Vec::with_capacity(links.len() * 2);
+        for l in &links {
+            for low in &l.lowers {
+                edges.push((*low, l.index, true));
+            }
+            if let Some(m) = l.master {
+                edges.push((m, l.index, false));
+            }
+        }
+        let mut map: HashMap<u32, Link> = HashMap::with_capacity(links.len());
+        for l in links {
+            map.insert(l.index, l);
+        }
+        for (of, other, is_upper) in edges {
+            if let Some(l) = map.get_mut(&of) {
+                if is_upper {
+                    l.uppers.push(other);
+                } else {
+                    l.slaves.push(other);
+                }
+            }
+        }
+        Topology {
+            links: map,
+            by_name,
+        }
+    }
+
+    /// Everything stacked on top of `root`, `root` itself included: VLAN
+    /// interfaces over a bridge, bridges over those, and so on. One walk up
+    /// the inverse of the `lowers` edges.
+    pub fn stacked_above(&self, root: u32) -> HashSet<u32> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<u32> = vec![root];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(link) = self.at(cur) else { continue };
+            stack.extend(link.uppers.iter().copied());
+        }
+        seen
+    }
+
+    /// By name. For the few places that start from one - a --pair, a bridge
+    /// out of the configuration file, a report to a person.
     pub fn get(&self, name: &str) -> Option<&Link> {
-        self.links.get(name)
+        self.by_name.get(name).and_then(|i| self.links.get(i))
+    }
+
+    /// By index, which is how everything the kernel says identifies an
+    /// interface, and how every walk in here travels.
+    pub fn at(&self, index: u32) -> Option<&Link> {
+        self.links.get(&index)
+    }
+
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied()
     }
 
     pub fn name_of(&self, index: u32) -> Option<&str> {
-        self.by_index.get(&index).map(|s| s.as_str())
+        self.links.get(&index).map(|l| l.name.as_str())
     }
 
-    pub fn is_bridge(&self, name: &str) -> bool {
-        self.get(name).map(|l| l.is_bridge).unwrap_or(false)
+    pub fn is_bridge(&self, index: u32) -> bool {
+        self.at(index).map(|l| l.is_bridge).unwrap_or(false)
     }
 
     pub fn bridges(&self) -> Vec<&Link> {
@@ -166,45 +278,59 @@ impl Topology {
     /// Does `dev` sit on top of `target`, directly or through any number of
     /// layers? True for a VLAN interface over a bridge, for a bridge built on
     /// such a VLAN interface, and so on.
-    pub fn leads_to(&self, dev: &str, target: &str) -> bool {
+    pub fn leads_to(&self, dev: u32, target: u32) -> bool {
         if dev == target {
             return true;
         }
-        // Every name in here lives in self.links and outlives the walk -
-        // borrowing them is the same walk without an allocation per node,
-        // in the one routine the whole pass leans on.
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![dev];
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<u32> = vec![dev];
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
                 continue;
             }
-            let Some(link) = self.get(cur) else { continue };
+            let Some(link) = self.at(cur) else { continue };
             for low in &link.lowers {
-                if low == target {
+                if *low == target {
                     return true;
                 }
-                stack.push(low.as_str());
+                stack.push(*low);
             }
         }
         false
     }
 
+    /// Everything at or below `roots`, the walk `leads_to` does turned the
+    /// other way up. One walk down from the bridge answers for every
+    /// interface at once, where asking each interface whether it leads to the
+    /// bridge walks the same edges once per interface.
+    pub fn subtree_of(&self, roots: &[u32]) -> HashSet<u32> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<u32> = roots.to_vec();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(link) = self.at(cur) else { continue };
+            stack.extend(link.lowers.iter().copied());
+        }
+        seen
+    }
+
     /// Follow the master chain upwards - through bonds, teams, whatever -
     /// until a bridge is reached. Returns the bridge and the interface that is
     /// actually enslaved to it, which is what the bridge's tables refer to.
-    pub fn bridge_above(&self, dev: &str) -> Option<(String, String)> {
+    pub fn bridge_above(&self, dev: u32) -> Option<(u32, u32)> {
         // A seen-set, like every other walk here: a hop budget also stops a
         // cycle, but it silently gives up on a legitimate stack that is
         // merely deep.
         let mut seen = HashSet::new();
-        let mut cur = dev.to_string();
+        let mut cur = dev;
         loop {
-            if !seen.insert(cur.clone()) {
+            if !seen.insert(cur) {
                 return None; // a masters-cycle; nothing above is a bridge
             }
-            let master = self.get(&cur)?.master.clone()?;
-            if self.is_bridge(&master) {
+            let master = self.at(cur)?.master?;
+            if self.is_bridge(master) {
                 return Some((master, cur));
             }
             cur = master;
@@ -213,32 +339,20 @@ impl Topology {
 
     /// The interface of `bridge` under which `dev` sits; `dev` itself when it
     /// is enslaved directly.
-    pub fn uplink_port(&self, dev: &str, bridge: &str) -> String {
+    pub fn uplink_port(&self, dev: u32, bridge: u32) -> u32 {
         match self.bridge_above(dev) {
             Some((br, port)) if br == bridge => port,
-            _ => dev.to_string(),
+            _ => dev,
         }
     }
 
     /// Every address at or below `dev`. For a bond port that is the bond's own
     /// address plus every member's - all of them face the wire.
-    pub fn subtree_macs(&self, dev: &str) -> Vec<[u8; 6]> {
-        let mut out = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![dev];
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
-                continue;
-            }
-            let Some(link) = self.get(cur) else { continue };
-            if let Some(mac) = link.mac {
-                out.push(mac);
-            }
-            for low in &link.lowers {
-                stack.push(low.as_str());
-            }
-        }
-        out
+    pub fn subtree_macs(&self, dev: u32) -> Vec<[u8; 6]> {
+        self.subtree_of(&[dev])
+            .iter()
+            .filter_map(|i| self.at(*i).and_then(|l| l.mac))
+            .collect()
     }
 
     /// Interfaces that carry a bridge over an eSwitch: a NIC with virtual
@@ -247,45 +361,50 @@ impl Topology {
     /// bond - without one there is nothing behind them to be missed.
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut taken_for: Vec<(u32, u32, String)> = Vec::new(); // pf, bridge, uplink name
         let mut skipped = Vec::new();
-        let mut names: Vec<&String> = self.links.keys().collect();
-        names.sort();
-        for name in names {
-            let link = &self.links[name];
+        // In name order, so a host with several candidates always chooses the
+        // same one rather than whichever the hash table offers first.
+        let mut sorted: Vec<&Link> = self.links.values().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        for link in sorted {
+            let name = &link.name;
             let has_vfs = link.numvfs > 0;
             if !has_vfs && link.physfn.is_none() {
                 continue;
             }
-            match self.bridge_above(name) {
+            match self.bridge_above(link.index) {
                 Some((br, port)) => {
+                    let br_name = self.name_of(br).unwrap_or_default().to_string();
                     // A VF cannot stand in for a port its own PF already
                     // holds: both would claim the same addresses, on two
                     // vports of one eSwitch. The same goes for a sister VF
                     // that was taken for this bridge a moment ago - the rule
                     // is about the eSwitch, not about who is a PF.
-                    if let Some(pf) = &link.physfn {
-                        if self.bridge_above(pf).map(|(b, _)| b).as_deref() == Some(&br) {
-                            skipped.push(format!("skip {name}: {pf} already carries {br}"));
+                    if let Some(pf) = link.physfn {
+                        let pf_name = self.name_of(pf).unwrap_or_default();
+                        if self.bridge_above(pf).map(|(b, _)| b) == Some(br) {
+                            skipped
+                                .push(format!("skip {name}: {pf_name} already carries {br_name}"));
                             continue;
                         }
-                        let sister = pairs.iter().find(|(taken, tbr)| {
-                            *tbr == br
-                                && self.get(taken.as_str()).and_then(|l| l.physfn.as_ref())
-                                    == Some(pf)
-                        });
-                        if let Some((taken, _)) = sister {
+                        if let Some((_, _, taken)) =
+                            taken_for.iter().find(|(p, b, _)| *p == pf && *b == br)
+                        {
                             eprintln!(
-                                "warning: skip {name}: {taken} of the same {pf} already \
-                                 carries {br} - two vports of one eSwitch cannot both \
+                                "warning: skip {name}: {taken} of the same {pf_name} already \
+                                 carries {br_name} - two vports of one eSwitch cannot both \
                                  claim the same addresses"
                             );
                             continue;
                         }
+                        taken_for.push((pf, br, name.clone()));
                     }
-                    if &port != name {
-                        skipped.push(format!("{name} reaches {br} through {port}"));
+                    if port != link.index {
+                        let port_name = self.name_of(port).unwrap_or_default();
+                        skipped.push(format!("{name} reaches {br_name} through {port_name}"));
                     }
-                    pairs.push((name.clone(), br));
+                    pairs.push((name.clone(), br_name));
                 }
                 // A VF outside a bridge is the ordinary case - it belongs to
                 // a guest. Only a NIC handing out VFs is worth remarking on.
@@ -314,13 +433,27 @@ pub(crate) mod fixture {
         [0x00, 0x11, 0x22, 0x33, 0x44, last]
     }
 
+    /// Builds a topology the way `load()` does: names while it is being
+    /// described, indices once it is built. A fixture that resolved its own
+    /// relations would be a second implementation of the thing under test.
     pub struct Builder {
         links: Vec<Link>,
+        names: Vec<Names>,
+    }
+
+    #[derive(Default)]
+    struct Names {
+        master: Option<String>,
+        lowers: Vec<String>,
+        physfn: Option<String>,
     }
 
     impl Builder {
         pub fn new() -> Self {
-            Builder { links: Vec::new() }
+            Builder {
+                links: Vec::new(),
+                names: Vec::new(),
+            }
         }
 
         pub fn add(mut self, name: &str, index: u32, mac: Option<[u8; 6]>) -> Self {
@@ -330,11 +463,16 @@ pub(crate) mod fixture {
                 mac,
                 ..Default::default()
             });
+            self.names.push(Names::default());
             self
         }
 
         fn last(&mut self) -> &mut Link {
             self.links.last_mut().expect("add a link first")
+        }
+
+        fn last_names(&mut self) -> &mut Names {
+            self.names.last_mut().expect("add a link first")
         }
 
         pub fn bridge(mut self) -> Self {
@@ -343,12 +481,12 @@ pub(crate) mod fixture {
         }
 
         pub fn master(mut self, m: &str) -> Self {
-            self.last().master = Some(m.to_string());
+            self.last_names().master = Some(m.to_string());
             self
         }
 
         pub fn lower(mut self, l: &str) -> Self {
-            self.last().lowers.push(l.to_string());
+            self.last_names().lowers.push(l.to_string());
             self
         }
 
@@ -358,17 +496,29 @@ pub(crate) mod fixture {
         }
 
         pub fn physfn(mut self, pf: &str) -> Self {
-            self.last().physfn = Some(pf.to_string());
+            self.last_names().physfn = Some(pf.to_string());
             self
         }
 
         pub fn build(self) -> Topology {
-            let mut links = HashMap::new();
-            for l in self.links {
-                links.insert(l.name.clone(), l);
-            }
-            let by_index = links.values().map(|l| (l.index, l.name.clone())).collect();
-            Topology { links, by_index }
+            let by_name: HashMap<String, u32> = self
+                .links
+                .iter()
+                .map(|l| (l.name.clone(), l.index))
+                .collect();
+            let idx = |n: &String| by_name.get(n).copied();
+            let links: Vec<Link> = self
+                .links
+                .into_iter()
+                .zip(self.names)
+                .map(|(mut l, n)| {
+                    l.master = n.master.as_ref().and_then(idx);
+                    l.lowers = n.lowers.iter().filter_map(idx).collect();
+                    l.physfn = n.physfn.as_ref().and_then(idx);
+                    l
+                })
+                .collect();
+            Topology::assemble(links, by_name)
         }
     }
 }
@@ -376,6 +526,33 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::fixture::{mac, Builder};
+
+    use super::Topology;
+
+    /// The topology answers in indices, because that is what the kernel
+    /// talks in. These tests are about interfaces, so they say names and let
+    /// these three do the looking up.
+    fn leads(t: &Topology, dev: &str, target: &str) -> bool {
+        let (Some(d), Some(g)) = (t.index_of(dev), t.index_of(target)) else {
+            return false;
+        };
+        t.leads_to(d, g)
+    }
+
+    fn above(t: &Topology, dev: &str) -> Option<(String, String)> {
+        let (br, port) = t.bridge_above(t.index_of(dev)?)?;
+        Some((t.name_of(br)?.to_string(), t.name_of(port)?.to_string()))
+    }
+
+    fn port_of(t: &Topology, dev: &str, bridge: &str) -> String {
+        let d = t.index_of(dev).expect("no such device");
+        let b = t.index_of(bridge).unwrap_or(0);
+        t.name_of(t.uplink_port(d, b)).unwrap_or(dev).to_string()
+    }
+
+    fn below(t: &Topology, dev: &str) -> Vec<[u8; 6]> {
+        t.subtree_macs(t.index_of(dev).expect("no such device"))
+    }
 
     /// A bridge with two NICs, a VLAN interface on top of it and a second
     /// bridge on top of that - the shape a Proxmox SDN host has.
@@ -406,26 +583,20 @@ mod tests {
     fn leads_to_follows_stacking_upwards() {
         let t = stacked();
         assert!(
-            t.leads_to("vmbr1.44", "vmbr1"),
+            leads(&t, "vmbr1.44", "vmbr1"),
             "a VLAN interface on the bridge"
         );
-        assert!(
-            t.leads_to("IOT", "vmbr1"),
-            "a bridge on that VLAN interface"
-        );
-        assert!(t.leads_to("vmbr1", "vmbr1"), "itself");
-        assert!(!t.leads_to("nic2", "vmbr1"), "a port is below, not above");
-        assert!(!t.leads_to("veth0", "vmbr1"), "a guest port is below too");
+        assert!(leads(&t, "IOT", "vmbr1"), "a bridge on that VLAN interface");
+        assert!(leads(&t, "vmbr1", "vmbr1"), "itself");
+        assert!(!leads(&t, "nic2", "vmbr1"), "a port is below, not above");
+        assert!(!leads(&t, "veth0", "vmbr1"), "a guest port is below too");
     }
 
     #[test]
     fn a_port_enslaved_directly_is_its_own_uplink() {
         let t = stacked();
-        assert_eq!(
-            t.bridge_above("nic1"),
-            Some(("vmbr1".into(), "nic1".into()))
-        );
-        assert_eq!(t.uplink_port("nic1", "vmbr1"), "nic1");
+        assert_eq!(above(&t, "nic1"), Some(("vmbr1".into(), "nic1".into())));
+        assert_eq!(port_of(&t, "nic1", "vmbr1"), "nic1");
     }
 
     #[test]
@@ -444,15 +615,11 @@ mod tests {
             .bridge()
             .lower("bond0")
             .build();
-        assert_eq!(t.bridge_above("nic1"), Some(("br0".into(), "bond0".into())));
-        assert_eq!(
-            t.uplink_port("nic1", "br0"),
-            "bond0",
-            "the bond is the port"
-        );
+        assert_eq!(above(&t, "nic1"), Some(("br0".into(), "bond0".into())));
+        assert_eq!(port_of(&t, "nic1", "br0"), "bond0", "the bond is the port");
 
         // every member faces the wire, so every member's address is the host's
-        let mut macs = t.subtree_macs("bond0");
+        let mut macs = below(&t, "bond0");
         macs.sort();
         assert_eq!(macs, vec![mac(1), mac(1), mac(2)]);
     }
@@ -460,7 +627,7 @@ mod tests {
     #[test]
     fn uplink_port_falls_back_when_the_bridge_does_not_match() {
         let t = stacked();
-        assert_eq!(t.uplink_port("nic1", "IOT"), "nic1");
+        assert_eq!(port_of(&t, "nic1", "IOT"), "nic1");
     }
 
     #[test]
@@ -562,8 +729,8 @@ mod tests {
             .add("b", 2, None)
             .lower("a")
             .build();
-        assert!(!t.leads_to("a", "zz"));
-        assert_eq!(t.subtree_macs("a").len(), 0);
+        assert!(!leads(&t, "a", "zz"));
+        assert_eq!(below(&t, "a").len(), 0);
     }
 }
 

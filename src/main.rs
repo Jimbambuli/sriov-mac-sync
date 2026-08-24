@@ -331,10 +331,11 @@ fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<V
             let (dev, bridge) = spec
                 .split_once(':')
                 .ok_or_else(|| format!("malformed pair: {spec} (expected DEV:BRIDGE)"))?;
-            if topo.get(dev).is_none() {
+            let Some(dev_index) = topo.index_of(dev) else {
                 return Err(format!("no such interface: {dev}"));
-            }
-            if !topo.is_bridge(bridge) {
+            };
+            let bridge_index = topo.index_of(bridge).unwrap_or(0);
+            if !topo.is_bridge(bridge_index) {
                 return Err(format!("not a bridge: {bridge}"));
             }
             // A pair whose device does not actually sit under that bridge
@@ -345,7 +346,7 @@ fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<V
             if dev == bridge {
                 return Err(format!("{spec}: a bridge cannot be its own uplink"));
             }
-            if topo.bridge_above(dev).map(|(b, _)| b).as_deref() != Some(bridge) {
+            if topo.bridge_above(dev_index).map(|(b, _)| b) != Some(bridge_index) {
                 return Err(format!(
                     "{spec}: {dev} is not enslaved to {bridge}, directly or through a bond"
                 ));
