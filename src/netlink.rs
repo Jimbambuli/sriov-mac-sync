@@ -47,14 +47,6 @@ pub const NTF_EXT_LEARNED: u8 = 0x10;
 pub const NUD_PERMANENT: u16 = 0x80;
 pub const NUD_NOARP: u16 = 0x40;
 
-const IFLA_ADDRESS: u16 = 1;
-const IFLA_IFNAME: u16 = 3;
-const IFLA_LINK: u16 = 5;
-const IFLA_MASTER: u16 = 10;
-const IFLA_LINKINFO: u16 = 18;
-const IFLA_INFO_KIND: u16 = 1;
-const IFLA_INFO_DATA: u16 = 2;
-const IFLA_VXLAN_LINK: u16 = 3; // 0 unspec, 1 id, 2 group, 3 link
 const IFLA_EXT_MASK: u16 = 29;
 const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_VF_INFO: u16 = 1;
@@ -109,24 +101,6 @@ impl FdbEntry {
     pub fn is_unicast(&self) -> bool {
         self.mac[0] & 1 == 0
     }
-}
-
-/// What one `RTM_GETLINK` message says about an interface. Everything the
-/// topology needs except the SR-IOV relationships, which the kernel does not
-/// expose over netlink.
-#[derive(Debug, Clone, Default)]
-pub struct LinkInfo {
-    pub index: u32,
-    pub name: String,
-    pub mac: Option<[u8; 6]>,
-    /// what this interface is enslaved to, by index
-    pub master: Option<u32>,
-    /// for a VLAN interface the device it sits on; for a veth its peer, which
-    /// is why the kind has to be consulted before believing it
-    pub link: Option<u32>,
-    pub kind: Option<String>,
-    /// administratively set addresses of this interface's virtual functions
-    pub vf_macs: Vec<[u8; 6]>,
 }
 
 /// A batch of notifications: forwarding entries that changed, and whether any
@@ -474,32 +448,6 @@ impl Socket {
         })
     }
 
-    /// The administratively set MAC of every VF of every interface, keyed by
-    /// the PF's interface index. This is the address the guest will use, and
-    /// it exists whether or not the VF is bound on the host.
-    pub fn dump_vf_macs(&mut self) -> io::Result<Vec<(u32, [u8; 6])>> {
-        let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
-        let mut req = Vec::with_capacity(len);
-        put_nlmsghdr(
-            &mut req,
-            len as u32,
-            RTM_GETLINK,
-            NLM_F_REQUEST | NLM_F_DUMP,
-            0, // dump() assigns a fresh sequence number per attempt
-        );
-        req.push(libc::AF_UNSPEC as u8);
-        req.push(0);
-        req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-        req.extend_from_slice(&0i32.to_ne_bytes()); // ifi_index
-        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
-        put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
-
-        self.dump(&req, RTM_NEWLINK, "interface", |payload, out| {
-            collect_vf_macs(payload, out)
-        })
-    }
-
     /// The addresses administratively set on the virtual functions of the
     /// named interfaces.
     ///
@@ -536,33 +484,6 @@ impl Socket {
             }
         }
         Ok(out)
-    }
-
-    /// Every interface, as the kernel describes it. One dump instead of a walk
-    /// over `/sys/class/net`, which costs a few hundred failed file probes.
-    pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
-        let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
-        let mut req = Vec::with_capacity(len);
-        put_nlmsghdr(
-            &mut req,
-            len as u32,
-            RTM_GETLINK,
-            NLM_F_REQUEST | NLM_F_DUMP,
-            0, // dump() assigns a fresh sequence number per attempt
-        );
-        req.push(libc::AF_UNSPEC as u8);
-        req.push(0);
-        req.extend_from_slice(&0u16.to_ne_bytes());
-        req.extend_from_slice(&0i32.to_ne_bytes());
-        req.extend_from_slice(&0u32.to_ne_bytes());
-        req.extend_from_slice(&0u32.to_ne_bytes());
-        put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
-
-        self.dump(&req, RTM_NEWLINK, "interface", |payload, out| {
-            if let Some(l) = parse_link(payload) {
-                out.push(l);
-            }
-        })
     }
 
     /// Add or remove an address in an interface's own unicast filter list -
@@ -815,80 +736,6 @@ fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
         state,
         flags,
     })
-}
-
-fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
-    if payload.len() < IFINFOMSG_LEN {
-        return None;
-    }
-    let mut l = LinkInfo {
-        index: i32::from_ne_bytes(payload[4..8].try_into().unwrap()) as u32,
-        ..Default::default()
-    };
-    for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
-        match kind {
-            IFLA_IFNAME => {
-                let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
-                l.name = String::from_utf8_lossy(&value[..end]).into_owned();
-            }
-            IFLA_ADDRESS if value.len() == 6 => {
-                let mut m = [0u8; 6];
-                m.copy_from_slice(value);
-                l.mac = Some(m);
-            }
-            IFLA_MASTER if value.len() == 4 => {
-                l.master = Some(u32::from_ne_bytes(value.try_into().unwrap()))
-            }
-            IFLA_LINK if value.len() == 4 => {
-                l.link = Some(u32::from_ne_bytes(value.try_into().unwrap()))
-            }
-            IFLA_LINKINFO => {
-                let mut data: Option<&[u8]> = None;
-                for (ik, iv) in attrs(value) {
-                    match ik {
-                        IFLA_INFO_KIND => {
-                            let end = iv.iter().position(|&b| b == 0).unwrap_or(iv.len());
-                            l.kind = Some(String::from_utf8_lossy(&iv[..end]).into_owned());
-                        }
-                        IFLA_INFO_DATA => data = Some(iv),
-                        _ => {}
-                    }
-                }
-                // A VXLAN does not name its underlay in IFLA_LINK the way a
-                // VLAN names its parent - it is buried in the type's own
-                // attributes. sysfs shows it as a lower either way.
-                if l.kind.as_deref() == Some("vxlan") {
-                    if let Some(d) = data {
-                        for (dk, dv) in attrs(d) {
-                            if dk == IFLA_VXLAN_LINK && dv.len() == 4 {
-                                l.link = Some(u32::from_ne_bytes(dv.try_into().unwrap()));
-                            }
-                        }
-                    }
-                }
-            }
-            IFLA_VFINFO_LIST => {
-                for (vk, vi) in attrs(value) {
-                    if vk != IFLA_VF_INFO {
-                        continue;
-                    }
-                    for (mk, mv) in attrs(vi) {
-                        if mk == IFLA_VF_MAC && mv.len() >= 10 {
-                            let mut m = [0u8; 6];
-                            m.copy_from_slice(&mv[4..10]);
-                            l.vf_macs.push(m);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if l.name.is_empty() {
-        None
-    } else {
-        Some(l)
-    }
 }
 
 fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {

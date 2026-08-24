@@ -38,7 +38,6 @@ enum Mode {
     Status,
     Check,
     Flush,
-    CompareTopology,
 }
 
 struct Options {
@@ -89,11 +88,6 @@ usage: sriov-mac-sync [options]
   --status        show what is detected, wanted and registered
   --check         test whether the uplink accepts unicast filter entries
   --flush         remove every address this daemon registered
-  --compare-topology
-                  read the interface topology both ways - out of /sys and out
-                  of one netlink dump - and report where they disagree. Changes
-                  nothing; it exists to prove the two agree before anything
-                  relies on the faster one.
   --dry-run       report changes without applying them
   --timings       after every pass, say what each phase cost and what it
                   found, and name anything that failed along the way
@@ -224,7 +218,6 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
             "--status" => set_mode(opts, Mode::Status, &arg)?,
             "--check" => set_mode(opts, Mode::Check, &arg)?,
             "--flush" => set_mode(opts, Mode::Flush, &arg)?,
-            "--compare-topology" => set_mode(opts, Mode::CompareTopology, &arg)?,
             "--dry-run" => opts.dry_run = true,
             "--timings" => opts.timings = true,
             "-v" | "--verbose" => opts.verbose = true,
@@ -459,137 +452,6 @@ fn report_changes(
     }
 }
 
-/// Builds the topology both ways, times every part of a pass, and reports where
-/// the two disagree. Read-only throughout.
-fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> {
-    const ROUNDS: u32 = 20;
-    let avg = |d: Duration| d / ROUNDS;
-
-    let mut t_carried = Duration::ZERO;
-    let (mut t_sysfs, mut t_dump, mut t_build, mut t_fdb, mut t_vf, mut t_pass) = (
-        Duration::ZERO,
-        Duration::ZERO,
-        Duration::ZERO,
-        Duration::ZERO,
-        Duration::ZERO,
-        Duration::ZERO,
-    );
-    let mut entries = 0usize;
-
-    for _ in 0..ROUNDS {
-        let s = Instant::now();
-        let _ = Topology::load()?;
-        t_sysfs += s.elapsed();
-
-        let s = Instant::now();
-        let links = sock.dump_links()?;
-        t_dump += s.elapsed();
-        let s = Instant::now();
-        let _ = Topology::from_netlink(&links);
-        t_build += s.elapsed();
-
-        let s = Instant::now();
-        let fdb = sock.dump_fdb()?;
-        t_fdb += s.elapsed();
-        entries = fdb.len();
-
-        let s = Instant::now();
-        let _ = sock.dump_vf_macs()?;
-        t_vf += s.elapsed();
-    }
-
-    if !pairs.is_empty() {
-        let mut syncer = Syncer::new(pairs.to_vec(), PathBuf::from("/nonexistent"));
-        syncer.dry_run = true;
-        // Two kinds of pass now exist: one that reads the interfaces because
-        // something about them may have moved, and one woken by a forwarding
-        // entry, which works from the picture it already has. Time both - the
-        // second is the common one.
-        let bench_topo = Topology::load()?;
-        for _ in 0..ROUNDS {
-            let s = Instant::now();
-            let topo = Topology::load()?;
-            let load = s.elapsed();
-            let _ = syncer.reconcile(sock, false, &topo, load, true)?;
-            t_pass += s.elapsed();
-        }
-        for _ in 0..ROUNDS {
-            let s = Instant::now();
-            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO, false)?;
-            t_carried += s.elapsed();
-        }
-    }
-
-    println!("Topologie, beide Wege:");
-    println!("  aus /sys                {:>9.2?}", avg(t_sysfs));
-    println!("  aus netlink, Dump       {:>9.2?}", avg(t_dump));
-    println!("  aus netlink, Aufbau     {:>9.2?}", avg(t_build));
-    println!(
-        "  netlink gesamt          {:>9.2?}   ({:.1}x schneller)",
-        avg(t_dump + t_build),
-        t_sysfs.as_secs_f64() / (t_dump + t_build).as_secs_f64().max(f64::MIN_POSITIVE)
-    );
-    if t_pass.is_zero() {
-        println!("(kein SR-IOV-Paar auf diesem Host - Durchgangszeiten entfallen)");
-    }
-    println!("Die uebrigen Teile eines Durchgangs:");
-    println!("  FDB-Dump ({entries} Eintraege) {:>9.2?}", avg(t_fdb));
-    println!("  VF-Dump                 {:>9.2?}", avg(t_vf));
-    println!("  Durchgang, frisch gelesen{:>8.2?}", avg(t_pass));
-    println!("  Durchgang, uebernommen  {:>9.2?}", avg(t_carried));
-    let share = |d: Duration| {
-        if t_pass.is_zero() {
-            String::new()
-        } else {
-            format!(
-                "   ({:.0} % des Durchgangs)",
-                100.0 * d.as_secs_f64() / t_pass.as_secs_f64()
-            )
-        }
-    };
-    println!(
-        "  davon /sys-Topologie    {:>9.2?}{}",
-        avg(t_sysfs),
-        share(t_sysfs)
-    );
-    // Which way round they come out is the question being asked, so it must
-    // not be assumed. Subtracting durations the wrong way round panics, and
-    // netlink being the slower of the two is a perfectly ordinary answer.
-    let netlink = t_dump + t_build;
-    if t_sysfs >= netlink {
-        println!(
-            "  Ersparnis beim Wechsel  {:>9.2?}{}",
-            avg(t_sysfs - netlink),
-            share(t_sysfs - netlink)
-        );
-    } else {
-        println!(
-            "  Mehrkosten beim Wechsel {:>9.2?}{}",
-            avg(netlink - t_sysfs),
-            share(netlink - t_sysfs)
-        );
-    }
-
-    let from_sysfs = Topology::load()?;
-    let from_netlink = Topology::from_netlink(&sock.dump_links()?);
-    println!(
-        "Schnittstellen: /sys {}   netlink {}",
-        from_sysfs.links.len(),
-        from_netlink.links.len()
-    );
-    let diffs = from_sysfs.differences(&from_netlink);
-    if diffs.is_empty() {
-        println!("Unterschiede: keine - die beiden stimmen in jedem Feld ueberein");
-        Ok(true)
-    } else {
-        println!("Unterschiede: {}", diffs.len());
-        for d in &diffs {
-            println!("  {d}");
-        }
-        Ok(false)
-    }
-}
-
 fn run() -> Result<bool, String> {
     let mut opts = Options::default();
     load_conf(&mut opts);
@@ -604,20 +466,13 @@ fn run() -> Result<bool, String> {
     let pairs = resolve_pairs(
         &topo,
         &opts,
-        matches!(
-            opts.mode,
-            Mode::Daemon | Mode::CompareTopology | Mode::Flush | Mode::Status
-        ),
+        matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status),
     )?;
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
     if opts.mode == Mode::Check {
         return Ok(check(&mut sock, &topo, &pairs, opts.dry_run));
-    }
-
-    if opts.mode == Mode::CompareTopology {
-        return compare_topology(&mut sock, &pairs).map_err(|e| e.to_string());
     }
 
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
@@ -878,7 +733,7 @@ fn run() -> Result<bool, String> {
                 next_full = Instant::now();
             }
         }
-        Mode::Check | Mode::CompareTopology => unreachable!(),
+        Mode::Check => unreachable!(),
     }
 }
 
