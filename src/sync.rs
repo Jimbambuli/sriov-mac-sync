@@ -46,6 +46,11 @@ pub struct Syncer {
     pub state_dir: PathBuf,
     /// What the most recent pass cost.
     pub timings: Timings,
+    /// The virtual functions' addresses from the last pass. They are set
+    /// administratively and announced as link messages, so a pass that no
+    /// interface message preceded works from these rather than asking the
+    /// driver again - which is the most expensive thing a pass does.
+    carried_vf: Option<Vec<(u32, Mac)>>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -64,6 +69,8 @@ pub struct Timings {
     pub links: usize,
     pub fdb_entries: usize,
     pub vf_addresses: usize,
+    /// whether the addresses came from the previous pass rather than the driver
+    pub vf_carried: bool,
     pub added: usize,
     pub removed: usize,
     /// Anything that went wrong without stopping the pass. These are the
@@ -87,9 +94,14 @@ impl Timings {
             self.fdb_entries
         );
         out += &format!(
-            "    vf macs   {:7.2} ms  {} addresses\n",
+            "    vf macs   {:7.2} ms  {} addresses{}\n",
             ms(self.vf_macs),
-            self.vf_addresses
+            self.vf_addresses,
+            if self.vf_carried {
+                " (carried over)"
+            } else {
+                ""
+            }
         );
         out += &format!("    orphans   {:7.2} ms\n", ms(self.orphans));
         out += &format!(
@@ -128,6 +140,7 @@ impl Syncer {
             authoritative: false,
             state_dir,
             timings: Timings::default(),
+            carried_vf: None,
         }
     }
 
@@ -385,6 +398,7 @@ impl Syncer {
         apply: bool,
         topo: &Topology,
         topo_load: Duration,
+        interfaces_moved: bool,
     ) -> io::Result<Vec<Report>> {
         let started = Instant::now();
         let mut timings = Timings {
@@ -414,9 +428,19 @@ impl Syncer {
                 }
             }
         }
-        let mark = Instant::now();
-        let vf_macs = sock.vf_macs_of(&pfs)?;
-        timings.vf_macs = mark.elapsed();
+        let vf_macs = match (&self.carried_vf, interfaces_moved) {
+            (Some(kept), false) => {
+                timings.vf_carried = true;
+                kept.clone()
+            }
+            _ => {
+                let mark = Instant::now();
+                let fresh = sock.vf_macs_of(&pfs)?;
+                timings.vf_macs = mark.elapsed();
+                self.carried_vf = Some(fresh.clone());
+                fresh
+            }
+        };
         timings.vf_addresses = vf_macs.len();
 
         let mut reports = Vec::new();
@@ -1079,6 +1103,7 @@ mod state_tests {
             links: 37,
             fdb_entries: 8707,
             vf_addresses: 4,
+            vf_carried: false,
             added: 1,
             removed: 2,
             failures: vec!["nic1v0: unregister 02:00:00:00:00:01: no space".into()],
@@ -1096,6 +1121,28 @@ mod state_tests {
         assert!(
             r.contains("failure: nic1v0: unregister"),
             "a failure went unmentioned:\n{r}"
+        );
+    }
+
+    #[test]
+    fn a_carried_over_reading_says_so() {
+        let fresh = Timings {
+            vf_addresses: 4,
+            ..Default::default()
+        };
+        assert!(
+            !fresh.report().contains("carried over"),
+            "a reading taken this pass claimed to be carried over"
+        );
+        let carried = Timings {
+            vf_addresses: 4,
+            vf_carried: true,
+            ..Default::default()
+        };
+        assert!(
+            carried.report().contains("carried over"),
+            "a carried reading is indistinguishable from a fresh one:\n{}",
+            carried.report()
         );
     }
 

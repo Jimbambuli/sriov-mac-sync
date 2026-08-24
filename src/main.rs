@@ -413,7 +413,7 @@ fn compare_topology(sock: &mut Socket, pairs: &[Pair]) -> std::io::Result<bool> 
         let bench_topo = Topology::load()?;
         for _ in 0..ROUNDS {
             let s = Instant::now();
-            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO)?;
+            let _ = syncer.reconcile(sock, false, &bench_topo, Duration::ZERO, true)?;
             t_pass += s.elapsed();
         }
     }
@@ -514,7 +514,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Status => {
             let reports = syncer
-                .reconcile(&mut sock, false, &topo, topo_load)
+                .reconcile(&mut sock, false, &topo, topo_load, true)
                 .map_err(|e| e.to_string())?;
             for r in &reports {
                 println!("{} on {} ({})", r.dev, r.bridge, r.driver);
@@ -542,7 +542,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Once => {
             let reports = syncer
-                .reconcile(&mut sock, true, &topo, topo_load)
+                .reconcile(&mut sock, true, &topo, topo_load, true)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
             if opts.timings {
@@ -572,9 +572,26 @@ fn run() -> Result<bool, String> {
             // Which of the three reasons for a pass actually produced work is
             // the only way to tell whether the timed one earns its keep.
             let mut trigger = "start";
+            // The topology carried over from the last pass, and whether it can
+            // still be believed. A forwarding entry appearing or going says
+            // nothing about which interfaces exist or what they are enslaved
+            // to, so a pass woken by one works from the picture it already
+            // has. Anything that touches interfaces marks it stale, as does
+            // losing notifications and the timed pass, whose whole purpose is
+            // to find what the events missed.
+            let mut held: Option<Topology> = None;
+            let mut stale = true;
 
             loop {
                 if Instant::now() >= next_full {
+                    // The timed pass exists to catch what the events missed,
+                    // an interface change whose notification never arrived
+                    // included. It reads afresh - and the flag is set here,
+                    // where the reason for this pass is known, not after one
+                    // where it only says what the next would be called.
+                    if trigger == "timed" {
+                        stale = true;
+                    }
                     // Autodetection is redone every pass. A NIC that gets its
                     // VFs later, or a bridge built after boot, must not need a
                     // restart to be noticed - and starting before the network
@@ -582,15 +599,24 @@ fn run() -> Result<bool, String> {
                     // One reading of /sys serves both the autodetection and
                     // the pass. They ask about the same moment, and reading it
                     // twice was work nobody asked for.
-                    let load_started = Instant::now();
-                    let loaded = match Topology::load() {
-                        Ok(t) => Some((t, load_started.elapsed())),
-                        Err(e) => {
-                            eprintln!("warning: cannot read /sys/class/net: {e}");
-                            None
+                    let mut topo_load = Duration::ZERO;
+                    let reloaded = stale || held.is_none();
+                    if reloaded {
+                        let load_started = Instant::now();
+                        match Topology::load() {
+                            Ok(t) => {
+                                topo_load = load_started.elapsed();
+                                held = Some(t);
+                                stale = false;
+                            }
+                            Err(e) => {
+                                eprintln!("warning: cannot read /sys/class/net: {e}");
+                                held = None;
+                            }
                         }
-                    };
-                    if let (true, Some((topo, _))) = (auto, loaded.as_ref()) {
+                    }
+                    let loaded = held.as_ref().map(|t| (t, topo_load));
+                    if let (true, Some((topo, _))) = (auto, loaded) {
                         let found: Vec<Pair> = topo
                             .autodetect()
                             .0
@@ -612,12 +638,12 @@ fn run() -> Result<bool, String> {
                             said_empty = true;
                         }
                     } else {
-                        let Some((topo, topo_load)) = loaded.as_ref() else {
+                        let Some((topo, topo_load)) = loaded else {
                             next_full = Instant::now() + interval;
                             trigger = "timed";
                             continue;
                         };
-                        match syncer.reconcile(&mut sock, true, topo, *topo_load) {
+                        match syncer.reconcile(&mut sock, true, topo, topo_load, reloaded) {
                             Ok(reports) => {
                                 report_changes(
                                     &reports,
@@ -661,11 +687,21 @@ fn run() -> Result<bool, String> {
                     Err(e) => {
                         eprintln!("warning: lost neighbour notifications: {e}");
                         next_full = Instant::now();
+                        // What was in the messages that never arrived is not
+                        // knowable, so nothing carried over may be believed.
+                        stale = true;
                         continue;
                     }
                 };
                 if events.fdb.is_empty() && !events.links_changed {
                     continue; // something else's neighbour, not a bridge's
+                }
+                // Not the trigger name: a batch carrying both kinds is
+                // reported as a forwarding change, and would otherwise keep a
+                // topology that the link messages in the same batch just
+                // invalidated.
+                if events.links_changed {
+                    stale = true;
                 }
                 trigger = if events.fdb.is_empty() {
                     "interface change"
