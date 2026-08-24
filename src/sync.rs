@@ -105,6 +105,19 @@ impl Timings {
     }
 }
 
+/// The physical function behind an uplink, or the uplink itself when it is
+/// not a virtual function.
+///
+/// Both the pass and the exclusion set have to arrive at the same answer: the
+/// pass asks the kernel about this interface's virtual functions, and the
+/// exclusion set looks the results up by its index. Two spellings of the same
+/// rule would silently stop excluding anything.
+fn physical_function(topo: &Topology, dev: &str) -> String {
+    topo.get(dev)
+        .and_then(|l| l.physfn.clone())
+        .unwrap_or_else(|| dev.to_string())
+}
+
 impl Syncer {
     pub fn new(pairs: Vec<Pair>, state_dir: PathBuf) -> Self {
         Syncer {
@@ -319,10 +332,7 @@ impl Syncer {
                 skip.insert(mac);
             }
         }
-        let pf = topo
-            .get(&pair.dev)
-            .and_then(|l| l.physfn.clone())
-            .unwrap_or_else(|| pair.dev.clone());
+        let pf = physical_function(topo, &pair.dev);
         if let Some(pf_link) = topo.get(&pf) {
             if let Some(mac) = pf_link.mac {
                 skip.insert(mac);
@@ -381,8 +391,19 @@ impl Syncer {
         // address in the uplink's filter tells the switch that the guest
         // holding it lives behind the bridge - which sends its traffic past it.
         // A failed pass is harmless; a pass on incomplete information is not.
+        // Only each pair's physical function contributes exclusions, so ask
+        // about those. A dump would describe every interface on the host to
+        // reach them.
+        let mut pfs: Vec<u32> = Vec::new();
+        for pair in &self.pairs {
+            if let Some(link) = topo.get(&physical_function(&topo, &pair.dev)) {
+                if !pfs.contains(&link.index) {
+                    pfs.push(link.index);
+                }
+            }
+        }
         let mark = Instant::now();
-        let vf_macs = sock.dump_vf_macs()?;
+        let vf_macs = sock.vf_macs_of(&pfs)?;
         timings.vf_macs = mark.elapsed();
         timings.vf_addresses = vf_macs.len();
 

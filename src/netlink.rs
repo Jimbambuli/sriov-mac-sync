@@ -297,6 +297,48 @@ impl Socket {
         }
     }
 
+    /// One question about one interface, and the single answer to it.
+    ///
+    /// `RTM_GETLINK` with `NLM_F_DUMP` ignores the index it is given and
+    /// describes every interface in the system. Without the flag the index is
+    /// honoured and one message comes back - no `NLMSG_DONE` to wait for, so
+    /// the first matching answer ends it.
+    fn request_one(
+        &mut self,
+        request: &[u8],
+        want: u16,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
+        self.send(request)?;
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            let n = self.recv(&mut buf)?;
+            if n > buf.len() {
+                return Err(io::Error::other("the answer outgrew the buffer"));
+            }
+            for msg in messages(&buf[..n]) {
+                if msg.seq != seq {
+                    continue;
+                }
+                match msg.kind {
+                    NLMSG_ERROR => {
+                        if let Some(e) = nlmsg_error(msg.payload) {
+                            return Err(e);
+                        }
+                        return Ok(());
+                    }
+                    NLMSG_NOOP => continue,
+                    k if k == want => {
+                        sink(msg.payload);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Repeats `run_dump` with a growing buffer until it comes back trustworthy.
     fn dump(&mut self, request: &[u8], want: u16, sink: &mut impl FnMut(&[u8])) -> io::Result<()> {
         let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
@@ -387,6 +429,44 @@ impl Socket {
         self.dump(&req, RTM_NEWLINK, &mut |payload| {
             collect_vf_macs(payload, &mut out)
         })?;
+        Ok(out)
+    }
+
+    /// The addresses administratively set on the virtual functions of the
+    /// named interfaces.
+    ///
+    /// Only the physical function of a pair contributes exclusions, and there
+    /// are as many of those as there are uplinks - two here. Asking for them
+    /// by index costs two questions; the dump this replaces had the kernel
+    /// describe all 36 interfaces on this host, and measured at seven times
+    /// the forwarding dump for four addresses against 531 entries.
+    ///
+    /// An interface that has gone away answers ENODEV. That is not a failure
+    /// worth stopping for: the dump would simply not have listed it, and an
+    /// uplink that no longer exists has no virtual functions to exclude.
+    pub fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, [u8; 6])>> {
+        let mut out = Vec::new();
+        for &index in indices {
+            self.seq += 1;
+            let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
+            let mut req = Vec::with_capacity(len);
+            put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST, self.seq);
+            req.push(libc::AF_UNSPEC as u8);
+            req.push(0);
+            req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+            req.extend_from_slice(&(index as i32).to_ne_bytes());
+            req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+            req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+            put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
+
+            match self.request_one(&req, RTM_NEWLINK, &mut |payload| {
+                collect_vf_macs(payload, &mut out)
+            }) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => continue,
+                Err(e) => return Err(e),
+            }
+        }
         Ok(out)
     }
 
