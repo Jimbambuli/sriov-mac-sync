@@ -454,13 +454,30 @@ impl Syncer {
                     Err(e)
                 }
             });
+        // What the file held when it was read, so that somebody else writing
+        // it in between can be told from nothing having happened. A --flush
+        // from a second process replaces this file, and appending to what it
+        // left is right - but the copy in memory would then describe a file
+        // that no longer exists, and its size is how that shows.
+        let was = self.notes.borrow().get(dev).map(|n| n.len);
         let wrote = opened.and_then(|mut f| f.write_all(text.as_bytes()));
         match wrote {
             Ok(()) => {
-                // Keep the remembered copy in step with the file, including
-                // what the file now looks like, so the next read is a stat.
+                let expected = was.map(|w| w + text.len() as u64);
                 set.extend(fresh);
                 self.remember(dev, &set);
+                let agrees = match (expected, self.notes.borrow().get(dev)) {
+                    (Some(want), Some(now)) => now.len == want,
+                    // Nothing was remembered, so there is nothing to check
+                    // against; what was just written is all this knows.
+                    _ => true,
+                };
+                if !agrees {
+                    // Somebody wrote the file between the read and the
+                    // append. What it holds now is not what this thinks, so
+                    // stop thinking it - the next read goes to the file.
+                    self.notes.borrow_mut().remove(dev);
+                }
             }
             Err(e) => {
                 self.notes.borrow_mut().remove(dev);
@@ -2554,6 +2571,45 @@ mod state_tests {
             text.lines().count(),
             2,
             "one line per address, however often it is registered:\n{text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A --flush from a second process replaces the note while the daemon is
+    /// adding to it. Appending to what it left behind is right; carrying on
+    /// with a copy in memory that describes the file it replaced is not.
+    ///
+    /// This pins the ordinary case: the flush lands before the append reads
+    /// the file, and the append works from what it found. It does *not*
+    /// exercise the size check in `append_owned`, which covers the flush
+    /// landing between that read and the write - a window this test cannot
+    /// produce without a hook in the code to stop in. The check is kept
+    /// because it is two comparisons and the alternative is a copy in memory
+    /// that quietly disagrees with the file; its worth is argued, not
+    /// measured.
+    #[test]
+    fn a_note_rewritten_between_read_and_append_is_not_remembered() {
+        let dir = scratch("append-race");
+        let path = dir.join("nic1.owned");
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned(
+            "nic1",
+            &[BEHIND_NIC, BEHIND_GUEST].into_iter().collect::<Set<_>>(),
+        );
+        assert_eq!(s.load_owned("nic1").len(), 2); // the copy is now warm
+
+        // What --flush leaves: a different file, through rename, holding
+        // nothing.
+        let other = dir.join("flushed");
+        fs::write(&other, "").unwrap();
+        fs::rename(&other, &path).unwrap();
+
+        s.append_owned("nic1", &[UPLINK_WARD]);
+
+        assert_eq!(
+            s.load_owned("nic1"),
+            [UPLINK_WARD].into_iter().collect::<Set<_>>(),
+            "the file is the truth: it holds what was appended and nothing else"
         );
         let _ = fs::remove_dir_all(&dir);
     }
