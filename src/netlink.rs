@@ -172,14 +172,27 @@ impl Socket {
         // A dump of a large forwarding database overruns the default receive
         // buffer easily, and netlink answers that with ENOBUFS rather than
         // with short reads.
+        //
+        // SO_RCVBUF is silently capped at net.core.rmem_max, which is 208 KiB
+        // on a stock kernel - a fifth of what is asked for here, and nothing
+        // would say so. SO_RCVBUFFORCE ignores that ceiling; it needs
+        // CAP_NET_ADMIN, which this program holds for programming the filter
+        // anyway. Fall back to the capped request where it is refused, because
+        // a smaller buffer still works and losing notifications is survivable -
+        // the full pass reads the real state.
         let size: libc::c_int = 1 << 20;
-        unsafe {
+        let set = |opt| unsafe {
             libc::setsockopt(
                 fd.as_raw_fd(),
                 libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
+                opt,
                 &size as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if set(libc::SO_RCVBUFFORCE) < 0 && set(libc::SO_RCVBUF) < 0 {
+            eprintln!(
+                "warning: cannot enlarge the netlink receive buffer, notifications may be lost"
             );
         }
 
