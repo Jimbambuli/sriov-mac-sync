@@ -227,6 +227,17 @@ impl Topology {
         // be asked for one interface at a time.
         let names_parents = links.iter().any(|l| l.parent_dev.is_some());
 
+        // ... but only where an interface could have one. The kernel gives a
+        // kind to interfaces it creates itself - bridge, vlan, veth, bond,
+        // tun - and a driver bound to a bus device does not. So an interface
+        // with a kind has no device directory to find, and asking is one
+        // statx that always fails. On a host full of containers that is
+        // nearly every interface: 409 of them here, 3.2 ms of a 23 ms pass.
+        // An interface handing out virtual functions is asked regardless,
+        // since that is the case this daemon exists for and the count comes
+        // from the dump.
+        let could_have_device = |l: &crate::netlink::LinkInfo| l.kind.is_none() || l.num_vf > 0;
+
         let mut by_name: Map<String, u32> =
             Map::with_capacity_and_hasher(links.len(), Default::default());
         for l in links {
@@ -238,7 +249,7 @@ impl Topology {
             let has_device = if names_parents {
                 l.parent_dev.is_some()
             } else {
-                base.join("device").is_dir()
+                could_have_device(l) && base.join("device").is_dir()
             };
 
             // sysfs carries a lower_<name> link for what an interface is

@@ -594,7 +594,7 @@ fn run() -> Result<bool, String> {
                 opts.interval
             );
             catch_signals();
-            let mon = Socket::subscribed()
+            let mut mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
             let mut said_empty = false;
             let interval = Duration::from_secs(opts.interval);

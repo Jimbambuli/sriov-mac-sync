@@ -72,6 +72,10 @@ const RTEXT_FILTER_VF: u32 = 1;
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_NEIGH: u32 = 3;
 
+/// How long any single read may wait for the kernel. Set on the socket, so a
+/// read that would hang comes back by itself.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 const NLMSG_HDR: usize = 16;
 const NDMSG_LEN: usize = 12;
 const IFINFOMSG_LEN: usize = 16;
@@ -163,11 +167,28 @@ pub struct Events {
 }
 
 pub struct Socket {
+    /// The receive buffer, kept rather than allocated per call. Every read
+    /// here wants tens or hundreds of kilobytes, and `vec![0u8; n]` is both
+    /// an allocation and a walk over n bytes to zero them - paid on every
+    /// notification batch, every dump attempt and every acknowledgement. It
+    /// only ever grows, to whatever the largest answer needed.
+    buf: Vec<u8>,
     fd: OwnedFd,
     seq: u32,
 }
 
 impl Socket {
+    /// The kept buffer, at least `want` bytes, taken out for the duration of
+    /// a read. Taking it rather than borrowing is what lets `&mut self`
+    /// methods pass it to `&self` ones; the caller puts it back.
+    fn take_buf(&mut self, want: usize) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.buf);
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        buf
+    }
+
     pub fn new() -> io::Result<Self> {
         Self::open(0)
     }
@@ -223,6 +244,30 @@ impl Socket {
             );
         }
 
+        // A receive that waits for ever is how a hung kernel stops this daemon
+        // without a word, so every read has a deadline. Carrying it in the
+        // socket rather than in a poll before each read halves the syscalls of
+        // a registration - which is the one thing here whose latency anybody
+        // measures. The value is the longest any single read may take; a
+        // caller with a shorter deadline of its own checks the clock and comes
+        // back, and one with a longer one goes round again.
+        let tv = libc::timeval {
+            tv_sec: READ_TIMEOUT.as_secs() as libc::time_t,
+            tv_usec: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as u16;
         addr.nl_groups = groups;
@@ -236,7 +281,11 @@ impl Socket {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Socket { fd, seq: 1 })
+        Ok(Socket {
+            fd,
+            seq: 1,
+            buf: Vec::new(),
+        })
     }
 
     fn send(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -300,15 +349,19 @@ impl Socket {
     /// daemon, and nothing upstream could even say why.
     fn recv_deadline(&self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "no answer from the kernel in time",
                 ));
             }
-            if self.wait(left.as_millis().min(i32::MAX as u128) as i32)? {
-                return self.recv(buf);
+            // The socket's own timeout does the waiting; there is no poll in
+            // front of it to say whether waiting is necessary. Nothing to
+            // read yet comes back as WouldBlock, and the caller's deadline
+            // decides whether that is the end of it.
+            match self.recv(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                other => return other,
             }
         }
     }
@@ -379,10 +432,22 @@ impl Socket {
     ) -> io::Result<()> {
         let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
         self.send(request)?;
-        let mut buf = vec![0u8; 128 * 1024];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = self.take_buf(64 * 1024);
+        let out = self.request_one_into(&mut buf, seq, want, sink);
+        self.buf = buf;
+        out
+    }
+
+    fn request_one_into(
+        &mut self,
+        buf: &mut [u8],
+        seq: u32,
+        want: u16,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + READ_TIMEOUT;
         loop {
-            let n = self.recv_deadline(&mut buf, deadline)?;
+            let n = self.recv_deadline(buf, deadline)?;
             if n > buf.len() {
                 // Whatever else the kernel sent for this question is still
                 // queued and would be read as the answer to the next one.
@@ -443,9 +508,13 @@ impl Socket {
         what: &str,
         parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
-        // Big enough that growing is the exception on any host anybody has
-        // put this in front of.
-        self.dump_from(256 * 1024, request, want, what, parse)
+        // One kernel dump datagram, near enough: the kernel keeps them well
+        // under this. It used to start at 256 KiB on the reasoning that
+        // growing was not possible - it is now, and starting there cost an
+        // allocation and a walk over a quarter megabyte to zero it, every
+        // time the buffer was fresh. Whatever a host really needs, the
+        // buffer reaches on its first dump and keeps.
+        self.dump_from(64 * 1024, request, want, what, parse)
     }
 
     /// `dump`, with the size it starts from spelt out. Only a test passes
@@ -457,6 +526,23 @@ impl Socket {
         request: &[u8],
         want: u16,
         what: &str,
+        parse: impl FnMut(&[u8], &mut Vec<T>),
+    ) -> io::Result<Vec<T>> {
+        // The buffer is taken out of the socket for the duration and put back
+        // however large it had to grow, so the next dump starts from there
+        // instead of allocating and zeroing hundreds of kilobytes again.
+        let mut buf = self.take_buf(start);
+        let out = self.dump_into(&mut buf, request, want, what, parse);
+        self.buf = buf;
+        out
+    }
+
+    fn dump_into<T>(
+        &mut self,
+        buf: &mut Vec<u8>,
+        request: &[u8],
+        want: u16,
+        what: &str,
         mut parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
         // Capped, so a nonsensical size cannot be turned into an allocation
@@ -464,15 +550,14 @@ impl Socket {
         const CEILING: usize = 64 * 1024 * 1024;
         const ATTEMPTS: usize = 8;
         let mut req = request.to_vec();
-        let mut buf = vec![0u8; start];
         let mut out = Vec::new();
         for _ in 0..ATTEMPTS {
             out.clear();
             self.seq = self.seq.wrapping_add(1);
             req[8..12].copy_from_slice(&self.seq.to_ne_bytes());
             self.send(&req)?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            match self.run_dump(&mut buf, want, self.seq, deadline, &mut |payload| {
+            let deadline = Instant::now() + READ_TIMEOUT;
+            match self.run_dump(buf, want, self.seq, deadline, &mut |payload| {
                 parse(payload, &mut out)
             }) {
                 Ok(DumpEnd::Done) => return Ok(out),
@@ -673,13 +758,27 @@ impl Socket {
     }
 
     /// What arrived on the subscription since the last look.
-    pub fn recv_events(&self) -> io::Result<Events> {
-        let mut buf = vec![0u8; 64 * 1024];
+    pub fn recv_events(&mut self) -> io::Result<Events> {
+        let mut buf = self.take_buf(64 * 1024);
+        let out = self.events_from(&mut buf);
+        self.buf = buf;
+        out
+    }
+
+    fn events_from(&self, buf: &mut [u8]) -> io::Result<Events> {
         // A notification that did not fit is a loss like ENOBUFS: what was in
         // it is unknowable, so the caller has to stop trusting what it holds
         // and read the real state - saying so is the difference between that
         // and quietly working from half a batch.
-        let n = self.recv(&mut buf)?;
+        let n = match self.recv(buf) {
+            Ok(n) => n,
+            // The caller polls before asking, so this means the batch was
+            // taken by something else or never was - not that anything was
+            // lost. Saying "lost" here would send the daemon into a recovery
+            // pass over nothing.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Events::default()),
+            Err(e) => return Err(e),
+        };
         if n > buf.len() {
             return Err(io::Error::other("a notification batch outgrew the buffer"));
         }
@@ -999,24 +1098,37 @@ mod tests {
         assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
         let ours = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
         let theirs = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
-        // The kernel side gives up waiting after half a second. A datagram
-        // socketpair does not tell it when our end closes, so without this
-        // the thread it runs on is never joinable.
-        let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 500_000,
+        // Both ends give up waiting: the kernel side after half a second,
+        // because a datagram socketpair does not tell it when our end closes
+        // and the thread it runs on would never be joinable; our side the way
+        // a real netlink socket does, so the code under test meets the same
+        // WouldBlock it meets in production.
+        let timeout = |fd: &std::os::fd::OwnedFd, usec| {
+            let tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: usec,
+            };
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
         };
-        let rc = unsafe {
-            libc::setsockopt(
-                theirs.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
-        (Socket { fd: ours, seq: 1 }, theirs)
+        timeout(&theirs, 500_000);
+        timeout(&ours, 100_000);
+        (
+            Socket {
+                fd: ours,
+                seq: 1,
+                buf: Vec::new(),
+            },
+            theirs,
+        )
     }
 
     fn send_raw(fd: &std::os::fd::OwnedFd, bytes: &[u8]) {
