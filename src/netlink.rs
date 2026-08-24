@@ -966,6 +966,13 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_is_not_a_hex_digit() {
+        // from_str_radix accepts "+f" as 15; the parser must not.
+        assert_eq!(parse_mac("+1:+2:+3:+4:+5:+6"), None);
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:+f"), None);
+    }
+
+    #[test]
     fn malformed_addresses_are_rejected() {
         for bad in [
             "",

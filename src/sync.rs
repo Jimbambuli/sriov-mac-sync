@@ -32,6 +32,29 @@ pub struct Report {
     pub foreign: usize,
 }
 
+/// What the syncer needs from the kernel, as a trait so the bookkeeping can
+/// be tested against a fake. The real one is the netlink socket; the fake
+/// records what would be written and answers with whatever a test injects.
+/// reconcile had no test at all for exactly this reason - its second argument
+/// was the concrete socket, and the concrete socket needs a kernel.
+pub trait FdbWriter {
+    fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>>;
+    fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>>;
+    fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()>;
+}
+
+impl FdbWriter for Socket {
+    fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
+        Socket::dump_fdb(self)
+    }
+    fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
+        Socket::vf_macs_of(self, indices)
+    }
+    fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
+        Socket::set_self_fdb(self, ifindex, mac, add)
+    }
+}
+
 /// The virtual functions' addresses, remembered together with the physical
 /// functions they were read for.
 type CarriedVf = (Vec<u32>, Vec<(u32, Mac)>);
@@ -279,7 +302,7 @@ impl Syncer {
             .collect()
     }
 
-    fn drop_orphans(&self, sock: &mut Socket, topo: &Topology, apply: bool) {
+    fn drop_orphans(&self, sock: &mut dyn FdbWriter, topo: &Topology, apply: bool) {
         for dev in self.orphaned() {
             let owned = self.load_owned(&dev);
             if !apply || self.dry_run {
@@ -325,7 +348,7 @@ impl Syncer {
     /// could not be removed and therefore stays owned.
     fn unregister_all(
         &self,
-        sock: &mut Socket,
+        sock: &mut dyn FdbWriter,
         dev: &str,
         ifindex: u32,
         owned: &HashSet<Mac>,
@@ -505,7 +528,7 @@ impl Syncer {
     /// caller took over it, so the report still accounts for the whole pass.
     pub fn reconcile(
         &mut self,
-        sock: &mut Socket,
+        sock: &mut dyn FdbWriter,
         apply: bool,
         topo: &Topology,
         topo_load: Duration,
@@ -752,7 +775,7 @@ impl Syncer {
     /// is exactly when there is least of it to spare.
     pub fn fast_add_all(
         &mut self,
-        sock: &mut Socket,
+        sock: &mut dyn FdbWriter,
         topo: &Topology,
         entries: &[FdbEntry],
     ) -> io::Result<()> {
@@ -812,7 +835,7 @@ impl Syncer {
 
     fn fast_add(
         &self,
-        sock: &mut Socket,
+        sock: &mut dyn FdbWriter,
         topo: &Topology,
         entry: &FdbEntry,
         pairs: &[(&Pair, String, HashSet<Mac>)],
@@ -882,7 +905,7 @@ impl Syncer {
     /// Over the notes rather than over the pairs: `--flush` promises to remove
     /// every address this daemon registered, and some of them belong to
     /// devices that have since stopped being an uplink.
-    pub fn flush(&mut self, sock: &mut Socket) -> io::Result<bool> {
+    pub fn flush(&mut self, sock: &mut dyn FdbWriter) -> io::Result<bool> {
         let topo = Topology::load()?;
         let mut clean = true;
         for dev in self.noted_devices() {
@@ -1407,5 +1430,277 @@ mod state_tests {
             !r.contains("failure"),
             "an untroubled pass claimed a failure:\n{r}"
         );
+    }
+    use crate::sysfs::fixture::{mac, Builder};
+
+    /// The kernel, as far as the bookkeeping is concerned: answers with what
+    /// a test injected and records what would have been written.
+    #[derive(Default)]
+    struct FakeSock {
+        fdb: Vec<FdbEntry>,
+        vf: Vec<(u32, Mac)>,
+        added: Vec<(u32, Mac)>,
+        removed: Vec<(u32, Mac)>,
+        /// raw OS error to answer an add of this address with
+        fail_add: HashMap<Mac, i32>,
+        /// raw OS error to answer a removal of this address with
+        fail_del: HashMap<Mac, i32>,
+    }
+
+    impl FdbWriter for FakeSock {
+        fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
+            Ok(self.fdb.clone())
+        }
+        fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
+            Ok(self.vf.clone())
+        }
+        fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
+            let table = if add { &self.fail_add } else { &self.fail_del };
+            if let Some(code) = table.get(mac) {
+                return Err(io::Error::from_raw_os_error(*code));
+            }
+            if add {
+                self.added.push((ifindex, *mac));
+            } else {
+                self.removed.push((ifindex, *mac));
+            }
+            Ok(())
+        }
+    }
+
+    fn ready_syncer(dir: &std::path::Path) -> Syncer {
+        let mut s = Syncer::new(vec![pair()], dir.to_path_buf());
+        s.authoritative = true;
+        s
+    }
+
+    use std::time::Duration as Dur;
+
+    #[test]
+    fn a_full_pass_registers_exactly_what_is_wanted_and_notes_it() {
+        let dir = scratch("pass");
+        let topo = host(mac(1));
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        let mut s = ready_syncer(&dir);
+        let reports = s
+            .reconcile(&mut sock, true, &topo, Dur::ZERO, true)
+            .unwrap();
+
+        let registered: HashSet<Mac> = sock.added.iter().map(|(_, m)| *m).collect();
+        let (want, _, _) = s.desired(&topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
+        assert_eq!(
+            registered, want,
+            "the pass wrote something desired() does not want"
+        );
+        assert_eq!(reports[0].added, want.len());
+        assert_eq!(
+            s.load_owned("nic1"),
+            want,
+            "the note does not record what was registered"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The fast path once had its own abbreviation of the exclusion rules -
+    /// none of them - and registered our own VF's address. This pins the two
+    /// paths together: whatever arrives as an event may be registered exactly
+    /// when the full pass would want it.
+    #[test]
+    fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
+        let dir = scratch("parity");
+        let topo = host(mac(1));
+        let vf = vec![(2, VF_ADMIN)];
+        let mut s = ready_syncer(&dir);
+        let (want, _, wire) = s.desired(&topo, &pair(), "nic1", &fdb(), &vf);
+        s.carried_wire.insert("nic1".into(), wire);
+        s.carried_vf = Some((vec![2], vf.clone()));
+
+        for entry in fdb() {
+            let mut sock = FakeSock::default();
+            s.fast_add_all(&mut sock, &topo, std::slice::from_ref(&entry))
+                .unwrap();
+            let registered = !sock.added.is_empty();
+            // Only learned entries reach the fast path at all; desired() also
+            // wants the host's own addresses, which never arrive as events.
+            let wanted = entry.is_learned() && want.contains(&entry.mac);
+            assert_eq!(
+                registered,
+                wanted,
+                "fast path and full pass disagree on {} (registered {registered}, wanted {wanted})",
+                crate::netlink::format_mac(&entry.mac)
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eexist_is_not_claimed_as_ours() {
+        let dir = scratch("eexist");
+        let topo = host(mac(1));
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            fail_add: HashMap::from([(BEHIND_GUEST, libc::EEXIST)]),
+            ..Default::default()
+        };
+        let mut s = ready_syncer(&dir);
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
+            .unwrap();
+        assert!(
+            !s.load_owned("nic1").contains(&BEHIND_GUEST),
+            "an entry somebody else created was claimed - it would be deleted later"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removal_that_fails_keeps_its_note_and_enoent_counts_as_gone() {
+        let dir = scratch("removal");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        // Two addresses on record that the bridge no longer knows.
+        let gone_mac = mac(0x51);
+        let stuck_mac = mac(0x52);
+        s.save_owned("nic1", &HashSet::from([gone_mac, stuck_mac]));
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            fail_del: HashMap::from([(gone_mac, libc::ENOENT), (stuck_mac, libc::EPERM)]),
+            ..Default::default()
+        };
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
+            .unwrap();
+        let owned = s.load_owned("nic1");
+        assert!(!owned.contains(&gone_mac), "ENOENT means gone, not stuck");
+        assert!(
+            owned.contains(&stuck_mac),
+            "a failed removal lost its note - the entry is an orphan now"
+        );
+        assert!(
+            s.timings.failures.iter().any(|f| f.contains("unregister")),
+            "the failure went unrecorded"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dry_run_leaves_the_notes_byte_identical() {
+        let dir = scratch("dryrun");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.save_owned("nic1", &HashSet::from([mac(0x61)]));
+        s.save_owned("gone0", &HashSet::from([mac(0x62)])); // an orphan
+        let before: Vec<(String, String)> = {
+            let mut v: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (p.display().to_string(), fs::read_to_string(&p).unwrap())
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        s.dry_run = true;
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
+            .unwrap();
+        s.flush(&mut sock).unwrap();
+        assert!(
+            sock.added.is_empty() && sock.removed.is_empty(),
+            "a dry run wrote"
+        );
+        let after: Vec<(String, String)> = {
+            let mut v: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (p.display().to_string(), fs::read_to_string(&p).unwrap())
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(before, after, "a dry run changed the state directory");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mangled_note_gives_up_only_the_mangled_lines() {
+        let dir = scratch("mangled");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("nic1.owned"),
+            "aa:bb:cc:dd:ee:01\r\nnot an address\nAA:BB:CC:DD:EE:02\naa:bb:cc:dd:ee:03\n",
+        )
+        .unwrap();
+        let s = ready_syncer(&dir);
+        let owned = s.load_owned("nic1");
+        // CRLF is trimmed, uppercase is not an address to parse_mac, garbage is dropped.
+        assert!(owned.contains(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]));
+        assert!(owned.contains(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_pairs_left_the_pass_still_sweeps_orphans() {
+        let dir = scratch("sweep");
+        let topo = host(mac(1));
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        s.authoritative = true;
+        s.save_owned("nic1", &HashSet::from([mac(0x71)]));
+        let mut sock = FakeSock::default();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
+            .unwrap();
+        assert_eq!(
+            sock.removed,
+            vec![(2, mac(0x71))],
+            "the orphaned registration was not taken back out"
+        );
+        assert!(!dir.join("nic1.owned").exists(), "the settled note lingers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The uplink may itself be a VF; the exclusions then belong to its PF -
+    /// the sister VFs' addresses above all. All earlier tests ran with the
+    /// device being its own physical function.
+    #[test]
+    fn a_vf_uplink_excludes_its_sisters_through_the_pf() {
+        let sister: Mac = [0x02, 0x99, 0, 0, 0, 7];
+        let topo = Builder::new()
+            .add("pf0", 1, Some(mac(0x10)))
+            .vfs(2)
+            .add("pf0v1", 2, Some(mac(0x11)))
+            .physfn("pf0")
+            .master("br0")
+            .add("br0", 10, Some(mac(0x11)))
+            .bridge()
+            .lower("pf0v1")
+            .lower("tap1")
+            .add("tap1", 11, Some(mac(0x12)))
+            .master("br0")
+            .build();
+        let p = Pair {
+            dev: "pf0v1".into(),
+            bridge: "br0".into(),
+        };
+        // The sister's address was learnt behind the bridge; the PF's index
+        // is 1 and the vf list is keyed by it.
+        let entries = vec![learned(11, 10, sister)];
+        let s = syncer();
+        let (want, _, _) = s.desired(&topo, &p, "pf0v1", &entries, &[(1, sister)]);
+        assert!(
+            !want.contains(&sister),
+            "a sister VF's address made it past the PF-keyed exclusions"
+        );
+        let _ = &s;
     }
 }

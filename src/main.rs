@@ -918,6 +918,27 @@ mod tests {
     }
 
     #[test]
+    fn an_interval_that_would_spin_or_abort_is_refused() {
+        // Zero busy-loops; u64::MAX overflows the Instant it is added to.
+        assert!(clamp_interval(0).is_err());
+        assert!(clamp_interval(u64::MAX).is_err());
+        assert_eq!(clamp_interval(300), Ok(300));
+        let mut o = Options::default();
+        assert!(parse_args_from(&mut o, args(&["--interval", "0"]).into_iter()).is_err());
+    }
+
+    #[test]
+    fn a_second_mode_is_refused_rather_than_quietly_winning() {
+        let mut o = Options::default();
+        let e = parse_args_from(&mut o, args(&["--status", "--flush"]).into_iter()).unwrap_err();
+        assert!(e.contains("--flush"), "the message hides the option: {e}");
+        assert!(
+            matches!(o.mode, Mode::Status),
+            "the first mode did not stand"
+        );
+    }
+
+    #[test]
     fn the_daemon_is_the_mode_without_arguments() {
         let mut o = Options::default();
         parse_args_from(&mut o, args(&[]).into_iter()).unwrap();
