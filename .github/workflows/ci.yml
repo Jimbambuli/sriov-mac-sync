@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,6 +29,10 @@ jobs:
         run: cargo test
       - name: Release build
         run: cargo build --release
+      - name: The binary answers at all
+        run: |
+          ./target/release/sriov-mac-sync --version
+          ./target/release/sriov-mac-sync --help
 
   msrv:
     # Cargo.toml claims a minimum Rust version. Claiming is not testing.

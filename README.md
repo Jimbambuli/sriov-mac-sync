@@ -147,6 +147,7 @@ Each bridge is handled on its own, and so is each uplink into it.
 cargo build --release
 install -m 755 target/release/sriov-mac-sync /usr/local/sbin/
 install -m 644 dist/sriov-mac-sync.service   /etc/systemd/system/
+install -m 644 dist/sriov-mac-sync.conf.example /etc/sriov-mac-sync.conf  # optional
 systemctl daemon-reload
 systemctl enable --now sriov-mac-sync
 ```
@@ -162,25 +163,41 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
 
 ```
 sriov-mac-sync --check              does this NIC accept filter entries at all?
+                                    (it proves it by writing a probe entry and
+                                    taking it back out)
 sriov-mac-sync --status             what was detected, wanted, registered
 sriov-mac-sync --once --dry-run     what would change
-sriov-mac-sync --once               reconcile and exit
+sriov-mac-sync --once               reconcile and exit; the exit code says
+                                    whether every change went through
 sriov-mac-sync --flush              remove what this daemon registered
+sriov-mac-sync --timings            as a daemon: after every pass, say what
+                                    each phase cost and name what failed
+sriov-mac-sync --interval SEC       seconds between timed passes (default 300)
+sriov-mac-sync --max NUM            warn above this many addresses (default 128)
 sriov-mac-sync -v ...               explain what is skipped, and list addresses
+sriov-mac-sync --version            print the version
 ```
 
 `--extra <macs>` registers addresses unconditionally, for a device that never
-speaks first; the wire-side and own-address rules still override it, and you
-get a warning when they do. `--exclude <macs>` is its opposite.
+speaks first; the exclusion rules — excluded, multicast, the host's own, out
+on the wire — still override it, and you get a warning when they do.
+`--exclude <macs>` is its opposite.
 
-Pairs are found automatically: any interface with VFs that ends up in a bridge.
-Override with `--pair DEV:BRIDGE`, repeatable. `/etc/sriov-mac-sync.conf` may
-set `PAIRS`, `RESYNC`, `MAX_MACS`, `EXCLUDE` and `EXTRA`.
+Pairs are found automatically: any interface with VFs — or itself a VF — that
+ends up in a bridge. Override with `--pair DEV:BRIDGE`, repeatable; the device
+has to actually sit under that bridge, directly or through a bond.
+`/etc/sriov-mac-sync.conf` may set `PAIRS`, `RESYNC`, `MAX_MACS`, `EXCLUDE`
+and `EXTRA` — a commented copy ships as `dist/sriov-mac-sync.conf.example`.
+Numbers from the command line override the file; the lists add up. Naming
+pairs by hand — in either place — also means the daemon no longer decides on
+its own that a note belongs to no uplink: only autodetection sees every
+uplink, so only autodetection may conclude that.
 
-`--compare-topology` reads the interface layout twice — once out of `/sys` and
-once out of a single netlink dump — and reports any field where the two
-disagree. It changes nothing, and exists so the faster path can be trusted
-before anything depends on it. Reports from unusual setups are welcome.
+The question whether reading the topology over netlink would beat the walk
+over `/sys` is settled and the apparatus that answered it is gone: the two
+agreed in every field, and the dump costs what the walk costs, because the
+kernel serialises every interface either way. Measured 24.8.2026, the switch
+would have saved 5 % of the rare pass that reads the topology at all.
 
 The daemon works from notifications. An address is registered as soon as the
 kernel says a bridge learnt it, dropped when the bridge ages it out, and the
@@ -196,11 +213,13 @@ removing bridge ports, and creating and destroying a dozen veths with traffic,
 every one of twenty-five corrections came from a notification and none from the
 timer. It is kept because "nothing could be provoked" is not "nothing exists",
 and because the failure it guards against — a missed notification — would
-otherwise be silent and permanent. It also doubles as a canary: a log line
+otherwise be silent and permanent. It also doubles as a canary: a change line
 ending in `[timed]` means the notification path missed something, and is worth
-looking into.
+looking into — recovery passes after lost notifications label themselves
+`[lost events]` and `[recovery]` instead, so the canary stays honest.
 
-Every log line names what triggered the pass, for exactly that reason.
+Every line that reports a change names what triggered the pass, for exactly
+that reason; warnings and service messages carry no trigger.
 
 ## Verify it actually works
 
@@ -385,7 +404,7 @@ The parts most likely to be wrong on unfamiliar hardware are the ones that
 decide *which way the wire is* and *which addresses count*, and those are pure
 functions over a topology that tests build by hand — bonds, stacked VLAN
 interfaces, vnet bridges, a second unrelated bridge, a bridge carrying its own
-address. CI runs all of that plus a static build on every push.
+address. CI runs all of that, an MSRV build and a static build on every push to main and on pull requests.
 
 ## License
 

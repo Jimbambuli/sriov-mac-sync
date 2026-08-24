@@ -1,12 +1,16 @@
 //! The little bit of rtnetlink this daemon needs.
 //!
-//! Three operations, all on `AF_BRIDGE` neighbour messages - which is what the
-//! kernel calls forwarding database entries:
+//! Four operations - three on `AF_BRIDGE` neighbour messages, which is what
+//! the kernel calls forwarding database entries, and one on link messages:
 //!
 //! * dump every FDB entry the host knows, learnt and permanent alike,
 //! * add or remove an entry with `NTF_SELF`, which is the unicast filter list
 //!   of the interface itself rather than the bridge's table,
-//! * subscribe to `RTNLGRP_NEIGH` and read changes as they happen.
+//! * subscribe to `RTNLGRP_NEIGH` and `RTNLGRP_LINK` and read changes as they
+//!   happen - interfaces matter as much as addresses, because a VF whose MAC
+//!   is set from the host changes what must be excluded without moving a
+//!   single forwarding entry,
+//! * ask one interface for its virtual functions' addresses.
 //!
 //! Done by hand rather than through a netlink crate: the message layouts used
 //! here are small and stable, and a daemon that writes into a NIC's hardware
@@ -30,6 +34,10 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 0x001;
 const NLM_F_ACK: u16 = 0x004;
 const NLM_F_ROOT: u16 = 0x100;
+// The same bits mean different things on GET and on NEW requests: MATCH
+// belongs to GET (and makes up NLM_F_DUMP), EXCL to NEW. Their sharing 0x200
+// is the kernel's doing, not a typo here - as with IFLA_VF_INFO and
+// IFLA_VF_MAC below, which are both 1 in their respective nesting levels.
 const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
@@ -83,6 +91,11 @@ impl FdbEntry {
     /// configured: a port's own address, or an entry somebody added by hand.
     /// Entries planted by an external agent - an SDN controller, a VXLAN
     /// daemon - count as learnt too: they describe where a peer actually is.
+    ///
+    /// The final test is NUD_NOARP: a state given to entries that no probe
+    /// ever validates - static VXLAN destinations without NTF_EXT_LEARNED,
+    /// for instance - which therefore describe configuration, not an
+    /// observed peer.
     pub fn is_learned(&self) -> bool {
         if self.flags & NTF_SELF != 0 || self.state & NUD_PERMANENT != 0 {
             return false;
@@ -148,8 +161,9 @@ impl Socket {
         // buffer easily, and netlink answers that with ENOBUFS rather than
         // with short reads.
         //
-        // SO_RCVBUF is silently capped at net.core.rmem_max, which is 208 KiB
-        // on a stock kernel - a fifth of what is asked for here, and nothing
+        // SO_RCVBUF is silently capped at net.core.rmem_max - 208 KiB on a
+        // stock kernel against the megabyte asked for here (the kernel then
+        // doubles whatever value wins, for its own bookkeeping), and nothing
         // would say so. SO_RCVBUFFORCE ignores that ceiling; it needs
         // CAP_NET_ADMIN, which this program holds for programming the filter
         // anyway. Fall back to the capped request where it is refused, because
@@ -451,11 +465,11 @@ impl Socket {
     /// The addresses administratively set on the virtual functions of the
     /// named interfaces.
     ///
-    /// Only the physical function of a pair contributes exclusions, and there
-    /// are as many of those as there are uplinks - two here. Asking for them
-    /// by index costs two questions; the dump this replaces had the kernel
-    /// describe all 36 interfaces on this host, and measured at seven times
-    /// the forwarding dump for four addresses against 531 entries.
+    /// Only the physical functions of the pairs contribute exclusions, and
+    /// there are as many of those as there are uplinks. Asking by index costs
+    /// one question each; the dump this replaced had the kernel describe
+    /// every interface on the host to reach the few that have VFs, and the
+    /// serialisation dominated the cost.
     ///
     /// An interface that has gone away answers ENODEV. That is not a failure
     /// worth stopping for: the dump would simply not have listed it, and an
@@ -752,10 +766,15 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
                 continue;
             }
             for (mac_kind, mac_value) in attrs(vf_info) {
-                // struct ifla_vf_mac { __u32 vf; __u8 mac[32]; }
-                if mac_kind == IFLA_VF_MAC && mac_value.len() >= 4 + 6 {
+                // struct ifla_vf_mac { __u32 vf; __u8 mac[32]; } - the vf
+                // number first, then the address, of which only the usual six
+                // bytes carry meaning. Anything shorter than number-plus-six
+                // cannot be that struct.
+                const VF_MAC_OFF: usize = 4;
+                const VF_MAC_LEN: usize = 6;
+                if mac_kind == IFLA_VF_MAC && mac_value.len() >= VF_MAC_OFF + VF_MAC_LEN {
                     let mut m = [0u8; 6];
-                    m.copy_from_slice(&mac_value[4..10]);
+                    m.copy_from_slice(&mac_value[VF_MAC_OFF..VF_MAC_OFF + VF_MAC_LEN]);
                     out.push((ifindex, m));
                 }
             }

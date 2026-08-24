@@ -100,8 +100,8 @@ usage: sriov-mac-sync [options]
   -h, --help      this text
       --version   print the version
 
-Pairs are found automatically: every interface with virtual functions that ends
-up in a bridge, following bonds. {CONF} may set PAIRS, RESYNC,
+Pairs are found automatically: every interface with virtual functions - or
+itself a virtual function - that ends up in a bridge, following bonds. {CONF} may set PAIRS, RESYNC,
 MAX_MACS, EXCLUDE and EXTRA.
 "
     )
@@ -866,6 +866,55 @@ mod tests {
         // A typo must not turn into some other address.
         let bad = macs("extra", &args(&["02:00:00:00:00:0", "not-an-address", ""]));
         assert!(bad.is_empty(), "a malformed address was accepted: {bad:?}");
+    }
+
+    /// The README, the unit file and the example configuration all restate
+    /// facts the code owns. Each has drifted at least once - the help text
+    /// claimed a default the code had left behind - and this is the same
+    /// cure applied to the other three documents.
+    #[test]
+    fn the_readme_names_every_option_the_help_offers() {
+        let readme = include_str!("../README.md");
+        for opt in usage_text()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(|w| w.to_string()))
+            .filter(|w| w.starts_with("--"))
+        {
+            assert!(
+                readme.contains(&opt),
+                "the README never mentions {opt}, which the help offers"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unit_file_matches_the_paths_the_code_uses() {
+        let unit = include_str!("../dist/sriov-mac-sync.service");
+        let dir = STATE_DIR.strip_prefix("/run/").unwrap();
+        assert!(
+            unit.contains(&format!("RuntimeDirectory={dir}")),
+            "the unit's RuntimeDirectory does not produce {STATE_DIR}"
+        );
+        assert!(
+            unit.contains("RuntimeDirectoryPreserve=yes"),
+            "without RuntimeDirectoryPreserve the ownership notes die on every stop"
+        );
+    }
+
+    #[test]
+    fn the_example_config_offers_only_keys_the_code_reads() {
+        let example = include_str!("../dist/sriov-mac-sync.conf.example");
+        for key in example
+            .lines()
+            .filter_map(|l| l.strip_prefix('#'))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
+            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        {
+            assert!(
+                ["PAIRS", "RESYNC", "MAX_MACS", "EXCLUDE", "EXTRA"].contains(&key.as_str()),
+                "the example offers {key}, which load_conf never reads"
+            );
+        }
     }
 
     #[test]
