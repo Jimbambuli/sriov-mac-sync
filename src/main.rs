@@ -736,12 +736,28 @@ fn run() -> Result<bool, String> {
 
                 // Register what just appeared before anything else, so the
                 // first reply to it is not sent into the void.
-                if let Ok(topo) = Topology::load() {
-                    for (kind, entry) in events.fdb {
-                        if kind == netlink::RTM_NEWNEIGH {
-                            let _ = syncer.fast_add(&mut sock, &topo, &entry);
+                //
+                // The pass that follows a few milliseconds later works from
+                // the same picture, so read it here if it is wanted and let
+                // that one have it too. Reading it twice for one event was
+                // the whole of what this used to cost.
+                if stale || held.is_none() {
+                    match Topology::load() {
+                        Ok(t) => {
+                            held = Some(t);
+                            stale = false;
                         }
+                        Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
                     }
+                }
+                if let Some(topo) = held.as_ref() {
+                    let arrived: Vec<_> = events
+                        .fdb
+                        .into_iter()
+                        .filter(|(kind, _)| *kind == netlink::RTM_NEWNEIGH)
+                        .map(|(_, entry)| entry)
+                        .collect();
+                    let _ = syncer.fast_add_all(&mut sock, topo, &arrived);
                 }
 
                 // Let a burst settle, then make the full pass due at once.

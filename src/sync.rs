@@ -570,11 +570,46 @@ impl Syncer {
     /// Register one address straight away, without waiting for the next full
     /// pass. A device that has only just appeared would otherwise miss the
     /// first reply sent to it.
-    pub fn fast_add(
+    /// Register everything a batch of notifications brought, before the pass
+    /// that follows gets to it.
+    ///
+    /// The ownership notes are read once per device and written once at the
+    /// end. Doing it per address meant rewriting a growing file for every
+    /// entry of a burst - work that squares with the size of the burst, which
+    /// is exactly when there is least of it to spare.
+    pub fn fast_add_all(
+        &mut self,
+        sock: &mut Socket,
+        topo: &Topology,
+        entries: &[FdbEntry],
+    ) -> io::Result<()> {
+        // Where each uplink sits in its bridge is a property of the topology,
+        // which is the same for every entry in the batch. Worked out once
+        // instead of once per entry per pair - the same reason the pass stopped
+        // asking it per forwarding entry.
+        let pairs: Vec<(Pair, String)> = self
+            .pairs
+            .iter()
+            .map(|p| (p.clone(), topo.uplink_port(&p.dev, &p.bridge)))
+            .collect();
+
+        let mut touched: HashMap<String, HashSet<Mac>> = HashMap::new();
+        for entry in entries {
+            self.fast_add(sock, topo, entry, &pairs, &mut touched)?;
+        }
+        for (dev, set) in touched {
+            self.save_owned(&dev, &set);
+        }
+        Ok(())
+    }
+
+    fn fast_add(
         &mut self,
         sock: &mut Socket,
         topo: &Topology,
         entry: &FdbEntry,
+        pairs: &[(Pair, String)],
+        touched: &mut HashMap<String, HashSet<Mac>>,
     ) -> io::Result<()> {
         if !entry.is_learned() || !entry.is_unicast() {
             return Ok(());
@@ -585,12 +620,11 @@ impl Syncer {
         let Some(port_name) = topo.name_of(entry.ifindex).map(|s| s.to_string()) else {
             return Ok(());
         };
-        for pair in self.pairs.clone() {
+        for (pair, port) in pairs {
             let Some(bridge_link) = topo.get(&pair.bridge) else {
                 continue;
             };
-            let port = topo.uplink_port(&pair.dev, &pair.bridge);
-            if port_name == port {
+            if &port_name == port {
                 continue; // on the wire
             }
             if master != bridge_link.index {
@@ -619,9 +653,10 @@ impl Syncer {
             }
             match sock.set_self_fdb(dev_link.index, &entry.mac, true) {
                 Ok(()) => {
-                    let mut owned = self.load_owned(&pair.dev);
-                    owned.insert(entry.mac);
-                    self.save_owned(&pair.dev, &owned);
+                    touched
+                        .entry(pair.dev.clone())
+                        .or_insert_with(|| self.load_owned(&pair.dev))
+                        .insert(entry.mac);
                 }
                 // Already there, and unlike in a full pass nothing checked
                 // beforehand whether it was ours. Claiming it now could mean
