@@ -244,7 +244,7 @@ python3 bench/trial.py vmbr1 --vlan 22
 ```
 
 One run covers: eight addresses learnt one at a time (fast-path latency),
-four arriving inside the settle window (the slow, ordinary case - reported
+four arriving in close succession (reported
 separately), a burst of sixteen (one turnaround figure; per-address stamps
 inside one receive batch would be scheduling noise dressed as precision), a
 hundred cold `--once` passes (per-phase min/median/p95/max, with the CPU

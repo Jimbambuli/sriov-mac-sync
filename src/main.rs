@@ -558,6 +558,11 @@ fn run() -> Result<bool, String> {
             // to find what the events missed.
             let mut held: Option<Topology> = None;
             let mut stale = true;
+            // When the last full pass ran, so event storms are answered with
+            // a bounded pass rate rather than with waiting. Registrations
+            // never wait: every batch goes through the fast path the moment
+            // it is read.
+            let mut last_pass = Instant::now() - interval;
 
             loop {
                 if Instant::now() >= next_full {
@@ -638,7 +643,8 @@ fn run() -> Result<bool, String> {
                             Err(e) => eprintln!("warning: reconciliation failed: {e}"),
                         }
                     }
-                    next_full = Instant::now() + interval;
+                    last_pass = Instant::now();
+                    next_full = last_pass + interval;
                     trigger = "timed";
                 }
 
@@ -714,25 +720,19 @@ fn run() -> Result<bool, String> {
                     let _ = syncer.fast_add_all(&mut sock, topo, &arrived);
                 }
 
-                // Let a burst settle, then make the full pass due at once.
-                // Bounded, because on a host whose neighbour table never goes
-                // quiet for 200 ms this would wait for a lull that never comes
-                // and the pass would never happen at all.
-                let settle_until = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < settle_until && mon.wait(200).unwrap_or(false) {
-                    // The batches read here are not acted on - the full pass
-                    // that follows covers their forwarding entries - but an
-                    // interface message among them still means the carried
-                    // picture is no longer true. Before this was looked at,
-                    // a container starting mid-burst had its veth ignored
-                    // until the next timed pass.
-                    match mon.recv_events() {
-                        Ok(ev) if ev.links_changed => stale = true,
-                        Ok(_) => {}
-                        Err(_) => stale = true,
-                    }
-                }
-                next_full = Instant::now();
+                // The full pass still has to follow - it is what removes
+                // stale entries and reconciles the notes - but nothing waits
+                // for it any more. Its predecessor here waited for a 200 ms
+                // lull before running it, which held every second address of
+                // a burst back by exactly that lull, and any unrelated
+                // neighbour chatter stretched the wait towards its two-second
+                // bound. A pass rate bound does the same job - not flooding a
+                // large host with back-to-back forwarding dumps - without
+                // making anything later than it has to be: at most five
+                // passes a second, the first one immediately when the last
+                // pass is old enough.
+                let due = (last_pass + Duration::from_millis(200)).max(Instant::now());
+                next_full = next_full.min(due);
             }
         }
         Mode::Check => unreachable!(),
