@@ -234,6 +234,50 @@ it is a property of the driver, and there is no way to ask. Test with traffic:
 If step 3 changes nothing, this approach does not work on your hardware and
 this daemon will not help you.
 
+## Putting it on trial
+
+`bench/trial.py` (root, opt-in) provokes the situations the running daemon
+exists for, verifies each came out right, and reports what it cost:
+
+```
+python3 bench/trial.py vmbr1 --vlan 22
+```
+
+One run covers: eight addresses learnt one at a time (fast-path latency),
+four arriving inside the settle window (the slow, ordinary case - reported
+separately), a burst of sixteen (one turnaround figure; per-address stamps
+inside one receive batch would be scheduling noise dressed as precision), a
+hundred cold `--once` passes (per-phase min/median/p95/max, with the CPU
+governor logged), the port's removal (everything has to come back out of
+every filter and note, within a bound), and a final quiescence check: the
+journal has to be quiet, no `[timed]` pass may have had to fix anything, and
+filters and notes must be byte-identical to before. Any verification that
+fails fails the run's exit code.
+
+It refuses to start unless everything holds: the service active and not in
+`--dry-run`, the bridge actually watched, STP off, the VLAN named on a
+VLAN-aware bridge, the test prefix absent, no leftovers from a previous run,
+and enough headroom in every uplink's filter - the list drops addresses
+silently past its capacity, and a benchmark must not be the thing that pushes
+a real guest's address out.
+
+Two boundaries, so the numbers are read for what they are: latencies end at
+the kernel's forwarding-database notification - the driver programs the NIC
+itself asynchronously just afterwards - and absolute times swing with CPU
+frequency scaling, so two software states are compared only by interleaving
+their trials.
+
+If a failed run leaves test entries behind (prefix `02:be:5c`), remove them
+with `bridge fdb del <mac> dev <uplink> self permanent` and leave the note
+files alone: the daemon heals its own notes through the ENOENT path on the
+next pass. After a hard kill the bridge entries age out within 300 s and the
+daemon takes the registrations back by itself.
+
+How the pass scales with the size of the forwarding table is a question for
+`cargo test --release scaling -- --ignored --nocapture`: an SDN-shaped
+topology, a share of entries out on the wire, asserted to stay roughly
+linear (measured: 40x the entries cost 28x the time).
+
 Measured working:
 
 | NIC | driver |

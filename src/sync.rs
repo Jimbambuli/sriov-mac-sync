@@ -1703,4 +1703,148 @@ mod state_tests {
         );
         let _ = &s;
     }
+    /// The reading side of the bench: a pass that may not apply must leave
+    /// the state directory byte-identical - including an orphan note, whose
+    /// deletion path runs through the filesystem where no FdbWriter fake can
+    /// see it. A watchdog counting fake writes alone guards the wrong door.
+    #[test]
+    fn a_non_applying_pass_leaves_the_state_directory_untouched() {
+        let dir = scratch("readonly");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.save_owned("nic1", &HashSet::from([mac(0x81)]));
+        s.save_owned("gone0", &HashSet::from([mac(0x82)])); // an orphan
+        let snapshot = |d: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<_> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (p.display().to_string(), fs::read(&p).unwrap())
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = snapshot(&dir);
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            s.reconcile(&mut sock, false, &topo, Dur::ZERO, true)
+                .unwrap();
+        }
+        assert!(sock.added.is_empty() && sock.removed.is_empty());
+        assert_eq!(
+            before,
+            snapshot(&dir),
+            "a non-applying pass wrote to the state directory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// How the pass scales, in the shape it actually meets: stacked vnet
+    /// bridges the Proxmox way, a share of the entries out on the wire, two
+    /// pairs. Run by hand when the question comes up:
+    ///   cargo test --release scaling -- --ignored --nocapture
+    /// It asserts rough linearity so it doubles as a regression tripwire.
+    #[test]
+    #[ignore]
+    fn scaling_stays_roughly_linear_in_the_forwarding_table() {
+        use crate::sysfs::fixture::Builder;
+        use std::time::Instant;
+
+        // An SDN-shaped host: uplink + second NIC under the bridge, VLAN
+        // interfaces stacked on it, each carrying a vnet bridge with ports.
+        fn build(vnets: u32) -> crate::sysfs::Topology {
+            let mut b = Builder::new()
+                .add("nic1", 2, Some(mac(1)))
+                .master("vmbr1")
+                .vfs(1)
+                .add("nic2", 3, Some(mac(2)))
+                .master("vmbr1");
+            let mut bridge = b
+                .add("vmbr1", 10, Some(mac(3)))
+                .bridge()
+                .lower("nic1")
+                .lower("nic2");
+            for v in 0..vnets {
+                bridge = bridge.lower(&format!("vmbr1.{}", 100 + v));
+            }
+            b = bridge;
+            for v in 0..vnets {
+                let vid = 100 + v;
+                b = b
+                    .add(&format!("vmbr1.{vid}"), 100 + v * 3, Some(mac(3)))
+                    .master(&format!("VNET{vid}"))
+                    .lower("vmbr1")
+                    .add(&format!("VNET{vid}"), 101 + v * 3, Some(mac(3)))
+                    .bridge()
+                    .lower(&format!("vmbr1.{vid}"))
+                    .lower(&format!("veth{vid}"))
+                    .add(&format!("veth{vid}"), 102 + v * 3, Some(mac(4)))
+                    .master(&format!("VNET{vid}"));
+            }
+            b.build()
+        }
+
+        fn entries(n: usize, vnets: u32) -> Vec<FdbEntry> {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let m = [0xaa, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 1];
+                let e = if i % 10 < 3 {
+                    learned(2, 10, m) // 30 % out on the wire
+                } else if i % 10 < 6 {
+                    let v = (i as u32) % vnets;
+                    learned(102 + v * 3, 101 + v * 3, m) // behind a vnet
+                } else {
+                    learned(3, 10, m) // behind the second NIC
+                };
+                out.push(e);
+            }
+            out
+        }
+
+        let topo = build(8);
+        let mut cost = Vec::new();
+        for &n in &[500usize, 5_000, 20_000] {
+            let dir = scratch(&format!("scale{n}"));
+            let mut s = Syncer::new(
+                vec![Pair {
+                    dev: "nic1".into(),
+                    bridge: "vmbr1".into(),
+                }],
+                dir.clone(),
+            );
+            s.authoritative = true;
+            let mut sock = FakeSock {
+                fdb: entries(n, 8),
+                vf: vec![(2, VF_ADMIN)],
+                ..Default::default()
+            };
+            // warm once, then measure the median of five
+            let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO, true);
+            let mut runs: Vec<u128> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO, true);
+                    t.elapsed().as_micros()
+                })
+                .collect();
+            runs.sort();
+            println!("  {n:6} entries: {} us", runs[2]);
+            cost.push((n as u128, runs[2].max(1)));
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let (n0, t0) = cost[0];
+        let (n2, t2) = cost[2];
+        let work_ratio = n2 / n0; // 40x the entries
+        assert!(
+            t2 / t0 < work_ratio * 4,
+            "the pass grew {}x over a {}x larger table - that is not linear",
+            t2 / t0,
+            work_ratio
+        );
+    }
 }
