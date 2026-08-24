@@ -55,6 +55,14 @@ pub const NTF_EXT_LEARNED: u8 = 0x10;
 pub const NUD_PERMANENT: u16 = 0x80;
 pub const NUD_NOARP: u16 = 0x40;
 
+const IFLA_ADDRESS: u16 = 1;
+const IFLA_IFNAME: u16 = 3;
+const IFLA_MASTER: u16 = 10;
+const IFLA_LINK: u16 = 5;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_NUM_VF: u16 = 21;
+const IFLA_PARENT_DEV_NAME: u16 = 56;
 const IFLA_EXT_MASK: u16 = 29;
 const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_VF_INFO: u16 = 1;
@@ -114,6 +122,26 @@ impl FdbEntry {
     pub fn is_unicast(&self) -> bool {
         self.mac[0] & 1 == 0
     }
+}
+
+/// One interface as the kernel describes it. Everything here is in one dump;
+/// the SR-IOV relations are not, and are read from /sys for the handful of
+/// interfaces that have a device behind them at all.
+#[derive(Debug, Default, Clone)]
+pub struct LinkInfo {
+    pub index: u32,
+    pub name: String,
+    pub mac: Option<[u8; 6]>,
+    /// what this interface is enslaved to, by index
+    pub master: Option<u32>,
+    /// for a VLAN interface the device it sits on; for a veth its peer, which
+    /// is why the kind has to be consulted before believing it
+    pub link: Option<u32>,
+    pub kind: Option<String>,
+    pub num_vf: u32,
+    /// the bus device behind this interface, when the kernel names one. Its
+    /// presence answers "is there a device/ directory" without a stat.
+    pub parent_dev: Option<String>,
 }
 
 /// A batch of notifications: forwarding entries that changed, and whether any
@@ -501,6 +529,36 @@ impl Socket {
         }
     }
 
+    /// Every interface on the host, in one dump.
+    ///
+    /// Without RTEXT_FILTER_VF: asking for virtual function details makes the
+    /// driver answer out of its firmware for every interface that has any,
+    /// which was measured at 1.35 ms per physical function. The count comes
+    /// from IFLA_NUM_VF, which is free, and the addresses are asked for
+    /// separately for the two or three interfaces that turn out to matter.
+    pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
+        let len = NLMSG_HDR + IFINFOMSG_LEN;
+        let mut req = Vec::with_capacity(len);
+        put_nlmsghdr(
+            &mut req,
+            len as u32,
+            RTM_GETLINK,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            0, // dump() assigns a fresh sequence number per attempt
+        );
+        req.push(libc::AF_UNSPEC as u8);
+        req.push(0);
+        req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+        req.extend_from_slice(&0i32.to_ne_bytes()); // ifi_index: all of them
+        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+        self.dump(&req, RTM_NEWLINK, "link", |payload, out| {
+            if let Some(l) = parse_link(payload) {
+                out.push(l);
+            }
+        })
+    }
+
     /// Every forwarding database entry on the host, learnt and configured.
     pub fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         let mut req = Vec::with_capacity(NLMSG_HDR + NDMSG_LEN);
@@ -699,6 +757,62 @@ pub struct Message<'a> {
     pub flags: u16,
     pub seq: u32,
     pub payload: &'a [u8],
+}
+
+/// One RTM_NEWLINK body. Everything the topology needs except the SR-IOV
+/// relations, which the kernel does not describe here.
+fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
+    if payload.len() < IFINFOMSG_LEN {
+        return None;
+    }
+    let index = i32::from_ne_bytes(payload[4..8].try_into().ok()?);
+    if index <= 0 {
+        return None;
+    }
+    let mut out = LinkInfo {
+        index: index as u32,
+        ..Default::default()
+    };
+    for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
+        match kind {
+            IFLA_IFNAME => {
+                let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+                out.name = String::from_utf8_lossy(&value[..end]).into_owned();
+            }
+            IFLA_ADDRESS if value.len() == 6 => {
+                out.mac = Some(value.try_into().ok()?);
+            }
+            IFLA_MASTER if value.len() >= 4 => {
+                out.master = Some(u32::from_ne_bytes(value[..4].try_into().ok()?));
+            }
+            IFLA_LINK if value.len() >= 4 => {
+                let i = u32::from_ne_bytes(value[..4].try_into().ok()?);
+                if i != 0 {
+                    out.link = Some(i);
+                }
+            }
+            IFLA_NUM_VF if value.len() >= 4 => {
+                out.num_vf = u32::from_ne_bytes(value[..4].try_into().ok()?);
+            }
+            IFLA_PARENT_DEV_NAME => {
+                let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+                out.parent_dev = Some(String::from_utf8_lossy(&value[..end]).into_owned());
+            }
+            IFLA_LINKINFO => {
+                for (nested, v) in attrs(value) {
+                    if nested == IFLA_INFO_KIND {
+                        let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+                        out.kind = Some(String::from_utf8_lossy(&v[..end]).into_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.name.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Walks the netlink messages in a received buffer. A trailing fragment that

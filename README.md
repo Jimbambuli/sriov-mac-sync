@@ -193,11 +193,19 @@ pairs by hand — in either place — also means the daemon no longer decides on
 its own that a note belongs to no uplink: only autodetection sees every
 uplink, so only autodetection may conclude that.
 
-The question whether reading the topology over netlink would beat the walk
-over `/sys` is settled and the apparatus that answered it is gone: the two
-agreed in every field, and the dump costs what the walk costs, because the
-kernel serialises every interface either way. Measured 24.8.2026, the switch
-would have saved 5 % of the rare pass that reads the topology at all.
+The topology comes from one netlink dump. It used to be a walk over
+`/sys/class/net` — six or more file operations per interface — and an earlier
+measurement said the dump was no faster. That measurement asked the kernel for
+virtual function details along with everything else, which makes the driver
+read its firmware for every interface that has any: 1.35 ms per physical
+function, and it swamped what was being compared. Without that flag the dump
+costs a fraction of the walk: on a 36-interface host the topology phase went
+from 0.80 ms to 0.185 ms, and on a namespace built with 406 interfaces from
+9.3 ms to 2.3 ms. What netlink does not describe — which physical function a
+VF belongs to, which netdevs a PF's VFs have — is still read from `/sys`, for
+the two or three interfaces that have a device behind them at all. A test
+holds the two readings against each other on whatever host it runs on, so
+they cannot drift apart in silence.
 
 The daemon works from notifications. An address is registered as soon as the
 kernel says a bridge learnt it, dropped when the bridge ages it out, and the
@@ -461,9 +469,14 @@ entry, and subscribe to `RTNLGRP_NEIGH` for changes. No shelling out to
 `bridge`, no output parsing, no async runtime — and real error codes, which is
 what makes `EEXIST` and `ENOSPC` distinguishable instead of guessed at.
 
-Topology comes from `/sys/class/net`: `master` chains upward for bonds,
-`lower_*` links downward for stacking, `sriov_numvfs` and `physfn`/`virtfn` for
-the SR-IOV relationships.
+Topology comes from an `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
+the interface kind for stacking (a veth reports a peer there and a tunnel its
+underlay — neither is stacking), `IFLA_NUM_VF` for the virtual function count.
+The SR-IOV relationships the kernel does not put in that dump — `physfn` and
+`virtfn` — come from `/sys/class/net`, for interfaces that have a bus device.
+Interfaces are held by index, the way every kernel message identifies them,
+and the graph carries both directions of each edge so "what sits on top of
+this bridge" is one walk rather than one per interface.
 
 ## Development
 

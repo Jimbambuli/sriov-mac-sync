@@ -77,6 +77,7 @@ pub struct Report {
 /// was the concrete socket, and the concrete socket needs a kernel.
 pub trait FdbWriter {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>>;
+    fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>>;
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>>;
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()>;
 }
@@ -84,6 +85,9 @@ pub trait FdbWriter {
 impl FdbWriter for Socket {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         Socket::dump_fdb(self)
+    }
+    fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
+        Socket::dump_links(self)
     }
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
         Socket::vf_macs_of(self, indices)
@@ -1095,7 +1099,7 @@ impl Syncer {
     /// every address this daemon registered, and some of them belong to
     /// devices that have since stopped being an uplink.
     pub fn flush(&mut self, sock: &mut dyn FdbWriter) -> io::Result<bool> {
-        let topo = Topology::load()?;
+        let topo = Topology::from_links(&sock.dump_links()?);
         let mut clean = true;
         for dev in self.noted_devices() {
             let owned = self.load_owned(&dev);
@@ -1658,6 +1662,11 @@ mod state_tests {
     impl FdbWriter for FakeSock {
         fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
             Ok(self.fdb.clone())
+        }
+        // Only --flush reads the topology through the socket, and the tests
+        // that use this hand it in directly.
+        fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
+            Ok(Vec::new())
         }
         fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
             Ok(self.vf.clone())

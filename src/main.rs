@@ -497,13 +497,23 @@ fn report_changes(
     }
 }
 
+/// The interface picture, from the kernel in one dump.
+fn read_topology(sock: &mut Socket) -> Result<Topology, String> {
+    let links = sock
+        .dump_links()
+        .map_err(|e| format!("cannot ask the kernel about the interfaces: {e}"))?;
+    Ok(Topology::from_links(&links))
+}
+
 fn run() -> Result<bool, String> {
     let mut opts = Options::default();
     load_conf(&mut opts);
     parse_args(&mut opts)?;
 
+    let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
+
     let topo_started = Instant::now();
-    let topo = Topology::load().map_err(|e| format!("cannot read /sys/class/net: {e}"))?;
+    let topo = read_topology(&mut sock)?;
     let topo_load = topo_started.elapsed();
     // Flush and status must not require a pair to exist: the state they
     // inspect - notes and filter entries - outlives the pair on purpose, and
@@ -513,8 +523,6 @@ fn run() -> Result<bool, String> {
         &opts,
         matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status),
     )?;
-
-    let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
     if opts.mode == Mode::Check {
         return Ok(check(&mut sock, &topo, &pairs, opts.dry_run));
@@ -634,14 +642,14 @@ fn run() -> Result<bool, String> {
                     let reloaded = stale || held.is_none();
                     if reloaded {
                         let load_started = Instant::now();
-                        match Topology::load() {
+                        match read_topology(&mut sock) {
                             Ok(t) => {
                                 topo_load = load_started.elapsed();
                                 held = Some(t);
                                 stale = false;
                             }
                             Err(e) => {
-                                eprintln!("warning: cannot read /sys/class/net: {e}");
+                                eprintln!("warning: {e}");
                                 held = None;
                             }
                         }
@@ -751,12 +759,12 @@ fn run() -> Result<bool, String> {
                 // that one have it too. Reading it twice for one event was
                 // the whole of what this used to cost.
                 if stale || held.is_none() {
-                    match Topology::load() {
+                    match read_topology(&mut sock) {
                         Ok(t) => {
                             held = Some(t);
                             stale = false;
                         }
-                        Err(e) => eprintln!("warning: cannot read /sys/class/net: {e}"),
+                        Err(e) => eprintln!("warning: {e}"),
                     }
                 }
                 if let Some(topo) = held.as_ref() {

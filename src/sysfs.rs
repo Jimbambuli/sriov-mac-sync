@@ -10,9 +10,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
 use crate::netlink::parse_mac;
 
 const NET: &str = "/sys/class/net";
+
+/// Interfaces that carry a `lower_<parent>` link in sysfs because they are
+/// stacked on that parent. A veth also reports a peer over netlink, and a
+/// tunnel reports its underlay - neither is stacking, and treating them as
+/// such would send the uplink search off in the wrong direction.
+const STACKED_ON_PARENT: &[&str] = &["vlan", "macvlan", "macvtap", "ipvlan", "vxlan"];
 
 /// One interface, with its relations held as interface indices rather than
 /// names. The kernel identifies interfaces by index in every message the
@@ -56,6 +63,7 @@ pub struct Topology {
 
 /// What an interface's relations look like in /sys before they are resolved:
 /// names, which is all that is there until every interface has been seen.
+#[cfg(test)]
 #[derive(Default)]
 struct Names {
     master: Option<String>,
@@ -64,6 +72,7 @@ struct Names {
     vf_netdevs: Vec<String>,
 }
 
+#[cfg(test)]
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -75,6 +84,15 @@ fn link_target_name(path: impl AsRef<Path>) -> Option<String> {
 }
 
 impl Topology {
+    /// The same picture, walked out of `/sys/class/net`.
+    ///
+    /// Not used in anger any more - `from_links` reads the kernel directly,
+    /// which on a host with hundreds of interfaces is the difference between
+    /// 11.5 ms and one request. It is kept because it is an independent
+    /// second opinion, and a test holds the two to each other on whatever
+    /// host it runs on: two ways of describing the same thing drift apart
+    /// silently otherwise.
+    #[cfg(test)]
     pub fn load() -> std::io::Result<Self> {
         // Relations come out of /sys as names - a symlink's target, a
         // lower_* entry - and are turned into indices once every interface
@@ -191,6 +209,110 @@ impl Topology {
         // building a second one is the difference between one pass over the
         // names and two.
         Ok(Topology::assemble(links, by_name))
+    }
+
+    /// The same picture, from one netlink dump instead of a walk over
+    /// `/sys/class/net`.
+    ///
+    /// The walk is six or more file operations per interface, and on a host
+    /// with hundreds of them that is the whole cost of having a topology at
+    /// all - measured at 11.5 ms of a 11.7 ms load for 406 interfaces. The
+    /// dump is one request. What it does not carry is the SR-IOV relations:
+    /// the physical function behind a VF, and the netdevs of a PF's VFs.
+    /// Those come from /sys, for the interfaces that have a bus device behind
+    /// them and no others - two or three on a normal host.
+    pub fn from_links(links: &[crate::netlink::LinkInfo]) -> Self {
+        // Whether the kernel names bus devices for us at all. It has done
+        // since 5.13; where it does not, the presence of the directory has to
+        // be asked for one interface at a time.
+        let names_parents = links.iter().any(|l| l.parent_dev.is_some());
+
+        let mut by_name: HashMap<String, u32> = HashMap::with_capacity(links.len());
+        for l in links {
+            by_name.insert(l.name.clone(), l.index);
+        }
+        let mut out: Vec<Link> = Vec::with_capacity(links.len());
+        for l in links {
+            let base = Path::new(NET).join(&l.name);
+            let has_device = if names_parents {
+                l.parent_dev.is_some()
+            } else {
+                base.join("device").is_dir()
+            };
+
+            // sysfs carries a lower_<name> link for what an interface is
+            // built on. Two relations produce those: a port's master, seen
+            // from the master's side, and the parent a stacked interface sits
+            // on. A veth's peer and a tunnel's underlay are neither, which is
+            // why the kind has to be consulted before believing IFLA_LINK.
+            let lowers = match (l.kind.as_deref(), l.link) {
+                (Some(k), Some(parent)) if STACKED_ON_PARENT.contains(&k) => vec![parent],
+                _ => Vec::new(),
+            };
+
+            let mut link = Link {
+                name: l.name.clone(),
+                index: l.index,
+                mac: l.mac,
+                master: l.master,
+                lowers,
+                is_bridge: l.kind.as_deref() == Some("bridge"),
+                numvfs: l.num_vf,
+                driver: if has_device {
+                    link_target_name(base.join("device/driver"))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+
+            if has_device {
+                if let Ok(rd) = fs::read_dir(base.join("device/physfn/net")) {
+                    if let Some(e) = rd.flatten().next() {
+                        link.physfn = e.file_name().to_str().and_then(|n| by_name.get(n)).copied();
+                    }
+                }
+                if link.numvfs > 0 {
+                    if let Ok(rd) = fs::read_dir(base.join("device")) {
+                        for e in rd.flatten() {
+                            if !e.file_name().to_string_lossy().starts_with("virtfn") {
+                                continue;
+                            }
+                            if let Ok(nets) = fs::read_dir(e.path().join("net")) {
+                                for n in nets.flatten() {
+                                    if let Some(i) =
+                                        n.file_name().to_str().and_then(|n| by_name.get(n))
+                                    {
+                                        link.vf_netdevs.push(*i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(link);
+        }
+        // A master relation is a lower relation seen from the other side, and
+        // assemble() derives the inverse edges anyway - but `lowers` has to
+        // hold both kinds, because that is what sysfs puts there and what
+        // every walk in here expects.
+        let mut ports: Vec<(u32, u32)> = Vec::new();
+        for l in &out {
+            if let Some(m) = l.master {
+                ports.push((m, l.index));
+            }
+        }
+        let mut at: HashMap<u32, usize> = HashMap::with_capacity(out.len());
+        for (i, l) in out.iter().enumerate() {
+            at.insert(l.index, i);
+        }
+        for (master, port) in ports {
+            if let Some(i) = at.get(&master) {
+                out[*i].lowers.push(port);
+            }
+        }
+        Self::assemble(out, by_name)
     }
 
     /// Build a topology from links whose relations are already indices, and
@@ -732,6 +854,84 @@ mod tests {
         assert!(!leads(&t, "a", "zz"));
         assert_eq!(below(&t, "a").len(), 0);
     }
-}
 
-impl Topology {}
+    /// The netlink reading and the sysfs walk have to agree about this host,
+    /// whatever host that is. They are two descriptions of one thing, and the
+    /// one that is not used every day is the one that would drift.
+    ///
+    /// Skipped where a netlink socket cannot be opened at all - some build
+    /// containers - because there is then nothing to compare against.
+    #[test]
+    fn the_kernel_and_the_filesystem_describe_the_same_host() {
+        let mut sock = match crate::netlink::Socket::new() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipped: no netlink socket here ({e})");
+                return;
+            }
+        };
+        let links = match sock.dump_links() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipped: the kernel would not list interfaces ({e})");
+                return;
+            }
+        };
+        let from_kernel = super::Topology::from_links(&links);
+        let from_sysfs = super::Topology::load().expect("/sys/class/net is readable");
+
+        let mut differences = Vec::new();
+        for (index, a) in &from_kernel.links {
+            // Only what both readings saw: an interface that appeared or went
+            // between them is a race, not a disagreement.
+            let Some(b) = from_sysfs.links.get(index) else {
+                continue;
+            };
+            let mut al = a.lowers.clone();
+            let mut bl = b.lowers.clone();
+            al.sort();
+            bl.sort();
+            let mut av = a.vf_netdevs.clone();
+            let mut bv = b.vf_netdevs.clone();
+            av.sort();
+            bv.sort();
+            for (what, x, y) in [
+                ("name", a.name.clone(), b.name.clone()),
+                ("mac", format!("{:?}", a.mac), format!("{:?}", b.mac)),
+                (
+                    "master",
+                    format!("{:?}", a.master),
+                    format!("{:?}", b.master),
+                ),
+                ("lowers", format!("{al:?}"), format!("{bl:?}")),
+                (
+                    "is_bridge",
+                    a.is_bridge.to_string(),
+                    b.is_bridge.to_string(),
+                ),
+                ("numvfs", a.numvfs.to_string(), b.numvfs.to_string()),
+                (
+                    "driver",
+                    format!("{:?}", a.driver),
+                    format!("{:?}", b.driver),
+                ),
+                (
+                    "physfn",
+                    format!("{:?}", a.physfn),
+                    format!("{:?}", b.physfn),
+                ),
+                ("vf_netdevs", format!("{av:?}"), format!("{bv:?}")),
+            ] {
+                if x != y {
+                    differences.push(format!("{}: {what}: kernel {x}, sysfs {y}", a.name));
+                }
+            }
+        }
+        assert!(
+            differences.is_empty(),
+            "the two readings disagree about {} interface(s) on this host:\n{}",
+            differences.len(),
+            differences.join("\n")
+        );
+    }
+}
