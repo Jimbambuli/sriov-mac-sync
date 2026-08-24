@@ -295,6 +295,18 @@ are the whole test.
 
 ## Limits and things worth knowing
 
+**The first registration after a topology change can wait on the host's own
+tooling.** Writing a filter entry takes the kernel's rtnl lock, and so does
+everything else that manages interfaces. On a Proxmox node, a link change
+prompts the status daemon to re-check the network configuration (`ifquery`),
+and while that - and any other tool whose first act is a full link dump -
+churns through rtnl, a plain fdb add has been measured waiting up to two
+seconds for the lock. The daemon is not the cause and cannot dodge it: the
+write is sent instantly and sits in the kernel until rtnl frees up, and every
+queued address follows in the next pass the moment it does. In steady state -
+no interfaces coming or going - registrations run in well under a millisecond.
+
+
 **The list is finite and its size cannot be queried.** On ConnectX-4 Lx it
 holds 128 entries. Beyond that the driver drops addresses silently, and *which*
 ones is not predictable — with 257 entries a given address still worked, with
