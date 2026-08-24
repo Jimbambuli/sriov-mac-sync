@@ -118,6 +118,16 @@ impl FdbEntry {
 
 /// A batch of notifications: forwarding entries that changed, and whether any
 /// interface changed at all.
+/// How a dump ended. "Did not fit" and "was interrupted" both mean the answer
+/// cannot be used, but they ask different things of the caller: a bigger
+/// buffer, or simply another go.
+enum DumpEnd {
+    Done,
+    Interrupted,
+    /// the datagram's real size, which the buffer has to reach
+    TooBig(usize),
+}
+
 #[derive(Debug, Default)]
 pub struct Events {
     pub fdb: Vec<(u16, FdbEntry)>,
@@ -277,10 +287,13 @@ impl Socket {
 
     /// Runs one dump and hands every message body of type `want` to `sink`.
     ///
-    /// Returns `false` when the answer cannot be trusted - either the kernel
-    /// flagged the dump as interrupted, or a datagram did not fit the buffer.
-    /// Either way the caller should enlarge and try again rather than work
-    /// from half a picture.
+    /// The two ways an answer can fail to be trustworthy need different
+    /// answers from the caller, so they are told apart. A dump the kernel
+    /// flagged as interrupted has to be asked for again; one whose datagram
+    /// did not fit has to be asked for again *into a bigger buffer*, and
+    /// retrying into the same one is how a host large enough to overflow it
+    /// gets six identical failures and an error message about interruptions
+    /// that never happened.
     fn run_dump(
         &self,
         buf: &mut [u8],
@@ -288,11 +301,12 @@ impl Socket {
         seq: u32,
         deadline: Instant,
         sink: &mut impl FnMut(&[u8]),
-    ) -> io::Result<bool> {
+    ) -> io::Result<DumpEnd> {
         loop {
             let n = self.recv_deadline(buf, deadline)?;
             if n > buf.len() {
-                return Ok(false); // did not fit
+                // MSG_TRUNC: n is what the datagram really was.
+                return Ok(DumpEnd::TooBig(n));
             }
             for msg in messages(&buf[..n]) {
                 // An answer to something else, or left over from a dump that
@@ -301,10 +315,10 @@ impl Socket {
                     continue;
                 }
                 if msg.flags & NLM_F_DUMP_INTR != 0 {
-                    return Ok(false); // inconsistent
+                    return Ok(DumpEnd::Interrupted);
                 }
                 match msg.kind {
-                    NLMSG_DONE => return Ok(true),
+                    NLMSG_DONE => return Ok(DumpEnd::Done),
                     NLMSG_ERROR => {
                         // The request asks for no acknowledgement, so an error
                         // message is only ever bad news. One whose code reads
@@ -358,6 +372,15 @@ impl Socket {
                         }
                         return Ok(());
                     }
+                    // The question was asked without NLM_F_DUMP, so there is
+                    // nothing to end - but a kernel is free to end it anyway,
+                    // and a request that names an interface which has just
+                    // gone gets exactly this and no RTM_NEWLINK. Ignoring it
+                    // leaves the caller waiting out the whole five-second
+                    // deadline for an answer that has already been given.
+                    // "Nothing to report" is the answer: sink is not called
+                    // and the caller sees an empty result.
+                    NLMSG_DONE => return Ok(()),
                     NLMSG_NOOP => continue,
                     k if k == want => {
                         sink(msg.payload);
@@ -376,20 +399,46 @@ impl Socket {
     /// collecting into a caller's list would keep the half-read attempt's
     /// entries in front of the real ones. Each retry sends under a fresh
     /// sequence number, so whatever an abandoned attempt left queued cannot
-    /// pass for the new answer. The buffer is one fixed 256 KiB: the kernel
-    /// caps a dump datagram far below that, so growing it never helped -
-    /// the retries only ever defend against NLM_F_DUMP_INTR.
+    /// pass for the new answer.
+    ///
+    /// The buffer starts at 256 KiB, which the kernel's own cap on a dump
+    /// datagram puts out of reach on every host seen so far, and grows to
+    /// whatever a datagram turns out to need. It used to be fixed, on the
+    /// reasoning that the cap made growing pointless - but the cap is the
+    /// kernel's business, not a promise to us, and the failure it left was a
+    /// bad one: the same too-small buffer offered six times over, and then an
+    /// error blaming interruptions that never happened.
     fn dump<T>(
         &mut self,
         request: &[u8],
         want: u16,
         what: &str,
+        parse: impl FnMut(&[u8], &mut Vec<T>),
+    ) -> io::Result<Vec<T>> {
+        // Big enough that growing is the exception on any host anybody has
+        // put this in front of.
+        self.dump_from(256 * 1024, request, want, what, parse)
+    }
+
+    /// `dump`, with the size it starts from spelt out. Only a test passes
+    /// anything but the default: growing is meant to be the rare path, and a
+    /// test that cannot reach it does not test it.
+    fn dump_from<T>(
+        &mut self,
+        start: usize,
+        request: &[u8],
+        want: u16,
+        what: &str,
         mut parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
+        // Capped, so a nonsensical size cannot be turned into an allocation
+        // that ends the process.
+        const CEILING: usize = 64 * 1024 * 1024;
+        const ATTEMPTS: usize = 8;
         let mut req = request.to_vec();
-        let mut buf = vec![0u8; 256 * 1024];
+        let mut buf = vec![0u8; start];
         let mut out = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..ATTEMPTS {
             out.clear();
             self.seq = self.seq.wrapping_add(1);
             req[8..12].copy_from_slice(&self.seq.to_ne_bytes());
@@ -398,8 +447,21 @@ impl Socket {
             match self.run_dump(&mut buf, want, self.seq, deadline, &mut |payload| {
                 parse(payload, &mut out)
             }) {
-                Ok(true) => return Ok(out),
-                Ok(false) => self.drain(),
+                Ok(DumpEnd::Done) => return Ok(out),
+                Ok(DumpEnd::Interrupted) => self.drain(),
+                Ok(DumpEnd::TooBig(need)) => {
+                    self.drain();
+                    if need > CEILING {
+                        return Err(io::Error::other(format!(
+                            "{what} dump wants {need} bytes in one datagram, \
+                             beyond the {CEILING} this is willing to allocate"
+                        )));
+                    }
+                    // Round up rather than take the exact size: the table is
+                    // read because it moves, and the next attempt will not be
+                    // answered with the same number of bytes.
+                    buf.resize(need.next_power_of_two().min(CEILING), 0);
+                }
                 Err(e) => {
                     self.drain();
                     return Err(e);
@@ -407,7 +469,9 @@ impl Socket {
             }
         }
         Err(io::Error::other(format!(
-            "{what} dump kept being interrupted"
+            "{what} dump did not come back whole in {ATTEMPTS} attempts \
+             (buffer now {} bytes)",
+            buf.len()
         )))
     }
 
@@ -812,6 +876,62 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
 mod tests {
     use super::*;
 
+    /// A netlink socket whose kernel is a thread in this test.
+    ///
+    /// A socketpair stands in for the netlink socket: everything the code
+    /// under test sends arrives at the other end, and what that end sends
+    /// arrives back with a zeroed sender address - which is what `recv`
+    /// insists on, a port id of zero, "the kernel". This is the only way to
+    /// reach the paths that only a kernel behaving in a particular way can
+    /// produce: a dump that does not fit, a question answered with nothing.
+    fn kernel_pair() -> (Socket, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+        let ours = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let theirs = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        // The kernel side gives up waiting after half a second. A datagram
+        // socketpair does not tell it when our end closes, so without this
+        // the thread it runs on is never joinable.
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 500_000,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                theirs.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+        (Socket { fd: ours, seq: 1 }, theirs)
+    }
+
+    fn send_raw(fd: &std::os::fd::OwnedFd, bytes: &[u8]) {
+        let n = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+                0,
+            )
+        };
+        assert_eq!(n, bytes.len() as isize, "{}", io::Error::last_os_error());
+    }
+
+    /// Like `msg`, but with a sequence number: everything that answers a
+    /// request has to carry the one the request went out with, or the code
+    /// under test rightly ignores it.
+    fn msg_seq(kind: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = msg(kind, 0, payload);
+        v[8..12].copy_from_slice(&seq.to_ne_bytes());
+        v
+    }
+
     fn msg(kind: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
         let len = NLMSG_HDR + payload.len();
         let mut v = Vec::with_capacity(align4(len));
@@ -994,5 +1114,98 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, NDA_LLADDR);
         assert_eq!(got[0].1, &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A question asked without NLM_F_DUMP has nothing to end, but a kernel
+    /// may end it anyway - an interface that disappears between the asking
+    /// and the answering gets exactly this. It used to fall through to the
+    /// catch-all arm and the caller waited out the whole five-second
+    /// deadline for an answer it had already been given.
+    ///
+    /// Verified by mutation: with the NLMSG_DONE arm removed this takes five
+    /// seconds and fails on the elapsed-time assertion.
+    #[test]
+    fn a_question_ended_by_the_kernel_returns_at_once() {
+        let (mut sock, kernel) = kernel_pair();
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETLINK, NLM_F_REQUEST, 7);
+        send_raw(&kernel, &msg_seq(NLMSG_DONE, 7, &[]));
+
+        let started = Instant::now();
+        let mut answers = 0;
+        sock.request_one(&req, RTM_NEWLINK, &mut |_| answers += 1)
+            .expect("a dump end is an answer, not a failure");
+        assert_eq!(answers, 0, "there was nothing to report");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for an answer that had already arrived",
+            started.elapsed()
+        );
+    }
+
+    /// A dump datagram larger than the buffer has to be asked for again into
+    /// a bigger one. Retrying into the same buffer is what used to happen,
+    /// and it produced six identical failures followed by an error about
+    /// interruptions that had not occurred.
+    ///
+    /// Verified by mutation: with the resize removed the dump fails.
+    #[test]
+    fn a_dump_that_does_not_fit_grows_rather_than_giving_up() {
+        let (mut sock, kernel) = kernel_pair();
+        // The kernel side answers every request that arrives, addressed to
+        // that request's own sequence number - so the retry gets an answer
+        // of its own, after the abandoned attempt has been drained.
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut answered = 0;
+            loop {
+                let n = unsafe {
+                    libc::recv(
+                        kernel.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n < NLMSG_HDR as isize {
+                    return answered;
+                }
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                let mut batch = Vec::new();
+                for i in 0..8 {
+                    batch.extend_from_slice(&msg_seq(
+                        RTM_NEWNEIGH,
+                        seq,
+                        &ndmsg(
+                            i + 1,
+                            0x02, // NUD_REACHABLE
+                            0,
+                            Some([0x02, 0, 0, 0, 0, i as u8]),
+                            Some(5),
+                        ),
+                    ));
+                }
+                send_raw(&kernel, &batch);
+                send_raw(&kernel, &msg_seq(NLMSG_DONE, seq, &[]));
+                answered += 1;
+            }
+        });
+
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETNEIGH, NLM_F_REQUEST, 0);
+        // 64 bytes holds one message and not eight.
+        let got: Vec<usize> = sock
+            .dump_from(64, &req, RTM_NEWNEIGH, "test", |payload, out| {
+                out.push(payload.len())
+            })
+            .expect("the dump has to survive a buffer that starts too small");
+        assert_eq!(got.len(), 8, "every entry has to come back, once");
+
+        drop(sock); // ends the listener's loop
+        let attempts = listener.join().unwrap();
+        assert!(
+            attempts >= 2,
+            "the point of the test is that it took a second, bigger attempt"
+        );
     }
 }
