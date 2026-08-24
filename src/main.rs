@@ -50,6 +50,7 @@ struct Options {
     extra: Vec<String>,
     dry_run: bool,
     verbose: bool,
+    timings: bool,
 }
 
 impl Default for Options {
@@ -63,6 +64,7 @@ impl Default for Options {
             extra: Vec::new(),
             dry_run: false,
             verbose: false,
+            timings: false,
         }
     }
 }
@@ -93,6 +95,8 @@ usage: sriov-mac-sync [options]
                   nothing; it exists to prove the two agree before anything
                   relies on the faster one.
   --dry-run       report changes without applying them
+  --timings       after every pass, say what each phase cost and what it
+                  found, and name anything that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  full reconciliation interval (default 300)
   --max NUM       warn above this many addresses per uplink (default 128)
@@ -182,6 +186,7 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
             "--flush" => opts.mode = Mode::Flush,
             "--compare-topology" => opts.mode = Mode::CompareTopology,
             "--dry-run" => opts.dry_run = true,
+            "--timings" => opts.timings = true,
             "-v" | "--verbose" => opts.verbose = true,
             "--pair" => opts
                 .pairs
@@ -537,6 +542,9 @@ fn run() -> Result<bool, String> {
                 .reconcile(&mut sock, true)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
+            if opts.timings {
+                eprint!("{}", syncer.timings.report());
+            }
             Ok(true)
         }
         Mode::Daemon => {
@@ -596,13 +604,18 @@ fn run() -> Result<bool, String> {
                         }
                     } else {
                         match syncer.reconcile(&mut sock, true) {
-                            Ok(reports) => report_changes(
-                                &reports,
-                                opts.dry_run,
-                                opts.max_macs,
-                                opts.verbose,
-                                trigger,
-                            ),
+                            Ok(reports) => {
+                                report_changes(
+                                    &reports,
+                                    opts.dry_run,
+                                    opts.max_macs,
+                                    opts.verbose,
+                                    trigger,
+                                );
+                                if opts.timings {
+                                    eprint!("pass [{trigger}]\n{}", syncer.timings.report());
+                                }
+                            }
                             // One failed pass is no reason to give up: the next
                             // is seconds away and starts from the kernel's
                             // state again.

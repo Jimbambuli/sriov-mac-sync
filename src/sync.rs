@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::netlink::{format_mac, FdbEntry, Socket};
 use crate::sysfs::Topology;
@@ -43,6 +44,65 @@ pub struct Syncer {
     /// none of them.
     pub authoritative: bool,
     pub state_dir: PathBuf,
+    /// What the most recent pass cost.
+    pub timings: Timings,
+}
+
+/// Where a pass spent its time, and what it found on the way.
+///
+/// Filled in on every pass: it is six clock reads and a handful of counters,
+/// far below the cost of the work being measured. Reported only when asked,
+/// because a daemon that says nothing while nothing changes is the point.
+#[derive(Debug, Default, Clone)]
+pub struct Timings {
+    pub topology: Duration,
+    pub fdb: Duration,
+    pub vf_macs: Duration,
+    pub orphans: Duration,
+    pub pairs: Duration,
+    pub total: Duration,
+    pub links: usize,
+    pub fdb_entries: usize,
+    pub vf_addresses: usize,
+    pub added: usize,
+    pub removed: usize,
+    /// Anything that went wrong without stopping the pass. These are the
+    /// places that used to fail in silence.
+    pub failures: Vec<String>,
+}
+
+impl Timings {
+    /// One line per phase, widest first, so the expensive one is obvious.
+    pub fn report(&self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut out = format!("  pass total {:.2} ms\n", ms(self.total));
+        out += &format!(
+            "    topology  {:7.2} ms  {} links\n",
+            ms(self.topology),
+            self.links
+        );
+        out += &format!(
+            "    fdb dump  {:7.2} ms  {} entries\n",
+            ms(self.fdb),
+            self.fdb_entries
+        );
+        out += &format!(
+            "    vf macs   {:7.2} ms  {} addresses\n",
+            ms(self.vf_macs),
+            self.vf_addresses
+        );
+        out += &format!("    orphans   {:7.2} ms\n", ms(self.orphans));
+        out += &format!(
+            "    pairs     {:7.2} ms  +{} -{}\n",
+            ms(self.pairs),
+            self.added,
+            self.removed
+        );
+        for f in &self.failures {
+            out += &format!("    failure: {f}\n");
+        }
+        out
+    }
 }
 
 impl Syncer {
@@ -54,6 +114,7 @@ impl Syncer {
             dry_run: false,
             authoritative: false,
             state_dir,
+            timings: Timings::default(),
         }
     }
 
@@ -303,18 +364,34 @@ impl Syncer {
     }
 
     pub fn reconcile(&mut self, sock: &mut Socket, apply: bool) -> io::Result<Vec<Report>> {
+        let started = Instant::now();
+        let mut timings = Timings::default();
+
         let topo = Topology::load()?;
+        timings.topology = started.elapsed();
+        timings.links = topo.links.len();
+
+        let mark = Instant::now();
         let fdb = sock.dump_fdb()?;
+        timings.fdb = mark.elapsed();
+        timings.fdb_entries = fdb.len();
         // Not `unwrap_or_default`: an empty list here does not mean "no virtual
         // functions", it means we failed to ask. Carrying on with it would drop
         // the VFs' own addresses out of the exclusions, and registering a VF's
         // address in the uplink's filter tells the switch that the guest
         // holding it lives behind the bridge - which sends its traffic past it.
         // A failed pass is harmless; a pass on incomplete information is not.
+        let mark = Instant::now();
         let vf_macs = sock.dump_vf_macs()?;
-        let mut reports = Vec::new();
-        self.drop_orphans(sock, &topo, apply);
+        timings.vf_macs = mark.elapsed();
+        timings.vf_addresses = vf_macs.len();
 
+        let mut reports = Vec::new();
+        let mark = Instant::now();
+        self.drop_orphans(sock, &topo, apply);
+        timings.orphans = mark.elapsed();
+
+        let mark = Instant::now();
         for pair in self.pairs.clone() {
             let Some(dev_link) = topo.get(&pair.dev) else {
                 continue;
@@ -359,6 +436,11 @@ impl Syncer {
                                 pair.dev,
                                 format_mac(mac)
                             );
+                            timings.failures.push(format!(
+                                "{}: register {}: {e}",
+                                pair.dev,
+                                format_mac(mac)
+                            ));
                             added -= 1;
                         }
                     }
@@ -373,8 +455,28 @@ impl Syncer {
             for mac in stale {
                 removed += 1;
                 if apply && !self.dry_run {
-                    let _ = sock.set_self_fdb(dev_index, &mac, false);
-                    owned.remove(&mac);
+                    // Forgetting the note while the entry is still in the card
+                    // is how a registration turns into an orphan: nothing owns
+                    // it any more, so nothing will ever take it out. Keep the
+                    // note when the removal fails and let the next pass retry.
+                    match sock.set_self_fdb(dev_index, &mac, false) {
+                        Ok(()) => {
+                            owned.remove(&mac);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: {}: cannot unregister {}: {e}",
+                                pair.dev,
+                                format_mac(&mac)
+                            );
+                            timings.failures.push(format!(
+                                "{}: unregister {}: {e}",
+                                pair.dev,
+                                format_mac(&mac)
+                            ));
+                            removed -= 1;
+                        }
+                    }
                 }
             }
 
@@ -398,6 +500,11 @@ impl Syncer {
                 foreign,
             });
         }
+        timings.pairs = mark.elapsed();
+        timings.added = reports.iter().map(|r| r.added).sum();
+        timings.removed = reports.iter().map(|r| r.removed).sum();
+        timings.total = started.elapsed();
+        self.timings = timings;
         Ok(reports)
     }
 
@@ -924,5 +1031,45 @@ mod state_tests {
         s.save_owned("nic1", &set);
         assert!(dir.join("nic1.owned").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn the_timing_report_names_every_phase_and_what_it_found() {
+        let t = Timings {
+            topology: Duration::from_micros(8100),
+            fdb: Duration::from_micros(3200),
+            vf_macs: Duration::from_micros(400),
+            orphans: Duration::from_micros(100),
+            pairs: Duration::from_micros(600),
+            total: Duration::from_micros(12400),
+            links: 37,
+            fdb_entries: 8707,
+            vf_addresses: 4,
+            added: 1,
+            removed: 2,
+            failures: vec!["nic1v0: unregister 02:00:00:00:00:01: no space".into()],
+        };
+        let r = t.report();
+        for phase in ["topology", "fdb dump", "vf macs", "orphans", "pairs"] {
+            assert!(
+                r.contains(phase),
+                "the report hides the {phase} phase:\n{r}"
+            );
+        }
+        assert!(r.contains("37 links"), "link count missing:\n{r}");
+        assert!(r.contains("8707 entries"), "fdb size missing:\n{r}");
+        assert!(r.contains("+1 -2"), "the change count is missing:\n{r}");
+        assert!(
+            r.contains("failure: nic1v0: unregister"),
+            "a failure went unmentioned:\n{r}"
+        );
+    }
+
+    #[test]
+    fn a_pass_without_trouble_reports_no_failures() {
+        let r = Timings::default().report();
+        assert!(
+            !r.contains("failure"),
+            "an untroubled pass claimed a failure:\n{r}"
+        );
     }
 }
