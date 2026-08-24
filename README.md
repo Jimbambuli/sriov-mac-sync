@@ -332,6 +332,17 @@ is what makes restarting it, for an update say, invisible to every guest behind
 the bridge. It says on the way out how many addresses it left in place.
 `--flush` is how you ask for the card to be cleared.
 
+**Under a stream of learning, what it costs depends on whose it is.** A batch
+of notifications that leaves nothing to reconcile - addresses appearing on the
+uplink's own port, entries on bridges unrelated to any uplink - is answered
+and dropped without scheduling a pass, because a pass dumps the host's whole
+forwarding table. Measured on a namespace of 406 interfaces with 4000 fresh
+addresses learnt over 20 seconds: 0.06 s of CPU when the learning is all
+wire-side, 3.1 s when every address is a guest behind the bridge and has to be
+registered. The second figure is real work - 4000 registrations and the passes
+that reconcile them - and it is what a host learning 200 addresses a second
+costs. A host of this project's kind learns a few an hour.
+
 **The list is finite and its size cannot be queried.** On ConnectX-4 Lx it
 holds 128 entries. Beyond that the driver drops addresses silently, and *which*
 ones is not predictable — with 257 entries a given address still worked, with
@@ -477,6 +488,27 @@ The SR-IOV relationships the kernel does not put in that dump — `physfn` and
 Interfaces are held by index, the way every kernel message identifies them,
 and the graph carries both directions of each edge so "what sits on top of
 this bridge" is one walk rather than one per interface.
+
+### Where the cost is not
+
+Four things were tried against the profile above and are recorded here so they
+are not tried again on the strength of how sensible they sound.
+
+*The topology from netlink rather than /sys* - done, and it is the largest
+single win in the daemon's history: 0.80 ms to 0.185 ms on a normal host, 9.3
+to 2.3 on a large one. An earlier attempt measured no difference because it
+asked for the dump with RTEXT_FILTER_VF, which makes every driver with virtual
+functions answer out of its firmware.
+
+*A faster hash* - done, worth 45% of the phase that puts addresses through
+sets, and nothing anywhere else.
+
+*MAC addresses as integers* - not done. It would work on the 0.35 ms of a
+19 ms pass that is not syscall time, and it touches every type in the program.
+
+*Keeping the interface graph and updating it from link events* - not done, and
+now pointless: reading it afresh costs 0.185 ms, and a stale graph is a class
+of silent error that no test would catch.
 
 ### What a pass costs, and where
 
