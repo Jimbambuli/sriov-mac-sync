@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,29 @@ struct FastPair {
     index: u32,
     /// addresses that may not be registered for this uplink
     skip: HashSet<Mac>,
+}
+
+/// A note as it was last read, with what it takes to tell whether the file
+/// is still the same one, unchanged.
+struct Note {
+    macs: HashSet<Mac>,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    /// When this was read. A file written in the same clock tick as the read
+    /// cannot be told from one written before it, so a note whose timestamp
+    /// is not strictly older than the moment we read it is never believed.
+    read_at: (i64, i64),
+}
+
+impl Note {
+    /// Is the file still the one this was read from, untouched since?
+    fn is_still(&self, meta: &fs::Metadata) -> bool {
+        self.ino == meta.ino()
+            && self.len == meta.len()
+            && self.mtime == (meta.mtime(), meta.mtime_nsec())
+            && self.mtime < self.read_at
+    }
 }
 
 pub struct Report {
@@ -99,6 +123,13 @@ pub struct Syncer {
     /// seventeen thousand identical journal lines a day teach an operator
     /// to stop reading warnings.
     warned_extra: HashMap<String, HashSet<Mac>>,
+    /// The notes as they were last read, so reading them again costs a stat
+    /// rather than an open-read-close. The file stays the truth: the copy is
+    /// used only while identity, size and timestamp all say the file has not
+    /// moved since - a --flush from a second process replaces it through
+    /// rename, which changes the inode, and any other writer changes at
+    /// least the timestamp.
+    notes: std::cell::RefCell<HashMap<String, Note>>,
     /// Which addresses the last pass saw out on the wire, per uplink. The
     /// fast path has no forwarding dump to work this out from, and an address
     /// that lives on the wire in one VLAN and behind the bridge in another
@@ -202,6 +233,7 @@ impl Syncer {
             carried_vf: None,
             carried_wire: HashMap::new(),
             warned_extra: HashMap::new(),
+            notes: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -212,12 +244,60 @@ impl Syncer {
     /// What this daemon put there itself. Kept on disk so a restart does not
     /// have to choose between forgetting its entries and claiming everybody
     /// else's.
-    /// Read afresh every time rather than from a copy in memory. `--once` and
-    /// `--flush` write these same files while the daemon runs, and a daemon
-    /// working from a remembered copy would carry on believing it owns
-    /// entries that somebody has since taken from it - and never clean them
-    /// up again.
+    ///
+    /// The file is the truth, and it has to be: `--once` and `--flush` write
+    /// these same files while the daemon runs, and a daemon working from a
+    /// remembered copy would carry on believing it owns entries somebody has
+    /// since taken from it - and never clean them up again. That was a real
+    /// bug once and is not being reintroduced.
+    ///
+    /// What is remembered is the file's identity - inode, size, timestamp -
+    /// so *checking* the copy costs one stat instead of an open, a read and a
+    /// close. Any writer changes at least one of the three: this daemon and
+    /// --flush both replace the file through rename, which changes the inode.
+    /// A note whose timestamp is not strictly older than the moment it was
+    /// read is never believed either, since a write in the same clock tick as
+    /// the read cannot be told from one before it.
     fn load_owned(&self, dev: &str) -> HashSet<Mac> {
+        let path = self.state_path(dev);
+        if let Ok(meta) = fs::metadata(&path) {
+            if let Some(note) = self.notes.borrow().get(dev) {
+                if note.is_still(&meta) {
+                    return note.macs.clone();
+                }
+            }
+        }
+        let set = self.read_owned(dev);
+        self.remember(dev, &set);
+        set
+    }
+
+    /// Note what was just read or written, together with what the file looks
+    /// like now, so the next read can be a stat.
+    fn remember(&self, dev: &str, set: &HashSet<Mac>) {
+        let Ok(meta) = fs::metadata(self.state_path(dev)) else {
+            // No file: nothing to recognise later. Forget any older copy
+            // rather than keep one that describes a file that is gone.
+            self.notes.borrow_mut().remove(dev);
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos() as i64))
+            .unwrap_or((0, 0));
+        self.notes.borrow_mut().insert(
+            dev.to_string(),
+            Note {
+                macs: set.clone(),
+                ino: meta.ino(),
+                len: meta.len(),
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                read_at: now,
+            },
+        );
+    }
+
+    fn read_owned(&self, dev: &str) -> HashSet<Mac> {
         let mut set = HashSet::new();
         match fs::read_to_string(self.state_path(dev)) {
             Ok(text) => {
@@ -251,14 +331,17 @@ impl Syncer {
         if self.dry_run {
             return;
         }
+        // Most passes change nothing, and rewriting the note every time would
+        // be pointless work on a host that is simply idle. The remembered
+        // copy answers this without reading the file - and when it cannot be
+        // believed, load_owned reads it and the comparison is against what is
+        // really there either way.
+        if self.load_owned(dev) == *set {
+            return;
+        }
         let mut lines: Vec<String> = set.iter().map(format_mac).collect();
         lines.sort();
         let text = lines.join("\n") + "\n";
-        // Most passes change nothing, and rewriting the note every time would
-        // be pointless work on a host that is simply idle.
-        if fs::read_to_string(self.state_path(dev)).ok().as_deref() == Some(text.as_str()) {
-            return;
-        }
         // A note that cannot be written strands every entry it should have
         // named: the next pass reads nothing and counts them as foreign,
         // forever. That must not happen in silence.
@@ -276,11 +359,17 @@ impl Syncer {
                 e
             })
         };
-        if let Err(e) = write() {
-            eprintln!(
-                "warning: cannot write the ownership note for {dev}: {e} - \
-                 what was just registered has no owner on record"
-            );
+        match write() {
+            Ok(()) => self.remember(dev, set),
+            Err(e) => {
+                // The file and the copy have to agree, and neither is now
+                // known to hold what was asked for.
+                self.notes.borrow_mut().remove(dev);
+                eprintln!(
+                    "warning: cannot write the ownership note for {dev}: {e} - \
+                     what was just registered has no owner on record"
+                );
+            }
         }
     }
 
@@ -2088,6 +2177,67 @@ mod state_tests {
         assert!(
             s.load_owned("nic1").contains(&BEHIND_NIC),
             "the note stays until a full dump says otherwise"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The remembered copy is a way to skip *reading* the file, never a way
+    /// to skip believing it. A second process replacing the note through
+    /// rename - which is what --flush and --once do - has to be seen.
+    ///
+    /// Verified by mutation: with `is_still` always true, this reads the old
+    /// contents and fails.
+    #[test]
+    fn a_note_replaced_by_another_process_is_read_again() {
+        let dir = scratch("note-replaced");
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+        assert_eq!(s.load_owned("nic1"), HashSet::from([BEHIND_NIC]));
+
+        // What another process's save_owned leaves: a different file in the
+        // same place, same length, written through rename.
+        let other = dir.join("other");
+        fs::write(&other, format!("{}\n", format_mac(&BEHIND_GUEST))).unwrap();
+        fs::rename(&other, dir.join("nic1.owned")).unwrap();
+
+        assert_eq!(
+            s.load_owned("nic1"),
+            HashSet::from([BEHIND_GUEST]),
+            "the file is the truth; the copy only saves reading it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A note written in the same instant it was read cannot be told from one
+    /// written before it, and believing the copy then would mean believing
+    /// something that was already out of date when it was made. The rule is
+    /// that the timestamp has to be strictly older than the read.
+    ///
+    /// Verified by mutation: without the `mtime < read_at` condition this
+    /// returns the stale set and fails.
+    #[test]
+    fn a_note_not_older_than_its_reading_is_never_believed() {
+        let dir = scratch("note-instant");
+        let path = dir.join("nic1.owned");
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+
+        // A timestamp in the future stands in for "the same instant": both
+        // are timestamps that are not older than the moment of reading, and
+        // the file can be changed afterwards without the timestamp moving.
+        let ahead = 4_000_000_000; // 2096
+        set_mtime(&path, ahead);
+        assert_eq!(s.load_owned("nic1"), HashSet::from([BEHIND_NIC]));
+
+        // Changed underneath, with identity, length and timestamp all left
+        // looking exactly as they did.
+        fs::write(&path, format!("{}\n", format_mac(&BEHIND_GUEST))).unwrap();
+        set_mtime(&path, ahead);
+
+        assert_eq!(
+            s.load_owned("nic1"),
+            HashSet::from([BEHIND_GUEST]),
+            "a note whose timestamp is not older than the read has to be read"
         );
         let _ = fs::remove_dir_all(&dir);
     }
