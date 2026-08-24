@@ -6,7 +6,7 @@
 //! guessing from them is how a tool like this breaks on somebody else's
 //! machine.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{Map, Set};
 use std::fs;
 use std::path::Path;
 
@@ -55,10 +55,10 @@ pub struct Link {
 
 #[derive(Debug, Default)]
 pub struct Topology {
-    pub links: HashMap<u32, Link>,
+    pub links: Map<u32, Link>,
     /// Indices by name, for the few places that start from one: a --pair on
     /// the command line, a bridge named in the configuration.
-    by_name: HashMap<String, u32>,
+    by_name: Map<String, u32>,
 }
 
 /// What an interface's relations look like in /sys before they are resolved:
@@ -192,7 +192,7 @@ impl Topology {
             named.push((link, names));
         }
 
-        let by_name: HashMap<String, u32> = named
+        let by_name: Map<String, u32> = named
             .iter()
             .map(|(l, _)| (l.name.clone(), l.index))
             .collect();
@@ -227,7 +227,8 @@ impl Topology {
         // be asked for one interface at a time.
         let names_parents = links.iter().any(|l| l.parent_dev.is_some());
 
-        let mut by_name: HashMap<String, u32> = HashMap::with_capacity(links.len());
+        let mut by_name: Map<String, u32> =
+            Map::with_capacity_and_hasher(links.len(), Default::default());
         for l in links {
             by_name.insert(l.name.clone(), l.index);
         }
@@ -303,7 +304,7 @@ impl Topology {
                 ports.push((m, l.index));
             }
         }
-        let mut at: HashMap<u32, usize> = HashMap::with_capacity(out.len());
+        let mut at: Map<u32, usize> = Map::with_capacity_and_hasher(out.len(), Default::default());
         for (i, l) in out.iter().enumerate() {
             at.insert(l.index, i);
         }
@@ -319,7 +320,7 @@ impl Topology {
     /// work out the inverse relations. Both the reading of /sys and the test
     /// fixtures come through here, so neither can end up with a view of the
     /// host the other does not have.
-    pub(crate) fn assemble(links: Vec<Link>, by_name: HashMap<String, u32>) -> Self {
+    pub(crate) fn assemble(links: Vec<Link>, by_name: Map<String, u32>) -> Self {
         // Collected while the links are still a list: reading them out of the
         // map afterwards is a second walk over every one of them, and on a
         // host with hundreds of interfaces that showed up in the measurement.
@@ -332,7 +333,8 @@ impl Topology {
                 edges.push((m, l.index, false));
             }
         }
-        let mut map: HashMap<u32, Link> = HashMap::with_capacity(links.len());
+        let mut map: Map<u32, Link> =
+            Map::with_capacity_and_hasher(links.len(), Default::default());
         for l in links {
             map.insert(l.index, l);
         }
@@ -354,8 +356,8 @@ impl Topology {
     /// Everything stacked on top of `root`, `root` itself included: VLAN
     /// interfaces over a bridge, bridges over those, and so on. One walk up
     /// the inverse of the `lowers` edges.
-    pub fn stacked_above(&self, root: u32) -> HashSet<u32> {
-        let mut seen: HashSet<u32> = HashSet::new();
+    pub fn stacked_above(&self, root: u32) -> Set<u32> {
+        let mut seen: Set<u32> = crate::hash::set();
         let mut stack: Vec<u32> = vec![root];
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
@@ -404,7 +406,7 @@ impl Topology {
         if dev == target {
             return true;
         }
-        let mut seen: HashSet<u32> = HashSet::new();
+        let mut seen: Set<u32> = crate::hash::set();
         let mut stack: Vec<u32> = vec![dev];
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
@@ -425,8 +427,8 @@ impl Topology {
     /// other way up. One walk down from the bridge answers for every
     /// interface at once, where asking each interface whether it leads to the
     /// bridge walks the same edges once per interface.
-    pub fn subtree_of(&self, roots: &[u32]) -> HashSet<u32> {
-        let mut seen: HashSet<u32> = HashSet::new();
+    pub fn subtree_of(&self, roots: &[u32]) -> Set<u32> {
+        let mut seen: Set<u32> = crate::hash::set();
         let mut stack: Vec<u32> = roots.to_vec();
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
@@ -445,7 +447,7 @@ impl Topology {
         // A seen-set, like every other walk here: a hop budget also stops a
         // cycle, but it silently gives up on a legitimate stack that is
         // merely deep.
-        let mut seen = HashSet::new();
+        let mut seen = crate::hash::set();
         let mut cur = dev;
         loop {
             if !seen.insert(cur) {
@@ -549,7 +551,7 @@ impl Topology {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::{Link, Topology};
-    use std::collections::HashMap;
+    use crate::hash::Map;
 
     pub fn mac(last: u8) -> [u8; 6] {
         [0x00, 0x11, 0x22, 0x33, 0x44, last]
@@ -623,7 +625,7 @@ pub(crate) mod fixture {
         }
 
         pub fn build(self) -> Topology {
-            let by_name: HashMap<String, u32> = self
+            let by_name: Map<String, u32> = self
                 .links
                 .iter()
                 .map(|l| (l.name.clone(), l.index))

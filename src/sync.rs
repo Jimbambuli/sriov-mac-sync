@@ -1,7 +1,7 @@
 //! Deciding which addresses belong in an uplink's unicast filter, and putting
 //! them there.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{Map, Set};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -30,13 +30,13 @@ struct FastPair {
     /// the uplink's own interface index, which the filter is written to
     index: u32,
     /// addresses that may not be registered for this uplink
-    skip: HashSet<Mac>,
+    skip: Set<Mac>,
 }
 
 /// A note as it was last read, with what it takes to tell whether the file
 /// is still the same one, unchanged.
 struct Note {
-    macs: HashSet<Mac>,
+    macs: Set<Mac>,
     ino: u64,
     len: u64,
     mtime: (i64, i64),
@@ -103,9 +103,9 @@ type CarriedVf = (Vec<u32>, Vec<(u32, Mac)>);
 
 pub struct Syncer {
     pub pairs: Vec<Pair>,
-    pub exclude: HashSet<Mac>,
+    pub exclude: Set<Mac>,
     /// addresses to register whether or not a bridge has learnt them
-    pub extra: HashSet<Mac>,
+    pub extra: Set<Mac>,
     pub dry_run: bool,
     /// Whether the pair list is the whole picture. It is when autodetection
     /// drew it, and it is not when somebody named pairs by hand - and only
@@ -127,19 +127,19 @@ pub struct Syncer {
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
     /// to stop reading warnings.
-    warned_extra: HashMap<String, HashSet<Mac>>,
+    warned_extra: Map<String, Set<Mac>>,
     /// The notes as they were last read, so reading them again costs a stat
     /// rather than an open-read-close. The file stays the truth: the copy is
     /// used only while identity, size and timestamp all say the file has not
     /// moved since - a --flush from a second process replaces it through
     /// rename, which changes the inode, and any other writer changes at
     /// least the timestamp.
-    notes: std::cell::RefCell<HashMap<String, Note>>,
+    notes: std::cell::RefCell<Map<String, Note>>,
     /// Which addresses the last pass saw out on the wire, per uplink. The
     /// fast path has no forwarding dump to work this out from, and an address
     /// that lives on the wire in one VLAN and behind the bridge in another
     /// must not flap in and out of the filter on every learning event.
-    carried_wire: HashMap<String, HashSet<Mac>>,
+    carried_wire: Map<String, Set<Mac>>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -227,16 +227,16 @@ impl Syncer {
     pub fn new(pairs: Vec<Pair>, state_dir: PathBuf) -> Self {
         Syncer {
             pairs,
-            exclude: HashSet::new(),
-            extra: HashSet::new(),
+            exclude: crate::hash::set(),
+            extra: crate::hash::set(),
             dry_run: false,
             authoritative: false,
             state_dir,
             timings: Timings::default(),
             carried_vf: None,
-            carried_wire: HashMap::new(),
-            warned_extra: HashMap::new(),
-            notes: std::cell::RefCell::new(HashMap::new()),
+            carried_wire: crate::hash::map(),
+            warned_extra: crate::hash::map(),
+            notes: std::cell::RefCell::new(crate::hash::map()),
         }
     }
 
@@ -261,7 +261,7 @@ impl Syncer {
     /// A note whose timestamp is not strictly older than the moment it was
     /// read is never believed either, since a write in the same clock tick as
     /// the read cannot be told from one before it.
-    fn load_owned(&self, dev: &str) -> HashSet<Mac> {
+    fn load_owned(&self, dev: &str) -> Set<Mac> {
         let path = self.state_path(dev);
         if let Ok(meta) = fs::metadata(&path) {
             if let Some(note) = self.notes.borrow().get(dev) {
@@ -277,7 +277,7 @@ impl Syncer {
 
     /// Note what was just read or written, together with what the file looks
     /// like now, so the next read can be a stat.
-    fn remember(&self, dev: &str, set: &HashSet<Mac>) {
+    fn remember(&self, dev: &str, set: &Set<Mac>) {
         let Ok(meta) = fs::metadata(self.state_path(dev)) else {
             // No file: nothing to recognise later. Forget any older copy
             // rather than keep one that describes a file that is gone.
@@ -300,8 +300,8 @@ impl Syncer {
         );
     }
 
-    fn read_owned(&self, dev: &str) -> HashSet<Mac> {
-        let mut set = HashSet::new();
+    fn read_owned(&self, dev: &str) -> Set<Mac> {
+        let mut set = crate::hash::set();
         match fs::read_to_string(self.state_path(dev)) {
             Ok(text) => {
                 for line in text.lines() {
@@ -330,7 +330,7 @@ impl Syncer {
         set
     }
 
-    fn save_owned(&self, dev: &str, set: &HashSet<Mac>) {
+    fn save_owned(&self, dev: &str, set: &Set<Mac>) {
         if self.dry_run {
             return;
         }
@@ -411,7 +411,7 @@ impl Syncer {
         if !self.authoritative {
             return Vec::new();
         }
-        let live: HashSet<&str> = self.pairs.iter().map(|p| p.dev.as_str()).collect();
+        let live: Set<&str> = self.pairs.iter().map(|p| p.dev.as_str()).collect();
         self.noted_devices()
             .into_iter()
             .filter(|d| !live.contains(d.as_str()))
@@ -441,7 +441,7 @@ impl Syncer {
                 // that was merely renamed keeps its entries under the new
                 // name, but a note under the old name could never reach them
                 // anyway.)
-                None => (owned.len(), HashSet::new()),
+                None => (owned.len(), crate::hash::set()),
             };
             if kept.is_empty() {
                 eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
@@ -467,10 +467,10 @@ impl Syncer {
         sock: &mut dyn FdbWriter,
         dev: &str,
         ifindex: u32,
-        owned: &HashSet<Mac>,
-    ) -> (usize, HashSet<Mac>) {
+        owned: &Set<Mac>,
+    ) -> (usize, Set<Mac>) {
         let mut gone = 0usize;
-        let mut kept = HashSet::new();
+        let mut kept = crate::hash::set();
         for mac in owned {
             match sock.set_self_fdb(ifindex, mac, false) {
                 Ok(()) => gone += 1,
@@ -496,14 +496,8 @@ impl Syncer {
     /// path once carried its own abbreviation of this list - it had none of
     /// it - and registered a guest VF's own address, which tells the eSwitch
     /// the guest lives behind the bridge and sends its traffic past it.
-    fn exclusions(
-        &self,
-        topo: &Topology,
-        dev: u32,
-        port: u32,
-        vf_macs: &[(u32, Mac)],
-    ) -> HashSet<Mac> {
-        let mut skip: HashSet<Mac> = HashSet::new();
+    fn exclusions(&self, topo: &Topology, dev: u32, port: u32, vf_macs: &[(u32, Mac)]) -> Set<Mac> {
+        let mut skip: Set<Mac> = crate::hash::set();
         skip.extend(self.exclude.iter().copied());
         skip.extend(topo.subtree_macs(port));
         if let Some(l) = topo.at(dev) {
@@ -540,9 +534,9 @@ impl Syncer {
         port: u32,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
-    ) -> (HashSet<Mac>, Vec<String>, HashSet<Mac>) {
+    ) -> (Set<Mac>, Vec<String>, Set<Mac>) {
         let Some(bridge_link) = topo.at(bridge) else {
-            return (HashSet::new(), Vec::new(), HashSet::new());
+            return (crate::hash::set(), Vec::new(), crate::hash::set());
         };
         let port_index = port;
 
@@ -552,13 +546,13 @@ impl Syncer {
         // interface. A busy host has thousands of forwarding entries and a
         // few dozen interfaces, and asking the same structural question over
         // and over is what made this daemon show up in `top` at all.
-        let uplink_ward: HashSet<u32> = topo.stacked_above(bridge);
+        let uplink_ward: Set<u32> = topo.stacked_above(bridge);
 
         // Bridges stacked on the uplink bridge. Their tables hold the guests
         // whose addresses the lower bridge never learns: that traffic enters it
         // from the bridge's own local port, and a bridge does not learn from
         // itself.
-        let mut relevant: HashMap<u32, String> = HashMap::new();
+        let mut relevant: Map<u32, String> = crate::hash::map();
         for b in topo.bridges() {
             if b.index == bridge {
                 continue;
@@ -568,8 +562,8 @@ impl Syncer {
             }
         }
 
-        let mut wire: HashSet<Mac> = HashSet::new();
-        let mut want: HashSet<Mac> = HashSet::new();
+        let mut wire: Set<Mac> = crate::hash::set();
+        let mut want: Set<Mac> = crate::hash::set();
 
         for e in fdb {
             if !e.is_learned() || !e.is_unicast() {
@@ -608,7 +602,7 @@ impl Syncer {
 
         // Everything the host owns on this side of the uplink, plus what the
         // wire already carries.
-        let mut skip: HashSet<Mac> = self.exclusions(topo, dev, port, vf_macs);
+        let mut skip: Set<Mac> = self.exclusions(topo, dev, port, vf_macs);
         skip.extend(wire.iter().copied());
 
         // Addresses pinned by configuration are registered even when nothing
@@ -732,7 +726,7 @@ impl Syncer {
                 self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
 
             // Pinned addresses that did not make it, said once per change.
-            let unpinned: HashSet<Mac> = self
+            let unpinned: Set<Mac> = self
                 .extra
                 .iter()
                 .filter(|m| !want.contains(*m))
@@ -753,7 +747,7 @@ impl Syncer {
 
             self.carried_wire.insert(pair.dev.clone(), wire);
 
-            let present: HashSet<Mac> = fdb
+            let present: Set<Mac> = fdb
                 .iter()
                 .filter(|e| e.is_self() && e.ifindex == dev_index && e.is_unicast())
                 .map(|e| e.mac)
@@ -961,7 +955,7 @@ impl Syncer {
         // Read before anything is registered, because within one batch the
         // wire has the last word - the same reason the full pass subtracts
         // its wire set from what it wants.
-        let mut reflected: HashMap<String, HashSet<Mac>> = HashMap::new();
+        let mut reflected: Map<String, Set<Mac>> = crate::hash::map();
         for (kind, e) in events {
             if *kind != crate::netlink::RTM_NEWNEIGH || !e.is_learned() || !e.is_unicast() {
                 continue;
@@ -1021,7 +1015,7 @@ impl Syncer {
                 .extend(macs.iter().copied());
         }
 
-        let mut touched: HashMap<String, HashSet<Mac>> = HashMap::new();
+        let mut touched: Map<String, Set<Mac>> = crate::hash::map();
         for (kind, entry) in events {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
@@ -1040,7 +1034,7 @@ impl Syncer {
         topo: &Topology,
         entry: &FdbEntry,
         pairs: &[FastPair],
-        touched: &mut HashMap<String, HashSet<Mac>>,
+        touched: &mut Map<String, Set<Mac>>,
     ) {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
             return;
@@ -1109,7 +1103,7 @@ impl Syncer {
             }
             let (gone, kept) = match topo.get(&dev) {
                 Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
-                None => (owned.len(), HashSet::new()),
+                None => (owned.len(), crate::hash::set()),
             };
             if kept.is_empty() {
                 let _ = fs::remove_file(self.state_path(&dev));
@@ -1216,7 +1210,7 @@ pub(crate) mod tests {
         port: &str,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
-    ) -> (HashSet<Mac>, Vec<String>, HashSet<Mac>) {
+    ) -> (Set<Mac>, Vec<String>, Set<Mac>) {
         let dev = topo
             .index_of(&pair.dev)
             .expect("fixture has no such device");
@@ -1432,7 +1426,7 @@ mod state_tests {
     #[test]
     fn ownership_survives_a_restart() {
         let dir = scratch("restart");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
         set.insert(BEHIND_GUEST);
 
@@ -1467,7 +1461,7 @@ mod state_tests {
     #[test]
     fn a_device_that_stopped_being_an_uplink_is_noticed() {
         let dir = scratch("orphan");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
 
         let mut s = Syncer::new(
@@ -1499,7 +1493,7 @@ mod state_tests {
     #[test]
     fn named_pairs_do_not_get_to_declare_anything_an_orphan() {
         let dir = scratch("no-authority");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
 
         // `--once --pair nic0:vmbr0` next to a running daemon that also looks
@@ -1522,7 +1516,7 @@ mod state_tests {
     #[test]
     fn a_note_changed_behind_our_back_is_put_right() {
         let dir = scratch("stale-note");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
 
         let s = Syncer::new(Vec::new(), dir.clone());
@@ -1546,7 +1540,7 @@ mod state_tests {
     #[test]
     fn an_unchanged_set_is_not_written_again() {
         let dir = scratch("idle");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
 
         let s = Syncer::new(Vec::new(), dir.clone());
@@ -1571,7 +1565,7 @@ mod state_tests {
     #[test]
     fn a_vanished_note_is_recreated() {
         let dir = scratch("vanish");
-        let mut set = HashSet::new();
+        let mut set = crate::hash::set();
         set.insert(BEHIND_NIC);
         let s = Syncer::new(Vec::new(), dir.clone());
         s.save_owned("nic1", &set);
@@ -1654,9 +1648,9 @@ mod state_tests {
         added: Vec<(u32, Mac)>,
         removed: Vec<(u32, Mac)>,
         /// raw OS error to answer an add of this address with
-        fail_add: HashMap<Mac, i32>,
+        fail_add: Map<Mac, i32>,
         /// raw OS error to answer a removal of this address with
-        fail_del: HashMap<Mac, i32>,
+        fail_del: Map<Mac, i32>,
     }
 
     impl FdbWriter for FakeSock {
@@ -1707,7 +1701,7 @@ mod state_tests {
             .reconcile(&mut sock, true, &topo, Dur::ZERO, true)
             .unwrap();
 
-        let registered: HashSet<Mac> = sock.added.iter().map(|(_, m)| *m).collect();
+        let registered: Set<Mac> = sock.added.iter().map(|(_, m)| *m).collect();
         let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
         assert_eq!(
             registered, want,
@@ -1765,7 +1759,9 @@ mod state_tests {
         let mut sock = FakeSock {
             fdb: fdb(),
             vf: vec![(2, VF_ADMIN)],
-            fail_add: HashMap::from([(BEHIND_GUEST, libc::EEXIST)]),
+            fail_add: [(BEHIND_GUEST, libc::EEXIST)]
+                .into_iter()
+                .collect::<Map<_, _>>(),
             ..Default::default()
         };
         let mut s = ready_syncer(&dir);
@@ -1786,11 +1782,16 @@ mod state_tests {
         // Two addresses on record that the bridge no longer knows.
         let gone_mac = mac(0x51);
         let stuck_mac = mac(0x52);
-        s.save_owned("nic1", &HashSet::from([gone_mac, stuck_mac]));
+        s.save_owned(
+            "nic1",
+            &[gone_mac, stuck_mac].into_iter().collect::<Set<_>>(),
+        );
         let mut sock = FakeSock {
             fdb: fdb(),
             vf: vec![(2, VF_ADMIN)],
-            fail_del: HashMap::from([(gone_mac, libc::ENOENT), (stuck_mac, libc::EPERM)]),
+            fail_del: [(gone_mac, libc::ENOENT), (stuck_mac, libc::EPERM)]
+                .into_iter()
+                .collect::<Map<_, _>>(),
             ..Default::default()
         };
         s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
@@ -1813,8 +1814,8 @@ mod state_tests {
         let dir = scratch("dryrun");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.save_owned("nic1", &HashSet::from([mac(0x61)]));
-        s.save_owned("gone0", &HashSet::from([mac(0x62)])); // an orphan
+        s.save_owned("nic1", &[mac(0x61)].into_iter().collect::<Set<_>>());
+        s.save_owned("gone0", &[mac(0x62)].into_iter().collect::<Set<_>>()); // an orphan
         let before: Vec<(String, String)> = {
             let mut v: Vec<_> = fs::read_dir(&dir)
                 .unwrap()
@@ -1877,7 +1878,7 @@ mod state_tests {
         let topo = host(mac(1));
         let mut s = Syncer::new(Vec::new(), dir.clone());
         s.authoritative = true;
-        s.save_owned("nic1", &HashSet::from([mac(0x71)]));
+        s.save_owned("nic1", &[mac(0x71)].into_iter().collect::<Set<_>>());
         let mut sock = FakeSock::default();
         s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
             .unwrap();
@@ -1933,8 +1934,8 @@ mod state_tests {
         let dir = scratch("readonly");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.save_owned("nic1", &HashSet::from([mac(0x81)]));
-        s.save_owned("gone0", &HashSet::from([mac(0x82)])); // an orphan
+        s.save_owned("nic1", &[mac(0x81)].into_iter().collect::<Set<_>>());
+        s.save_owned("gone0", &[mac(0x82)].into_iter().collect::<Set<_>>()); // an orphan
         let snapshot = |d: &std::path::Path| -> Vec<(String, Vec<u8>)> {
             let mut v: Vec<_> = fs::read_dir(d)
                 .unwrap()
@@ -2085,7 +2086,7 @@ mod state_tests {
         let mut s = ready_syncer(&dir);
         s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
         // It was behind the bridge a moment ago, registered and noted.
-        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
 
         let mut sock = FakeSock::default();
         // nic1 is the uplink and its own port in this fixture: index 2.
@@ -2177,7 +2178,7 @@ mod state_tests {
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
         s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
-        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
 
         let mut sock = FakeSock::default();
         s.fast_apply(
@@ -2209,8 +2210,11 @@ mod state_tests {
     fn a_note_replaced_by_another_process_is_read_again() {
         let dir = scratch("note-replaced");
         let s = Syncer::new(Vec::new(), dir.clone());
-        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
-        assert_eq!(s.load_owned("nic1"), HashSet::from([BEHIND_NIC]));
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
+        assert_eq!(
+            s.load_owned("nic1"),
+            [BEHIND_NIC].into_iter().collect::<Set<_>>()
+        );
 
         // What another process's save_owned leaves: a different file in the
         // same place, same length, written through rename.
@@ -2220,7 +2224,7 @@ mod state_tests {
 
         assert_eq!(
             s.load_owned("nic1"),
-            HashSet::from([BEHIND_GUEST]),
+            [BEHIND_GUEST].into_iter().collect::<Set<_>>(),
             "the file is the truth; the copy only saves reading it"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2238,14 +2242,17 @@ mod state_tests {
         let dir = scratch("note-instant");
         let path = dir.join("nic1.owned");
         let s = Syncer::new(Vec::new(), dir.clone());
-        s.save_owned("nic1", &HashSet::from([BEHIND_NIC]));
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
 
         // A timestamp in the future stands in for "the same instant": both
         // are timestamps that are not older than the moment of reading, and
         // the file can be changed afterwards without the timestamp moving.
         let ahead = 4_000_000_000; // 2096
         set_mtime(&path, ahead);
-        assert_eq!(s.load_owned("nic1"), HashSet::from([BEHIND_NIC]));
+        assert_eq!(
+            s.load_owned("nic1"),
+            [BEHIND_NIC].into_iter().collect::<Set<_>>()
+        );
 
         // Changed underneath, with identity, length and timestamp all left
         // looking exactly as they did.
@@ -2254,7 +2261,7 @@ mod state_tests {
 
         assert_eq!(
             s.load_owned("nic1"),
-            HashSet::from([BEHIND_GUEST]),
+            [BEHIND_GUEST].into_iter().collect::<Set<_>>(),
             "a note whose timestamp is not older than the read has to be read"
         );
         let _ = fs::remove_dir_all(&dir);

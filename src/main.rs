@@ -14,11 +14,12 @@
 //! hit and delivers to the uplink, where the bridge takes over. This daemon
 //! keeps that list in step with what the bridges learn.
 
+mod hash;
 mod netlink;
 mod sync;
 mod sysfs;
 
-use std::collections::HashSet;
+use crate::hash::Set;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,8 +156,8 @@ MAX_MACS, EXCLUDE and EXTRA.
 /// used to vanish without a word - and an address that was meant to be pinned
 /// and silently was not is exactly the kind of thing somebody spends an
 /// evening looking for in the wrong place.
-fn macs(what: &str, given: &[String]) -> HashSet<[u8; 6]> {
-    let mut out = HashSet::new();
+fn macs(what: &str, given: &[String]) -> Set<[u8; 6]> {
+    let mut out = crate::hash::set();
     for s in given {
         match parse_mac(s) {
             Some(m) => {
