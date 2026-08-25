@@ -38,15 +38,40 @@ switchdev mode to switch to, and the ConnectX-4 Lx refuses the switch. See
 
 ## Quickstart
 
-The released binary is statically linked and needs nothing on the target:
+Everything below is statically linked and depends on nothing at all - no
+runtime, no libc, no configuration. Take whichever suits the machine.
+
+**Debian, Ubuntu, Proxmox VE** — installs the binary, a systemd unit and a
+commented `/etc/sriov-mac-sync.conf`, and starts nothing:
 
 ```
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync
-install -m 755 sriov-mac-sync /usr/local/sbin/
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.4.0_amd64.deb
+dpkg -i sriov-mac-sync_1.4.0_amd64.deb
+```
 
+**OpenWrt** — the same, with a procd service instead of the unit:
+
+```
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.4.0_x86_64.ipk
+opkg install ./sriov-mac-sync_1.4.0_x86_64.ipk
+```
+
+**Anything else** — the bare binary, `x86_64` or `aarch64`:
+
+```
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync-$(uname -m)
+install -m 755 sriov-mac-sync-$(uname -m) /usr/local/sbin/sriov-mac-sync
+```
+
+Then, before starting anything:
+
+```
 sriov-mac-sync --check              does this NIC accept filter entries at all?
 sriov-mac-sync --once --dry-run     what would be registered, and why
 ```
+
+If both look right, `systemctl enable --now sriov-mac-sync`, or on OpenWrt
+`/etc/init.d/sriov-mac-sync enable && /etc/init.d/sriov-mac-sync start`.
 
 If `--check` passes and `--dry-run` names the addresses you expected, install
 the unit and let it run — see [Build and install](#build-and-install). If it
@@ -209,6 +234,26 @@ the one you built on:
 ```
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
 ```
+
+To build everything a release ships - static binaries, `.deb`, `.ipk`, for both
+architectures - from a machine with the two musl targets installed:
+
+```
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+./dist/package.sh
+```
+
+The result lands in `dist/out`. Nothing in it is cross-compiled against a
+sysroot or a container; the musl targets link with `rust-lld` and need no
+toolchain beyond cargo.
+
+`x86_64` and `aarch64` are the architectures that exist here. There is no
+32-bit ARM build, and that is not an oversight: SR-IOV needs a PCIe root
+complex that implements it, and hardware pairing that with an armv7 CPU is not
+something you will meet. The `.ipk` is built for `x86_64` and
+`aarch64_generic`; because the binary is static, `opkg install
+--force-architecture` puts the aarch64 one on a `cortex-a53` or `cortex-a72`
+build just as well.
 
 ## Use
 

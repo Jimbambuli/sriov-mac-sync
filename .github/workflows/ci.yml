@@ -57,21 +57,51 @@ jobs:
       - name: Against a real kernel
         run: sudo bench/integration.sh target/release/sriov-mac-sync
 
-  static:
-    # The audience runs hypervisors, not build hosts. Prove that a binary can
-    # be produced that does not depend on the build machine's C library, so it
-    # can simply be copied onto an older distribution.
+  packages:
+    # The audience runs hypervisors and routers, not build hosts. Everything a
+    # release ships is built and then actually exercised here: the binaries
+    # must not depend on the build machine's C library, the .deb must install
+    # and purge on a real dpkg, the .ipk must have the member order opkg
+    # expects, and the aarch64 binary must run - under emulation, but run.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Static build
-        run: RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
-      - name: It really is static
+      - name: Cross targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - name: Build the artefacts
+        run: ./dist/package.sh
+      - name: Both binaries are static
         run: |
-          file target/release/sriov-mac-sync
-          ! ldd target/release/sriov-mac-sync 2>/dev/null | grep -q "=>" \
-            || (echo "binary still has dynamic dependencies" && exit 1)
+          for a in x86_64 aarch64; do
+            file "dist/out/sriov-mac-sync-$a"
+            ! ldd "dist/out/sriov-mac-sync-$a" 2>/dev/null | grep -q "=>" \
+              || (echo "$a binary still has dynamic dependencies" && exit 1)
+          done
+      - name: The aarch64 binary runs
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -qq -y qemu-user-static
+          qemu-aarch64-static dist/out/sriov-mac-sync-aarch64 --version
+          qemu-aarch64-static dist/out/sriov-mac-sync-aarch64 --help > /dev/null
+      - name: The .deb installs, works and purges
+        run: |
+          sudo dpkg -i dist/out/sriov-mac-sync_*_amd64.deb
+          test -x /usr/sbin/sriov-mac-sync
+          /usr/sbin/sriov-mac-sync --version
+          grep -q "^ExecStart=/usr/sbin/sriov-mac-sync$" \
+            /lib/systemd/system/sriov-mac-sync.service
+          sudo dpkg --purge sriov-mac-sync
+          ! test -e /usr/sbin/sriov-mac-sync
+          ! test -e /etc/sriov-mac-sync.conf
+      - name: The .ipk is one opkg would take
+        run: |
+          for f in dist/out/*.ipk; do
+            test "$(ar t "$f" | tr '\n' ' ')" = "debian-binary control.tar.gz data.tar.gz " \
+              || (echo "$f: wrong member order" && exit 1)
+            test "$(ar p "$f" debian-binary)" = "2.0"
+            ar p "$f" data.tar.gz | tar tzf - | grep -q "./etc/init.d/sriov-mac-sync"
+            ar p "$f" control.tar.gz | tar xzOf - ./control | grep -q "^Package: sriov-mac-sync$"
+          done
       - uses: actions/upload-artifact@v5
         with:
-          name: sriov-mac-sync-static-x86_64
-          path: target/release/sriov-mac-sync
+          name: packages
+          path: dist/out/

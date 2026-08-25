@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# procd service for OpenWrt. Settings live in /etc/sriov-mac-sync.conf, the
+# same file the daemon reads everywhere else - there is no UCI section, because
+# there is nothing here that a second configuration format would make clearer.
+
+USE_PROCD=1
+# After the network is up: the daemon finds nothing to do before the bridge and
+# its uplink exist, and it would spend its first reconciliation on an empty
+# host. It catches up by itself either way; this only saves the noise.
+START=95
+STOP=10
+
+PROG=/usr/sbin/sriov-mac-sync
+
+start_service() {
+	procd_open_instance
+	procd_set_param command "$PROG"
+	# Everything it says goes to stderr; procd passes it to logd, where
+	# `logread -e sriov-mac-sync` finds it.
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	# Come back from a crash, but do not flap: five seconds apart, and give up
+	# after three tries within the hour rather than restart forever.
+	procd_set_param respawn 3600 5 3
+	procd_close_instance
+}
+
+stop_service() {
+	# A plain stop deliberately leaves the registrations in the NIC. They are
+	# what makes the peers reachable, and pulling them out because a daemon was
+	# restarted would break traffic that has nothing to do with the restart.
+	# `sriov-mac-sync --flush` is the way to take them back.
+	:
+}
+
+reload_service() {
+	restart
+}

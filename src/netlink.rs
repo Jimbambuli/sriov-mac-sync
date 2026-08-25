@@ -280,7 +280,10 @@ impl Socket {
         // caller with a shorter deadline of its own checks the clock and comes
         // back, and one with a longer one goes round again.
         let tv = libc::timeval {
-            tv_sec: READ_TIMEOUT.as_secs() as libc::time_t,
+            // Inferred from the field rather than named: `time_t` is 32-bit on
+            // some musl targets and 64-bit on others, and naming it means
+            // picking one and being deprecated on the rest.
+            tv_sec: READ_TIMEOUT.as_secs() as _,
             tv_usec: 0,
         };
         let rc = unsafe {
