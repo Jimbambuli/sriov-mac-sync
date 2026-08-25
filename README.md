@@ -503,6 +503,13 @@ functions answer out of its firmware.
 *A faster hash* - done, worth 45% of the phase that puts addresses through
 sets, and nothing anywhere else.
 
+*Not asking for what is not read* - done, and it turned out to be the largest
+thing left in a pass. Asking an interface about its virtual functions
+(`RTEXT_FILTER_VF`) also makes the kernel collect each function's traffic
+counters out of the hardware. `RTEXT_FILTER_SKIP_STATS` says not to: 2.17 ms
+to 0.73 on a ConnectX-4 with two physical functions, which is 43% of a whole
+cold pass, for numbers this daemon never looks at.
+
 *MAC addresses as integers* - not done. It would work on the 0.35 ms of a
 19 ms pass that is not syscall time, and it touches every type in the program.
 
@@ -522,6 +529,11 @@ pass total 19.45 ms          syscall time 19.11 ms  (98.2%)
   topology  1.28 ms            sendto      1.18 ms    3 calls
   pairs     0.23 ms            statx       0.04 ms    4 calls
 ```
+
+On a normal host the shape is different: 2 ms for a whole pass, of which the
+largest part used to be one driver answering about its virtual functions -
+0.73 ms for four addresses, and it was 2.17 ms until the request stopped
+asking for their traffic counters as well.
 
 Everything this program does with the data it reads - parsing 9826 forwarding
 entries, building the interface graph, putting 4200 addresses through several

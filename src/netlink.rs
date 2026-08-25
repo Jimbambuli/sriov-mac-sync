@@ -68,6 +68,9 @@ const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_VF_INFO: u16 = 1;
 const IFLA_VF_MAC: u16 = 1;
 const RTEXT_FILTER_VF: u32 = 1;
+/// Asking for virtual function details also fetches their traffic counters,
+/// which come out of the hardware. This says not to.
+const RTEXT_FILTER_SKIP_STATS: u32 = 1 << 3;
 
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_NEIGH: u32 = 3;
@@ -685,16 +688,7 @@ impl Socket {
         let mut out = Vec::new();
         for &index in indices {
             self.seq = self.seq.wrapping_add(1);
-            let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
-            let mut req = Vec::with_capacity(len);
-            put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST, self.seq);
-            req.push(libc::AF_UNSPEC as u8);
-            req.push(0);
-            req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-            req.extend_from_slice(&(index as i32).to_ne_bytes());
-            req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-            req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
-            put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_VF);
+            let req = vf_request(index, self.seq);
 
             match self.request_one(&req, RTM_NEWLINK, &mut |payload| {
                 collect_vf_macs(payload, &mut out)
@@ -829,6 +823,32 @@ impl Socket {
         }
         Ok(rc > 0)
     }
+}
+
+/// The request that asks one interface about its virtual functions.
+///
+/// Its own function so a test can look at what goes out. The one thing that
+/// matters in it is easy to lose and expensive to lose: without
+/// RTEXT_FILTER_SKIP_STATS the kernel also collects each virtual function's
+/// traffic counters, out of the hardware, and hands them over unasked. On a
+/// ConnectX-4 with two functions of two VFs each that was two thirds of the
+/// call - 2.17 ms against 0.73 - for numbers nothing here reads.
+fn vf_request(index: u32, seq: u32) -> Vec<u8> {
+    let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
+    let mut req = Vec::with_capacity(len);
+    put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST, seq);
+    req.push(libc::AF_UNSPEC as u8);
+    req.push(0);
+    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    req.extend_from_slice(&(index as i32).to_ne_bytes());
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    put_attr_u32(
+        &mut req,
+        IFLA_EXT_MASK,
+        RTEXT_FILTER_VF | RTEXT_FILTER_SKIP_STATS,
+    );
+    req
 }
 
 fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, seq: u32) {
@@ -1426,6 +1446,41 @@ mod tests {
         assert!(
             attempts >= 2,
             "the point of the test is that it took a second, bigger attempt"
+        );
+    }
+
+    /// The request that asks about virtual functions has to say that it does
+    /// not want their statistics. Nothing reads them, they come out of the
+    /// hardware, and they were two thirds of what a pass spent on this call.
+    /// A regression here would be invisible in behaviour and only show up as
+    /// the daemon quietly costing three times as much.
+    #[test]
+    fn the_virtual_function_request_asks_for_no_statistics() {
+        let req = vf_request(7, 3);
+        assert_eq!(
+            u32::from_ne_bytes(req[8..12].try_into().unwrap()),
+            3,
+            "the sequence number goes where request_one looks for it"
+        );
+        assert_eq!(
+            i32::from_ne_bytes(req[20..24].try_into().unwrap()),
+            7,
+            "and the interface index into ifi_index"
+        );
+        let mask = attrs(&req[NLMSG_HDR + IFINFOMSG_LEN..])
+            .find(|(kind, _)| *kind == IFLA_EXT_MASK)
+            .map(|(_, v)| u32::from_ne_bytes(v[..4].try_into().unwrap()))
+            .expect("the request carries an extended filter mask");
+        assert_eq!(
+            mask & RTEXT_FILTER_VF,
+            RTEXT_FILTER_VF,
+            "without this the answer has no virtual functions in it"
+        );
+        assert_eq!(
+            mask & RTEXT_FILTER_SKIP_STATS,
+            RTEXT_FILTER_SKIP_STATS,
+            "without this the kernel reads traffic counters out of the card \
+             for every virtual function, on every pass, for nobody"
         );
     }
 }
