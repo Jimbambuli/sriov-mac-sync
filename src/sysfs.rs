@@ -888,6 +888,13 @@ mod tests {
     /// whatever host that is. They are two descriptions of one thing, and the
     /// one that is not used every day is the one that would drift.
     ///
+    /// The two readings are separate moments, so a host that changes between
+    /// them disagrees with itself: this caught `enp7s0` joining a bridge
+    /// mid-test, reported it as a defect, and passed on the next run. A
+    /// disagreement therefore has to survive being looked at again - a real
+    /// difference in how the two are built survives any number of readings,
+    /// a host in motion does not.
+    ///
     /// Skipped where a netlink socket cannot be opened at all - some build
     /// containers - because there is then nothing to compare against.
     #[test]
@@ -899,13 +906,37 @@ mod tests {
                 return;
             }
         };
-        let links = match sock.dump_links() {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("skipped: the kernel would not list interfaces ({e})");
+        let mut differences = Vec::new();
+        for attempt in 0..3 {
+            differences = match compare_readings(&mut sock) {
+                Some(d) => d,
+                None => {
+                    eprintln!("skipped: the kernel would not list interfaces");
+                    return;
+                }
+            };
+            if differences.is_empty() {
                 return;
             }
-        };
+            eprintln!(
+                "attempt {}: {} difference(s), reading again in case the host moved",
+                attempt + 1,
+                differences.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        panic!(
+            "the two readings disagree about {} interface(s) on this host, \
+             three readings running:\n{}",
+            differences.len(),
+            differences.join("\n")
+        );
+    }
+
+    /// One comparison of the two readings; `None` when the kernel would not
+    /// answer at all.
+    fn compare_readings(sock: &mut crate::netlink::Socket) -> Option<Vec<String>> {
+        let links = sock.dump_links().ok()?;
         let from_kernel = super::Topology::from_links(&links);
         let from_sysfs = super::Topology::load().expect("/sys/class/net is readable");
 
@@ -956,11 +987,6 @@ mod tests {
                 }
             }
         }
-        assert!(
-            differences.is_empty(),
-            "the two readings disagree about {} interface(s) on this host:\n{}",
-            differences.len(),
-            differences.join("\n")
-        );
+        Some(differences)
     }
 }

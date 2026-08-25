@@ -401,9 +401,16 @@ impl Syncer {
         // Through a temporary file: a note truncated by a crash mid-write
         // would read as "we own nothing" just the same. The name is a hidden
         // prefix, not a suffix - "eth0.new" is a perfectly legal interface
-        // name whose own note would otherwise be this file.
+        // name whose own note would otherwise be this file - and it carries
+        // the process id, because the daemon is not the only thing that
+        // writes these. `--once` and `--flush` are run by hand while it is
+        // running; two of them sharing one temporary file means one truncates
+        // what the other is writing and then renames it into place, and the
+        // note that results is neither's.
         let write = || -> io::Result<()> {
-            let tmp = self.state_dir.join(format!(".{dev}.owned.tmp"));
+            let tmp = self
+                .state_dir
+                .join(format!(".{dev}.owned.{}.tmp", std::process::id()));
             if let Err(e) = fs::write(&tmp, &text) {
                 // The directory is created by the unit and survives a
                 // restart; asking for it on every write was a syscall per
@@ -2722,5 +2729,34 @@ mod state_tests {
             now,
             &[topo.index_of("tap0").unwrap()]
         ));
+    }
+
+    /// Two processes writing the same note must not share a temporary file:
+    /// one would truncate what the other is writing and rename the result
+    /// into place. The name carries the process id for that reason.
+    ///
+    /// Verified by mutation: dropping the pid from the name fails this.
+    #[test]
+    fn the_temporary_note_is_this_process_alone() {
+        let dir = scratch("tmp-name");
+        let s = Syncer::new(Vec::new(), dir.clone());
+        // A temporary file left by another process, mid-write.
+        let theirs = dir.join(format!(".nic1.owned.{}.tmp", std::process::id() + 1));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&theirs, "half a note").unwrap();
+
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
+
+        assert_eq!(
+            s.load_owned("nic1"),
+            [BEHIND_NIC].into_iter().collect::<Set<_>>(),
+            "our write went through untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(&theirs).unwrap(),
+            "half a note",
+            "and did not go through the other process's temporary file"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
