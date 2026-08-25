@@ -76,6 +76,18 @@ trap cleanup EXIT
 ip -br link >"$SNAP"
 ip netns del sms-it 2>/dev/null
 ip netns add sms-it
+# No IPv6 anywhere in here, set before a single interface exists so that
+# `default` covers the ones made below. An interface that comes up with IPv6
+# sends duplicate-address detection and a listener report, and the bridge
+# learns the sender - a veth peer's own address - some tens of milliseconds
+# after the link came up. That is a second learner arriving on its own
+# schedule, in the middle of a test whose whole subject is what the daemon
+# does about what the bridge has learnt: S2 asks whether a second pass
+# changes anything, and a peer's address landing between the two passes made
+# the answer yes, correctly and at random. Nothing here needs IP at all - the
+# addresses are put in the forwarding table by hand.
+$NS sysctl -q -w net.ipv6.conf.default.disable_ipv6=1
+$NS sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
 $NS ip link set lo up
 $NS ip link add br0 type bridge
 $NS ip link add veth-up type veth peer name veth-upP
@@ -84,6 +96,31 @@ $NS ip link set veth-up master br0
 $NS ip link set veth-g1 master br0
 $NS sh -c 'for i in br0 veth-up veth-upP veth-g1 veth-g1P; do ip link set $i up; done'
 $NS ip link set br0 type bridge stp_state 0
+
+# And then wait for the table to stop moving before anything is asserted
+# about it. Disabling IPv6 removes the learner this test has actually been
+# seen to trip over; the wait is what makes the test independent of there
+# being another one - a kernel that announces something new at link-up, a
+# distribution that runs something in a fresh namespace. Three identical
+# readings in a row, or two seconds, whichever comes first; a table still
+# moving after two seconds is reported rather than silently tested on.
+settle_fdb() {
+  local last="" now="" same=0 i
+  for i in $(seq 1 20); do
+    now=$($NS bridge fdb show br br0)
+    if [ "$now" = "$last" ]; then
+      same=$((same + 1))
+      [ "$same" -ge 2 ] && return 0
+    else
+      same=0
+    fi
+    last="$now"
+    sleep 0.1
+  done
+  echo "   note: the forwarding table was still changing after 2 s" >&2
+  return 0
+}
+settle_fdb
 
 M1=02:be:5c:00:00:11
 M2=02:be:5c:00:00:12
@@ -97,9 +134,17 @@ check "M1 in the self filter" "has_self $M1"
 check "M1 in the note" "grep -q $M1 $STATE/veth-up.owned"
 
 say "S2: a second --once changes nothing"
+# Idempotence is the claim, so what is compared is the filter and the note
+# either side of the pass, not only what the pass said about itself. A pass
+# that registered and unregistered the same address would print nothing and
+# still not be idempotent.
+FILTER_BEFORE=$($NS bridge fdb show dev veth-up)
+NOTE_BEFORE=$(cat $STATE/veth-up.owned)
 $NS "$BIN" --once --pair veth-up:br0 >/tmp/sms-it-s2.log 2>&1
 check "exit 0" "[ $? -eq 0 ]"
 check "no +/- line" "! grep -qE '^veth-up: [+-]' /tmp/sms-it-s2.log"
+check "filter unchanged" "[ \"$FILTER_BEFORE\" = \"$($NS bridge fdb show dev veth-up)\" ]"
+check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 
 say "S3: --dry-run touches nothing"
 $NS bridge fdb add $M2 dev veth-g1 master dynamic
