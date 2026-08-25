@@ -12,28 +12,78 @@
 //! dependency deep on purpose, which is what makes a static binary for a
 //! foreign host a matter of one build flag.
 //!
-//! What is given up: an attacker who chooses the keys can make lookups
-//! collide. Here the keys are MAC addresses the bridges learnt, so a guest
-//! behind the bridge can indeed choose some of them. The damage it could do
-//! is to make this daemon slower - the sets are bounded by what a unicast
-//! filter can hold, and a full pass is milliseconds - which is a poor
-//! exchange for the constant cost of the defence.
+//! What SipHash buys and this does not is collisions an attacker cannot
+//! predict, and here the attacker is real: the keys are MAC addresses the
+//! bridges learnt, and a guest behind the bridge chooses those by sending
+//! frames. Thousands of addresses that all land in one bucket turn every
+//! lookup into a walk, and a pass over a large table is where this daemon
+//! spends what little time it spends.
+//!
+//! So the state is seeded, once per process, from the kernel's random pool.
+//! The multiply-rotate step is unchanged and still costs a multiplication;
+//! what changes is that the arrangement it produces is not the same twice, so
+//! there is nothing to aim at. That is not SipHash's guarantee - somebody who
+//! learns the seed can still construct collisions - but it is the difference
+//! between an attack anybody can copy from a blog post and one that needs the
+//! contents of this process's memory.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The odd 64-bit constant rustc's FxHash uses: 2^64 / phi, rounded to odd.
-const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+const MULTIPLIER: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
-#[derive(Default, Clone, Copy)]
+/// Where every hash in this process starts. Zero means "not chosen yet";
+/// once chosen it never changes, because a set whose hasher changed under it
+/// would never find anything again.
+static SEED: AtomicU64 = AtomicU64::new(0);
+
+fn seed() -> u64 {
+    let existing = SEED.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing;
+    }
+    let mut bytes = [0u8; 8];
+    let got = unsafe {
+        libc::getrandom(
+            bytes.as_mut_ptr() as *mut libc::c_void,
+            bytes.len(),
+            libc::GRND_NONBLOCK,
+        )
+    };
+    // A kernel that will not hand out randomness leaves the seed at a fixed
+    // value rather than a weak one: the daemon still works, it simply has the
+    // predictability this is meant to remove. It has never been seen to
+    // happen outside early boot.
+    let fresh = if got == bytes.len() as isize {
+        u64::from_ne_bytes(bytes) | 1
+    } else {
+        MULTIPLIER
+    };
+    // First writer wins; everyone else takes what is there. Two hashers in
+    // one process must never disagree about where a key belongs.
+    match SEED.compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => fresh,
+        Err(already) => already,
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct FxHasher {
     hash: u64,
+}
+
+impl Default for FxHasher {
+    fn default() -> Self {
+        FxHasher { hash: seed() }
+    }
 }
 
 impl FxHasher {
     #[inline]
     fn add(&mut self, word: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(MULTIPLIER);
     }
 }
 
@@ -137,5 +187,32 @@ mod tests {
         m.insert(7, "seven");
         assert_eq!(m.get(&7), Some(&"seven"));
         assert_eq!(m.get(&8), None);
+    }
+
+    /// The arrangement must not be the same in two processes, or a guest that
+    /// chooses the addresses the bridge learns can choose which of them
+    /// collide. Same process, same answer - a set whose hasher changed under
+    /// it would never find anything again.
+    #[test]
+    fn the_seed_is_per_process_and_stable_within_it() {
+        let a = hash_of(&[0x02u8, 0, 0, 0, 0, 1]);
+        let b = hash_of(&[0x02u8, 0, 0, 0, 0, 1]);
+        assert_eq!(a, b, "the same key has to land in the same place");
+        assert_ne!(
+            super::seed(),
+            0,
+            "a seed of zero means the state was never initialised"
+        );
+        // Not the bare multiply-rotate of an unseeded hasher: that is what
+        // an attacker would reproduce at home.
+        let unseeded = {
+            let mut h = FxHasher { hash: 0 };
+            [0x02u8, 0, 0, 0, 0, 1].hash(&mut h);
+            h.finish()
+        };
+        assert_ne!(
+            a, unseeded,
+            "the hash has to depend on the seed, or seeding it changed nothing"
+        );
     }
 }

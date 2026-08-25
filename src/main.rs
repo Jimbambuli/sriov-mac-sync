@@ -173,6 +173,20 @@ fn macs(what: &str, given: &[String]) -> Set<[u8; 6]> {
     out
 }
 
+/// Everything up to a `#` that is not inside quotes.
+fn strip_comment(value: &str) -> &str {
+    let mut quote: Option<char> = None;
+    for (i, c) in value.char_indices() {
+        match (quote, c) {
+            (None, '"') | (None, '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '#') => return &value[..i],
+            _ => {}
+        }
+    }
+    value
+}
+
 fn load_conf(opts: &mut Options) {
     let text = match std::fs::read_to_string(CONF) {
         Ok(t) => t,
@@ -191,9 +205,12 @@ fn load_conf(opts: &mut Options) {
             continue;
         }
         let (key, value) = line.split_once('=').unwrap();
-        // "RESYNC=300  # seconds" means 300, not a parse warning. No value
-        // this file takes can legitimately contain a hash.
-        let value = value.split('#').next().unwrap_or("");
+        // "RESYNC=300  # seconds" means 300, not a parse warning - but a hash
+        // inside quotes is part of the value, not the start of a comment.
+        // Nothing this file takes can legitimately contain one today; the
+        // rule is here so that the day something can, the parser does not
+        // quietly eat half of it.
+        let value = strip_comment(value);
         let value = value.trim().trim_matches('"').trim_matches('\'');
         match key.trim() {
             "PAIRS" => opts
@@ -1097,5 +1114,19 @@ mod tests {
         assert!(stopping(), "the handler has to record the request");
         // Other tests share this process.
         STOPPING.store(false, Ordering::Relaxed);
+    }
+
+    /// A hash starts a comment - unless it is inside quotes, where it is part
+    /// of what somebody wrote down.
+    #[test]
+    fn a_comment_ends_a_value_but_quotes_protect_a_hash() {
+        assert_eq!(strip_comment("300  # seconds"), "300  ");
+        assert_eq!(strip_comment("300"), "300");
+        assert_eq!(strip_comment("\"a#b\" # trailing"), "\"a#b\" ");
+        assert_eq!(strip_comment("'a#b'"), "'a#b'");
+        assert_eq!(strip_comment("#all of it"), "");
+        // An unbalanced quote swallows the rest rather than guessing where
+        // the value was meant to stop.
+        assert_eq!(strip_comment("\"unclosed # here"), "\"unclosed # here");
     }
 }

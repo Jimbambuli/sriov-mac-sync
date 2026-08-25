@@ -872,6 +872,14 @@ fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, seq: u32) {
 
 fn put_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
     let len = RTATTR_HDR + value.len();
+    // A netlink attribute's length field is 16 bits. Nothing here writes an
+    // attribute anywhere near that - the largest is a six-byte address - but
+    // a truncated length would be a silently malformed message rather than a
+    // refusal, and those are the ones that cost an afternoon.
+    assert!(
+        len <= u16::MAX as usize,
+        "netlink attribute of {len} bytes cannot state its own length"
+    );
     buf.extend_from_slice(&(len as u16).to_ne_bytes());
     buf.extend_from_slice(&kind.to_ne_bytes());
     buf.extend_from_slice(value);
