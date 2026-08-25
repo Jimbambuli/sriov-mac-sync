@@ -256,11 +256,25 @@ four arriving in close succession (reported
 separately), a burst of sixteen (one turnaround figure; per-address stamps
 inside one receive batch would be scheduling noise dressed as precision), a
 hundred cold `--once` passes (per-phase min/median/p95/max, with the CPU
-governor logged), the port's removal (everything has to come back out of
-every filter and note, within a bound), and a final quiescence check: the
-journal has to be quiet, no `[timed]` pass may have had to fix anything, and
-filters and notes must be byte-identical to before. Any verification that
-fails fails the run's exit code.
+governor logged), an address of ours turning up on the uplink's own port (a
+guest that moved to another host: the registration has to come back out, and
+how fast is reported), a virtual function's own address being learnt behind
+the bridge (it must never be registered - doing so tells the eSwitch that
+guest lives behind the bridge and sends its traffic past it), the port's
+removal (everything has to come back out of every filter and note, within a
+bound), and a final quiescence check: the journal has to be quiet, no
+`[timed]` pass may have had to fix anything, and filters and notes must be
+byte-identical to before. Any verification that fails fails the run's exit
+code.
+
+The last two need situations that do not arise on a single host by
+themselves. An address on the uplink's own port is produced with `bridge fdb
+add ... master dynamic`, which is what learning produces and is announced the
+same way. A virtual function's address is borrowed for a moment from a
+function of the tested uplink's own physical function that nothing is using -
+bound on the host, not the uplink, not in a bridge - and given straight back;
+where there is no such function the scenario says so and is skipped rather
+than failed.
 
 It refuses to start unless everything holds: the service active and not in
 `--dry-run`, the bridge actually watched, STP off, the VLAN named on a
