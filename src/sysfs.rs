@@ -19,7 +19,9 @@ const NET: &str = "/sys/class/net";
 /// stacked on that parent. A veth also reports a peer over netlink, and a
 /// tunnel reports its underlay - neither is stacking, and treating them as
 /// such would send the uplink search off in the wrong direction.
-const STACKED_ON_PARENT: &[&str] = &["vlan", "macvlan", "macvtap", "ipvlan", "vxlan"];
+const STACKED_ON_PARENT: &[&str] = &[
+    "vlan", "macvlan", "macvtap", "ipvlan", "ipvtap", "macsec", "vxlan",
+];
 
 /// One interface, with its relations held as interface indices rather than
 /// names. The kernel identifies interfaces by index in every message the

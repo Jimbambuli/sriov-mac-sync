@@ -160,6 +160,9 @@ pub struct Syncer {
     /// Uplinks already told about, so the warning appears when the situation
     /// arises rather than once per pass for ever.
     warned_unknown_vf: Set<String>,
+    /// Devices whose note could not be read. Not "owns nothing" - nothing may
+    /// overwrite or unlink one of these.
+    unreadable: std::cell::RefCell<Set<String>>,
     /// Pinned addresses already warned about, per uplink, so the warning
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
@@ -311,6 +314,7 @@ impl Syncer {
             orphan_grace: Duration::ZERO,
             absent_since: crate::hash::map(),
             warned_unknown_vf: crate::hash::set(),
+            unreadable: std::cell::RefCell::new(crate::hash::set()),
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -418,12 +422,29 @@ impl Syncer {
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!(
-                "warning: cannot read {}: {e} - treating every entry there as foreign",
-                self.state_path(dev).display()
-            ),
+            Err(e) => {
+                // Not the same as owning nothing, and the difference is
+                // destructive: a pass would rename a fresh note over it, and
+                // --flush and the orphan sweep would unlink it - in every
+                // case abandoning entries that are still in the card with
+                // nothing left to say they are ours.
+                eprintln!(
+                    "warning: cannot read {}: {e} - leaving that device alone \
+                     until it can be read",
+                    self.state_path(dev).display()
+                );
+                self.unreadable.borrow_mut().insert(dev.to_string());
+                return set;
+            }
         }
+        self.unreadable.borrow_mut().remove(dev);
         set
+    }
+
+    /// Whether the note for this device could be read at all. Everything that
+    /// would replace or unlink it has to ask first.
+    fn note_is_readable(&self, dev: &str) -> bool {
+        !self.unreadable.borrow().contains(dev)
     }
 
     /// Hold the note against everybody else while it is rewritten.
@@ -495,6 +516,13 @@ impl Syncer {
 
     /// The write itself. Every caller holds the lock.
     fn write_owned(&self, dev: &str, set: &Set<Mac>) {
+        if !self.note_is_readable(dev) {
+            eprintln!(
+                "warning: not writing the ownership note for {dev}: it could not \
+                 be read, and replacing it would abandon whatever it names"
+            );
+            return;
+        }
         // Most passes change nothing, and rewriting the note every time would
         // be pointless work on a host that is simply idle. The remembered
         // copy answers this without reading the file - and when it cannot be
@@ -746,7 +774,7 @@ impl Syncer {
                 // anyway.)
                 None => (owned.len(), crate::hash::set()),
             };
-            if kept.is_empty() {
+            if kept.is_empty() && self.note_is_readable(&dev) {
                 eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
                 let _ = fs::remove_file(self.state_path(&dev));
             } else {
@@ -1538,7 +1566,7 @@ impl Syncer {
                 Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
                 None => (owned.len(), crate::hash::set()),
             };
-            if kept.is_empty() {
+            if kept.is_empty() && self.note_is_readable(&dev) {
                 let _ = fs::remove_file(self.state_path(&dev));
                 println!("{dev}: removed {gone} address(es)");
             } else {

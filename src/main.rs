@@ -205,7 +205,15 @@ fn load_conf(opts: &mut Options) {
     };
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') || !line.contains('=') {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // A line that is not a setting is somebody trying to write one.
+        // Dropping it in silence contradicts the whole point of the warnings
+        // below - the setting they wrote down never takes effect and nothing
+        // says so.
+        if !line.contains('=') {
+            eprintln!("warning: {CONF}: not a setting, ignored: {line}");
             continue;
         }
         let (key, value) = line.split_once('=').unwrap();
@@ -446,13 +454,23 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> b
                 continue;
             }
         }
-        let listed = sock
-            .dump_fdb()
-            .map(|fdb| {
-                fdb.iter()
-                    .any(|e| e.is_self() && e.ifindex == link.index && e.mac == probe)
-            })
-            .unwrap_or(false);
+        // A dump that failed is not an absent entry. Folding the two
+        // together blamed the driver for the kernel's refusal to answer.
+        let listed = match sock.dump_fdb() {
+            Ok(fdb) => fdb
+                .iter()
+                .any(|e| e.is_self() && e.ifindex == link.index && e.mac == probe),
+            Err(e) => {
+                println!(
+                    "{} ({driver}): inconclusive - the entry was accepted, but the \
+                     forwarding table could not be read back: {e}",
+                    pair.dev
+                );
+                ok = false;
+                let _ = sock.set_self_fdb(link.index, &probe, false);
+                continue;
+            }
+        };
         if listed {
             println!(
                 "{} ({driver}): ok - accepts unicast filter entries \
@@ -551,7 +569,15 @@ fn run() -> Result<bool, String> {
     )?;
 
     if opts.mode == Mode::Check {
-        return Ok(check(&mut sock, &topo, &pairs, opts.dry_run));
+        // The check works by writing a probe entry and taking it back; there
+        // is nothing it can do without writing. Saying "fine" for having
+        // skipped every pair is the one answer it must not give.
+        if opts.dry_run {
+            return Err("--check works by writing a probe entry, which --dry-run \
+                        rules out - run it without --dry-run"
+                .into());
+        }
+        return Ok(check(&mut sock, &topo, &pairs, false));
     }
 
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));

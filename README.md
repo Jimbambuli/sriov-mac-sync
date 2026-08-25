@@ -121,7 +121,8 @@ and you would break connectivity that was working.
 Nothing is decided by interface name. Naming conventions differ between
 distributions, and guessing from them is how a tool like this breaks on someone
 else's machine; the direction of the uplink is worked out from the actual
-device stacking in `/sys/class/net`.
+device stacking the kernel reports — master and link relations out of an
+`RTM_GETLINK` dump, with the SR-IOV relations from `/sys/class/net`.
 
 ## Topologies
 
@@ -263,9 +264,12 @@ the bridge (it must never be registered - doing so tells the eSwitch that
 guest lives behind the bridge and sends its traffic past it), the port's
 removal (everything has to come back out of every filter and note, within a
 bound), and a final quiescence check: the journal has to be quiet, no
-`[timed]` pass may have had to fix anything, and filters and notes must be
-byte-identical to before. Any verification that fails fails the run's exit
-code.
+`[timed]` pass may have had to fix anything, and no trace of the trial's own
+addresses may remain. Filters and notes are also compared against how they
+were before, but a difference there is reported rather than failed: the bridge
+under test is a live network whose guests come and go, and that drift is the
+daemon's ordinary work rather than the trial's doing. Any verification that
+does fail fails the run's exit code.
 
 The last two need situations that do not arise on a single host by
 themselves. An address on the uplink's own port is produced with `bridge fdb
@@ -509,7 +513,10 @@ what makes `EEXIST` and `ENOSPC` distinguishable instead of guessed at.
 
 Topology comes from an `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
 the interface kind for stacking (a veth reports a peer there and a tunnel its
-underlay — neither is stacking), `IFLA_NUM_VF` for the virtual function count.
+underlay — neither is stacking). The count of an interface's virtual functions
+is *not* in that dump: `IFLA_NUM_VF` is only sent when the request asks for the
+functions themselves, which is the expensive thing the daemon avoids, so the
+count is read from `device/sriov_numvfs`.
 The SR-IOV relationships the kernel does not put in that dump — `physfn` and
 `virtfn` — come from `/sys/class/net`, for interfaces that have a bus device.
 Interfaces are held by index, the way every kernel message identifies them,
