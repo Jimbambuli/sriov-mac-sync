@@ -357,6 +357,19 @@ registered. The second figure is real work - 4000 registrations and the passes
 that reconcile them - and it is what a host learning 200 addresses a second
 costs. A host of this project's kind learns a few an hour.
 
+**A virtual function's address has to be knowable, or it cannot be excluded.**
+Registering the address of a virtual function of the uplink's own physical
+function is the one thing that must never happen: it tells the eSwitch the
+guest holding it lives behind the bridge, and that guest's traffic is sent
+past it. The daemon recognises such an address two ways - one set from the
+host with `ip link set <pf> vf N mac ...`, which the driver reports, or a
+netdev for that function still bound here. A function handed straight to a
+guest with neither, its address made up by the driver inside the guest, is in
+no exclusion set, and the protection then rests entirely on the rule that
+nothing learnt on the uplink's own port is registered. The daemon says so once
+per uplink when it finds one. Setting the address from the host closes it;
+`EXCLUDE` does too.
+
 **The list is finite and its size cannot be queried.** On ConnectX-4 Lx it
 holds 128 entries. Beyond that the driver drops addresses silently, and *which*
 ones is not predictable — with 257 entries a given address still worked, with

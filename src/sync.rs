@@ -157,6 +157,9 @@ pub struct Syncer {
     pub orphan_grace: Duration,
     /// When each noted device was first seen to be missing.
     absent_since: Map<String, Instant>,
+    /// Uplinks already told about, so the warning appears when the situation
+    /// arises rather than once per pass for ever.
+    warned_unknown_vf: Set<String>,
     /// Pinned addresses already warned about, per uplink, so the warning
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
@@ -307,6 +310,7 @@ impl Syncer {
             vf_stale: true,
             orphan_grace: Duration::ZERO,
             absent_since: crate::hash::map(),
+            warned_unknown_vf: crate::hash::set(),
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -825,6 +829,51 @@ impl Syncer {
         skip
     }
 
+    /// Say so when a virtual function's address cannot be known.
+    ///
+    /// The exclusion set can recognise a virtual function two ways: an
+    /// address set from the host (`ip link set <pf> vf N mac ...`), which the
+    /// driver reports, or a netdev still bound here. A function handed
+    /// straight to a guest with neither - the address made up by the driver
+    /// in the guest - is in no exclusion set at all, and invariant 2 then
+    /// rests entirely on the wire rule: if anything ever makes the bridge
+    /// learn that address on a port other than the uplink's, the daemon will
+    /// register the guest's own address and its traffic is sent past it.
+    ///
+    /// Nothing can be done about it here - the address is not knowable - so
+    /// the operator is told, once, with the two ways to close it.
+    fn warn_about_unknowable_vfs(&mut self, topo: &Topology, dev: &str, vf_macs: &[(u32, Mac)]) {
+        let Some(pf) = topo.index_of(dev).map(|d| physical_function(topo, d)) else {
+            return;
+        };
+        let Some(pf_link) = topo.at(pf) else { return };
+        if pf_link.numvfs == 0 || self.warned_unknown_vf.contains(dev) {
+            return;
+        }
+        // An address of all zeroes is the driver saying "nobody set one".
+        let named = vf_macs
+            .iter()
+            .filter(|(index, mac)| *index == pf && *mac != [0u8; 6])
+            .count();
+        let here = pf_link.vf_netdevs.len();
+        let unknowable = pf_link.numvfs as usize > named.max(here);
+        self.warned_unknown_vf.insert(dev.to_string());
+        if unknowable {
+            eprintln!(
+                "warning: {}: {} of {}'s {} virtual function(s) have no address set \
+                 from this host and no interface here, so their addresses cannot be \
+                 excluded - a guest holding one would have its own traffic sent past \
+                 it if this bridge ever learns that address. Set them with \
+                 `ip link set {} vf N mac ...`, or list them in EXCLUDE.",
+                dev,
+                pf_link.numvfs as usize - named.max(here),
+                pf_link.name,
+                pf_link.numvfs,
+                pf_link.name
+            );
+        }
+    }
+
     fn desired(
         &self,
         topo: &Topology,
@@ -1020,6 +1069,7 @@ impl Syncer {
             };
             let port = topo.uplink_port(dev_index, bridge_index);
             let port_name = topo.name_of(port).unwrap_or(&pair.dev).to_string();
+            self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
             let (want, stacked, wire) =
                 self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
 
@@ -3147,6 +3197,57 @@ mod state_tests {
             note.contains(&BEHIND_NIC),
             "and our own registrations are still on record"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A virtual function handed straight to a guest, with no address set
+    /// from the host and no interface here, is in no exclusion set: its
+    /// address is not knowable. Nothing can be done about that in code - so
+    /// it has to be said, once, with the two ways to close it.
+    ///
+    /// Verified by mutation: with the count comparison inverted the quiet
+    /// case warns and this fails.
+    #[test]
+    fn an_unknowable_virtual_function_is_reported_once() {
+        let dir = scratch("vf-unknown");
+        // Two functions, one netdev here, no address set from the host.
+        let topo = Builder::new()
+            .add("pf0", 2, Some(mac(1)))
+            .master("br0")
+            .vfs(2)
+            .add("pf0v0", 3, Some(mac(2)))
+            .physfn("pf0")
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("pf0")
+            .build();
+        let mut s = Syncer::new(
+            vec![Pair {
+                dev: "pf0".into(),
+                bridge: "br0".into(),
+            }],
+            dir.clone(),
+        );
+
+        assert!(
+            !s.warned_unknown_vf.contains("pf0"),
+            "nothing said before it is looked at"
+        );
+        s.warn_about_unknowable_vfs(&topo, "pf0", &[]);
+        assert!(
+            s.warned_unknown_vf.contains("pf0"),
+            "and once looked at, not looked at again every pass for ever"
+        );
+
+        // With both addresses known, there is nothing to report - the flag is
+        // still set, because the question was asked and answered.
+        let mut quiet = Syncer::new(s.pairs.clone(), dir.clone());
+        quiet.warn_about_unknowable_vfs(
+            &topo,
+            "pf0",
+            &[(2, [0x02, 0, 0, 0, 0, 9]), (2, [0x02, 0, 0, 0, 0, 10])],
+        );
+        assert!(quiet.warned_unknown_vf.contains("pf0"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
