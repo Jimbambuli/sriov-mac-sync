@@ -626,6 +626,12 @@ fn run() -> Result<bool, String> {
             // containers most link messages are a veth nobody here cares
             // about.
             let mut vf_stale = true;
+            // What reading the picture cost when an event read it, so the
+            // pass that uses it can account for it. Without this a pass whose
+            // topology was read moments earlier reports "0.000 ms" for it,
+            // which reads as "not read at all" - it misled the author of this
+            // line for an hour.
+            let mut carried_topo_load = Duration::ZERO;
             // When the last full pass ran, so event storms are answered with
             // a bounded pass rate rather than with waiting. Registrations
             // never wait: every batch goes through the fast path the moment
@@ -655,7 +661,7 @@ fn run() -> Result<bool, String> {
                     // One reading of /sys serves both the autodetection and
                     // the pass. They ask about the same moment, and reading it
                     // twice was work nobody asked for.
-                    let mut topo_load = Duration::ZERO;
+                    let mut topo_load = std::mem::take(&mut carried_topo_load);
                     let reloaded = stale || held.is_none();
                     if reloaded {
                         let load_started = Instant::now();
@@ -792,8 +798,10 @@ fn run() -> Result<bool, String> {
                 // the whole of what this used to cost.
                 let mut previous: Option<Topology> = None;
                 if stale || held.is_none() {
+                    let started = Instant::now();
                     match read_topology(&mut sock) {
                         Ok(t) => {
+                            carried_topo_load += started.elapsed();
                             previous = held.replace(t);
                             stale = false;
                         }
