@@ -582,17 +582,11 @@ class Trial:
         its own does from the outside: the kernel announces it as a link
         message and nothing in the forwarding tables moves."""
         print("\nS6  an address that belongs to a virtual function")
-        # The uplink of the bridge under test, not just any watched uplink: a
-        # virtual function of some other card's physical function is an
-        # ordinary foreign address as far as this bridge is concerned, and
-        # registering it is correct. Getting that wrong made this scenario
-        # fail against a daemon that was right.
-        here = [d for (d, b) in watched_pairs(self.binary) if b == self.args.bridge]
-        if not here:
-            self.verdict("virtual function address", True,
-                         f"skipped: no watched uplink on {self.args.bridge}")
-            return
-        uplink = here[0]
+        # preflight() already narrowed the uplinks to this bridge's, which
+        # matters here: a virtual function of some other card's physical
+        # function is an ordinary foreign address as far as this bridge is
+        # concerned, and registering it would be correct.
+        uplink = self.uplinks[0]
         found = free_virtual_function(uplink)
         if not found:
             self.verdict("virtual function address", True,
@@ -603,7 +597,23 @@ class Trial:
         mac = self.macs(1)[0]
         cleanup_vf = (pf, index, original)
         self.cleanup.vf_address = cleanup_vf
-        run(["ip", "link", "set", pf, "vf", str(index), "mac", mac_str(mac)])
+        set_mac = run(["ip", "link", "set", pf, "vf", str(index), "mac", mac_str(mac)])
+        if set_mac.returncode != 0:
+            # Without the address actually set there is nothing to exclude,
+            # and the daemon would be failed for registering an ordinary
+            # address correctly.
+            self.cleanup.vf_address = None
+            self.verdict("virtual function address", True,
+                         f"skipped: {pf} vf {index} would not take an address "
+                         f"({set_mac.stderr.strip()})")
+            return
+        # The kernel reports what it accepted; a driver may refuse quietly.
+        if mac_str(mac) not in run(["ip", "-d", "link", "show", pf]).stdout:
+            run(["ip", "link", "set", pf, "vf", str(index), "mac", original])
+            self.cleanup.vf_address = None
+            self.verdict("virtual function address", True,
+                         f"skipped: {pf} vf {index} did not take the address")
+            return
         time.sleep(1.5)  # the link message, and the pass that answers it
 
         # ... and now something behind the bridge speaks with that address.

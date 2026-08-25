@@ -32,6 +32,10 @@ use sysfs::Topology;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONF: &str = "/etc/sriov-mac-sync.conf";
 const STATE_DIR: &str = "/run/sriov-mac-sync";
+/// How long to wait before trying again when the kernel would not describe the
+/// interfaces. Short, because until it answers the daemon is not doing its job
+/// at all; not zero, because a kernel that just refused will refuse again.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq)]
 enum Mode {
@@ -661,6 +665,9 @@ fn run() -> Result<bool, String> {
                                 held = Some(t);
                                 stale = false;
                             }
+                            // Fail closed: a pass on a picture that may be
+                            // wrong is worse than no pass at all. The retry
+                            // is scheduled below, where the pass gives up.
                             Err(e) => {
                                 eprintln!("warning: {e}");
                                 held = None;
@@ -690,7 +697,11 @@ fn run() -> Result<bool, String> {
                     }
                     {
                         let Some((topo, topo_load)) = loaded else {
-                            next_full = Instant::now() + interval;
+                            // Nothing to work from. Come back soon rather
+                            // than sitting out the whole reconciliation
+                            // interval: one refused dump used to cost five
+                            // minutes of not looking at the host at all.
+                            next_full = Instant::now() + RETRY_AFTER;
                             trigger = "timed";
                             continue;
                         };
