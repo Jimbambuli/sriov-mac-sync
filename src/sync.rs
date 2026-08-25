@@ -1839,6 +1839,72 @@ pub(crate) mod tests {
     pub(crate) const VF_ADMIN: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 1];
     pub(crate) const MCAST: Mac = [0x01, 0x00, 0x5e, 0, 0, 1];
 
+    /// The kernel, as far as the bookkeeping is concerned: answers with what
+    /// a test injected and records what would have been written. Shared with
+    /// main's daemon-loop tests, which is why it lives in this module.
+    #[derive(Default)]
+    pub(crate) struct FakeSock {
+        pub(crate) fdb: Vec<FdbEntry>,
+        pub(crate) vf: Vec<(u32, Mac)>,
+        pub(crate) added: Vec<(u32, Mac)>,
+        pub(crate) removed: Vec<(u32, Mac)>,
+        /// raw OS error to answer an add of this address with
+        pub(crate) fail_add: Map<Mac, i32>,
+        /// raw OS error to answer a removal of this address with
+        pub(crate) fail_del: Map<Mac, i32>,
+        /// A second process, writing the same note while the pass is inside
+        /// it: on the first successful add, this address is appended to the
+        /// note at this path. That is the window the merge exists for, and
+        /// there is no other way to be inside it from a test.
+        pub(crate) meanwhile: Option<(PathBuf, Mac)>,
+        /// What dump_links answers. Only --flush reads the topology through
+        /// the socket; an empty answer means every noted device looks gone,
+        /// which is one case of many - so a test can now say otherwise.
+        pub(crate) links: Vec<crate::netlink::LinkInfo>,
+        /// Milliseconds each removal takes. A flush with entries to remove
+        /// then stands in its read-unregister-unlink window long enough for
+        /// another thread to try the things the lock exists to serialise.
+        pub(crate) del_delay_ms: u64,
+        /// How often the driver was asked for the functions' addresses -
+        /// the most expensive question a pass asks, and exactly the one the
+        /// vf_stale machinery exists to avoid asking twice.
+        pub(crate) vf_asked: usize,
+    }
+
+    impl FdbWriter for FakeSock {
+        fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
+            Ok(self.fdb.clone())
+        }
+        fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
+            Ok(self.links.clone())
+        }
+        fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
+            self.vf_asked += 1;
+            Ok(self.vf.clone())
+        }
+        fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
+            let table = if add { &self.fail_add } else { &self.fail_del };
+            if let Some(code) = table.get(mac) {
+                return Err(io::Error::from_raw_os_error(*code));
+            }
+            if add {
+                if let Some((path, other)) = self.meanwhile.take() {
+                    let mut text = fs::read_to_string(&path).unwrap_or_default();
+                    text.push_str(&format_mac(&other));
+                    text.push('\n');
+                    fs::write(&path, text).unwrap();
+                }
+                self.added.push((ifindex, *mac));
+            } else {
+                if self.del_delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(self.del_delay_ms));
+                }
+                self.removed.push((ifindex, *mac));
+            }
+            Ok(())
+        }
+    }
+
     /// A learnt entry: not permanent, not `self`, so the bridge picked it up
     /// from traffic.
     pub(crate) fn learned(ifindex: u32, master: u32, mac: Mac) -> FdbEntry {
@@ -2486,66 +2552,6 @@ mod state_tests {
         );
     }
     use crate::sysfs::fixture::{mac, Builder};
-
-    /// The kernel, as far as the bookkeeping is concerned: answers with what
-    /// a test injected and records what would have been written.
-    #[derive(Default)]
-    struct FakeSock {
-        fdb: Vec<FdbEntry>,
-        vf: Vec<(u32, Mac)>,
-        added: Vec<(u32, Mac)>,
-        removed: Vec<(u32, Mac)>,
-        /// raw OS error to answer an add of this address with
-        fail_add: Map<Mac, i32>,
-        /// raw OS error to answer a removal of this address with
-        fail_del: Map<Mac, i32>,
-        /// A second process, writing the same note while the pass is inside
-        /// it: on the first successful add, this address is appended to the
-        /// note at this path. That is the window the merge exists for, and
-        /// there is no other way to be inside it from a test.
-        meanwhile: Option<(PathBuf, Mac)>,
-        /// What dump_links answers. Only --flush reads the topology through
-        /// the socket; an empty answer means every noted device looks gone,
-        /// which is one case of many - so a test can now say otherwise.
-        links: Vec<crate::netlink::LinkInfo>,
-        /// Milliseconds each removal takes. A flush with entries to remove
-        /// then stands in its read-unregister-unlink window long enough for
-        /// another thread to try the things the lock exists to serialise.
-        del_delay_ms: u64,
-    }
-
-    impl FdbWriter for FakeSock {
-        fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
-            Ok(self.fdb.clone())
-        }
-        fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
-            Ok(self.links.clone())
-        }
-        fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
-            Ok(self.vf.clone())
-        }
-        fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
-            let table = if add { &self.fail_add } else { &self.fail_del };
-            if let Some(code) = table.get(mac) {
-                return Err(io::Error::from_raw_os_error(*code));
-            }
-            if add {
-                if let Some((path, other)) = self.meanwhile.take() {
-                    let mut text = fs::read_to_string(&path).unwrap_or_default();
-                    text.push_str(&format_mac(&other));
-                    text.push('\n');
-                    fs::write(&path, text).unwrap();
-                }
-                self.added.push((ifindex, *mac));
-            } else {
-                if self.del_delay_ms > 0 {
-                    std::thread::sleep(Dur::from_millis(self.del_delay_ms));
-                }
-                self.removed.push((ifindex, *mac));
-            }
-            Ok(())
-        }
-    }
 
     fn ready_syncer(dir: &std::path::Path) -> Syncer {
         let mut s = Syncer::new(vec![pair()], dir.to_path_buf());
