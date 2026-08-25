@@ -58,6 +58,24 @@ impl Note {
     }
 }
 
+/// How soon a batch of notifications needs a full pass.
+///
+/// A pass dumps the host's whole forwarding table, so what a batch is worth
+/// decides how often that happens. Deletions are the case that matters: a
+/// bridge ages its entries out, and on a large table that arrives as a burst
+/// of hundreds. Each of them may mean an address is gone and its registration
+/// should follow - but none of them is urgent, and answering each burst at the
+/// full rate is how a quiet host turns into a busy one for no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    /// The batch was somebody else's entirely.
+    Nothing,
+    /// Something may need removing, but nothing is waiting on it.
+    WhenConvenient,
+    /// Registrations, removals or interfaces changed.
+    Now,
+}
+
 pub struct Report {
     pub dev: String,
     pub bridge: String,
@@ -1054,21 +1072,29 @@ impl Syncer {
         sock: &mut dyn FdbWriter,
         topo: &Topology,
         events: &[(u16, FdbEntry)],
-    ) -> io::Result<bool> {
+    ) -> io::Result<Urgency> {
         if events.is_empty() {
-            return Ok(false);
+            return Ok(Urgency::Nothing);
         }
         // A dry run changes nothing, so nothing here can decide a pass is
         // unnecessary - and the pass is where a dry run does its reporting.
         if self.dry_run {
-            return Ok(true);
+            return Ok(Urgency::Now);
         }
         // A deletion is not acted on here, but it is a reason to look: it may
         // have been the last copy of an address that is now to come out, and
-        // only a full dump can tell.
-        let mut worth_a_pass = events
+        // only a full dump can tell. It is never a reason to hurry - an
+        // ageing table produces these in bursts of hundreds, and a
+        // registration that outlives its guest by a few seconds costs nothing
+        // but a filter slot.
+        let mut urgency = if events
             .iter()
-            .any(|(kind, _)| *kind == crate::netlink::RTM_DELNEIGH);
+            .any(|(kind, _)| *kind == crate::netlink::RTM_DELNEIGH)
+        {
+            Urgency::WhenConvenient
+        } else {
+            Urgency::Nothing
+        };
         // Where each uplink sits in its bridge, and which addresses may never
         // be registered for it, are properties of the topology - the same for
         // every entry in the batch. Worked out once instead of once per entry
@@ -1161,7 +1187,7 @@ impl Syncer {
                     Ok(()) => {
                         owned.remove(mac);
                         changed = true;
-                        worth_a_pass = true;
+                        urgency = Urgency::Now;
                         taken_back.push(*mac);
                         eprintln!(
                             "{}: {} moved out onto the wire, unregistered [reflection]",
@@ -1208,13 +1234,13 @@ impl Syncer {
                 continue;
             }
             if self.fast_add(sock, topo, entry, &pairs, &mut registered) {
-                worth_a_pass = true;
+                urgency = Urgency::Now;
             }
         }
         for (dev, added) in registered {
             self.append_owned(&dev, &added);
         }
-        Ok(worth_a_pass)
+        Ok(urgency)
     }
 
     /// Returns whether this entry was any of our business - registered,
@@ -2499,23 +2525,25 @@ mod state_tests {
 
         // Somebody else's address, learnt out on the wire. Nothing of ours.
         assert!(
-            !s.fast_apply(
+            s.fast_apply(
                 &mut sock,
                 &topo,
                 &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))]
             )
-            .unwrap(),
+            .unwrap()
+                == Urgency::Nothing,
             "learning on the wire that was never ours leaves nothing to reconcile"
         );
 
         // An entry on a bridge that has nothing to do with this uplink.
         assert!(
-            !s.fast_apply(
+            s.fast_apply(
                 &mut sock,
                 &topo,
                 &[(crate::netlink::RTM_NEWNEIGH, learned(22, 20, OTHER_BRIDGE))]
             )
-            .unwrap(),
+            .unwrap()
+                == Urgency::Nothing,
             "another bridge's forwarding is not this uplink's business"
         );
 
@@ -2526,8 +2554,10 @@ mod state_tests {
                 &topo,
                 &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))]
             )
-            .unwrap(),
-            "an address behind the bridge is ours"
+            .unwrap()
+                == Urgency::Now,
+            "an address behind the bridge is ours, and registering it is not \
+             something to sit on"
         );
 
         // A deletion: only a full dump can say whether that was the last copy.
@@ -2537,8 +2567,10 @@ mod state_tests {
                 &topo,
                 &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))]
             )
-            .unwrap(),
-            "a deletion has to be looked at, even though it is not acted on"
+            .unwrap()
+                == Urgency::WhenConvenient,
+            "a deletion has to be looked at - but a table ageing out sends \
+             hundreds, and none of them is urgent"
         );
 
         // One of ours turning up on the wire: unregistered here, reconciled there.
@@ -2551,7 +2583,8 @@ mod state_tests {
                 &topo,
                 &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))]
             )
-            .unwrap(),
+            .unwrap()
+                == Urgency::Now,
             "taking one of ours back out is a change the pass has to see"
         );
         let _ = fs::remove_dir_all(&dir);

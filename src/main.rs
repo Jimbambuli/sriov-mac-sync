@@ -36,6 +36,10 @@ const STATE_DIR: &str = "/run/sriov-mac-sync";
 /// interfaces. Short, because until it answers the daemon is not doing its job
 /// at all; not zero, because a kernel that just refused will refuse again.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
+/// How long a batch that only reported deletions may hold the pass off. Long
+/// enough that a table ageing out is answered once rather than fifty times,
+/// short enough that a filter slot is not held by a guest that left.
+const AGEING_SETTLE: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq)]
 enum Mode {
@@ -834,7 +838,11 @@ fn run() -> Result<bool, String> {
                 // was entirely somebody else's - learning on the wire that
                 // was never ours, entries on unrelated bridges - must not
                 // buy one. Link changes always do.
-                let mut worth_a_pass = events.links_changed;
+                let mut urgency = if events.links_changed {
+                    sync::Urgency::Now
+                } else {
+                    sync::Urgency::Nothing
+                };
                 if let Some(topo) = held.as_ref() {
                     // The whole batch, both kinds. What each means is the
                     // fast path's business: an address learnt behind the
@@ -843,17 +851,17 @@ fn run() -> Result<bool, String> {
                     // is left to the pass that follows - one entry going
                     // does not mean the address is gone.
                     match syncer.fast_apply(&mut sock, topo, &events.fdb) {
-                        Ok(worth) => worth_a_pass |= worth,
+                        Ok(u) => urgency = urgency.max(u),
                         // It could not do its work, so the pass has to.
                         Err(e) => {
                             eprintln!("warning: answering the batch failed: {e}");
-                            worth_a_pass = true;
+                            urgency = sync::Urgency::Now;
                         }
                     }
                 } else {
-                    worth_a_pass = true; // no picture to judge it by
+                    urgency = sync::Urgency::Now; // no picture to judge it by
                 }
-                if !worth_a_pass {
+                if urgency == sync::Urgency::Nothing {
                     // Nothing to reconcile, so nothing is scheduled - and the
                     // name of this batch is not carried into whatever pass
                     // does come next. A pass that runs on the timer has to
@@ -874,7 +882,22 @@ fn run() -> Result<bool, String> {
                 // making anything later than it has to be: at most five
                 // passes a second, the first one immediately when the last
                 // pass is old enough.
-                let due = (last_pass + Duration::from_millis(200)).max(Instant::now());
+                // How long the pass may wait. Registrations and interface
+                // changes get the ordinary rate bound; a batch that only
+                // reported deletions waits longer, because an ageing table
+                // produces those by the hundred and each one would otherwise
+                // buy a dump of the whole table.
+                //
+                // Unless the filter is filling up: entries that should be
+                // gone are then taking room from entries that should be
+                // there, and the list is finite in a way nothing can query.
+                let filling = syncer.registered() * 10 >= opts.max_macs * 9;
+                let wait = if urgency == sync::Urgency::Now || filling {
+                    Duration::from_millis(200)
+                } else {
+                    AGEING_SETTLE
+                };
+                let due = (last_pass + wait).max(Instant::now());
                 next_full = next_full.min(due);
             }
 
