@@ -15,7 +15,7 @@
 # holds 128; other hardware differs and the size cannot be queried.
 #MAX_MACS=128
 
-# Addresses never to register, comma or space separated.
+# Addresses never to register, separated by commas or whitespace.
 #EXCLUDE=""
 
 # Addresses to register unconditionally, for a device that never speaks first.

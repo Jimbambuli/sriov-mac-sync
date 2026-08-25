@@ -106,6 +106,13 @@ fn stopping() -> bool {
 /// wait out the full reconciliation interval.
 fn catch_signals() {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // `sa_sigaction` is the only name libc has for this field on any Linux
+    // target - the C struct puts the one-argument handler and the
+    // three-argument one in a union, and the flags say which of them the
+    // kernel is looking at. No SA_SIGINFO below, so it is the one-argument
+    // one, which is what `note_signal` is. Setting SA_SIGINFO to match the
+    // field's name is what would be wrong: the kernel would then call a
+    // three-argument handler that is not there.
     action.sa_sigaction = note_signal as *const () as libc::sighandler_t;
     action.sa_flags = 0;
     unsafe {
@@ -147,8 +154,8 @@ usage: sriov-mac-sync [options]
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  full reconciliation interval (default 300)
   --max NUM       warn above this many addresses per uplink (default 128)
-  --exclude MACS  comma separated addresses never to register
-  --extra MACS    comma separated addresses to register unconditionally
+  --exclude MACS  addresses never to register, comma or space separated
+  --extra MACS    addresses to register unconditionally, likewise separated
   -v, --verbose   explain what is skipped and why
   -h, --help      this text
       --version   print the version
@@ -158,6 +165,22 @@ itself a virtual function - that ends up in a bridge, following bonds. {CONF} ma
 MAX_MACS, EXCLUDE and EXTRA.
 "
     )
+}
+
+/// The addresses in one `EXTRA`, `EXCLUDE`, `--extra` or `--exclude` value.
+///
+/// Commas or whitespace, in any mixture: somebody who writes
+/// `EXCLUDE=aa:...:ff, 02:...:01` means two addresses, and so does somebody
+/// whose editor put a tab between them. Splitting on the comma and the space
+/// alone made the tab part of the address, and then the whole thing was "not
+/// an address, ignored" - the address they meant never excluded, over a
+/// character they cannot see. `PAIRS` has always taken any whitespace; these
+/// now do too.
+fn addresses(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Addresses from the command line or the configuration file. A typo here
@@ -242,18 +265,8 @@ fn load_conf(opts: &mut Options) {
                 Ok(v) => opts.max_macs = v,
                 Err(_) => eprintln!("warning: {CONF}: MAX_MACS is not a number, ignored: {value}"),
             },
-            "EXTRA" => opts.extra.extend(
-                value
-                    .split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
-            "EXCLUDE" => opts.exclude.extend(
-                value
-                    .split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
+            "EXTRA" => opts.extra.extend(addresses(value)),
+            "EXCLUDE" => opts.exclude.extend(addresses(value)),
             // Silently ignoring a misspelt key means the setting somebody
             // wrote down never takes effect and nothing ever says so.
             other => eprintln!("warning: {CONF}: unknown setting, ignored: {other}"),
@@ -317,20 +330,14 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                     .parse()
                     .map_err(|_| "--max needs a number")?
             }
-            "--extra" => opts.extra.extend(
-                args.next()
-                    .ok_or("--extra needs addresses")?
-                    .split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
-            "--exclude" => opts.exclude.extend(
-                args.next()
-                    .ok_or("--exclude needs addresses")?
-                    .split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            ),
+            "--extra" => {
+                let value = args.next().ok_or("--extra needs addresses")?;
+                opts.extra.extend(addresses(&value));
+            }
+            "--exclude" => {
+                let value = args.next().ok_or("--exclude needs addresses")?;
+                opts.exclude.extend(addresses(&value));
+            }
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -1049,6 +1056,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.pairs, vec!["nic0:vmbr0", "nic1:vmbr1"]);
+    }
+
+    /// The separator between two addresses is a comma or whitespace of any
+    /// kind. A tab used to end up inside the address, which then parsed as
+    /// nothing and was dropped with a warning about a character nobody can
+    /// see - and the address somebody wrote down was never excluded.
+    #[test]
+    fn addresses_are_separated_by_commas_or_any_whitespace() {
+        let one = "02:00:00:00:00:01";
+        let two = "02:00:00:00:00:02";
+        for value in [
+            format!("{one},{two}"),
+            format!("{one}, {two}"),
+            format!("{one}\t{two}"),
+            format!("{one} ,\t {two}"),
+            format!("  {one}   {two}  "),
+        ] {
+            let mut o = Options::default();
+            parse_args_from(&mut o, args(&["--exclude", &value]).into_iter()).unwrap();
+            assert_eq!(o.exclude, vec![one, two], "{value:?} did not split");
+            assert_eq!(
+                macs("--exclude", &o.exclude).len(),
+                2,
+                "{value:?} split but did not parse"
+            );
+        }
     }
 
     #[test]

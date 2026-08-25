@@ -4,7 +4,7 @@
 use crate::hash::{Map, Set};
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -163,6 +163,16 @@ pub struct Syncer {
     /// Devices whose note could not be read. Not "owns nothing" - nothing may
     /// overwrite or unlink one of these.
     unreadable: std::cell::RefCell<Set<String>>,
+    /// Devices whose lock file could not be opened, already said once. The
+    /// note is still written, unlocked; what this stops is a line about it on
+    /// every address of every burst.
+    lock_warned: std::cell::RefCell<Set<String>>,
+    /// Whether the state directory has been looked at this run. Its mode is
+    /// only ours to decide when we are the ones who made it, and the one in
+    /// /run outlives the process: a run under an older build, or under a
+    /// umask that let it through wide open, leaves it that way for this run
+    /// to write into. Looked at once, on the first write.
+    dir_checked: std::cell::Cell<bool>,
     /// Pinned addresses already warned about, per uplink, so the warning
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
@@ -315,6 +325,8 @@ impl Syncer {
             absent_since: crate::hash::map(),
             warned_unknown_vf: crate::hash::set(),
             unreadable: std::cell::RefCell::new(crate::hash::set()),
+            lock_warned: std::cell::RefCell::new(crate::hash::set()),
+            dir_checked: std::cell::Cell::new(false),
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -331,6 +343,58 @@ impl Syncer {
 
     fn state_path(&self, dev: &str) -> PathBuf {
         self.state_dir.join(format!("{dev}.owned"))
+    }
+
+    /// The directory the notes live in, made if it is not there - and made
+    /// reachable by nobody but the user that runs this.
+    ///
+    /// `create_dir_all` asks for 0777 and lets the process umask take bits
+    /// off it, so the mode of this directory would be decided by whatever the
+    /// daemon happened to be started with. A umask of 0 - which is what a
+    /// process started by a unit that does not set one inherits on some
+    /// systems - leaves it writable by everybody, and then any local user can
+    /// replace a note, or put a symlink where one goes and have this daemon,
+    /// which is root, write through it. 0700 is asked for outright.
+    ///
+    /// A directory that is already there is looked at rather than trusted,
+    /// because it outlives the process that made it: the packaged unit keeps
+    /// it across restarts on purpose, so a directory made by an older build,
+    /// or by a hand, is the one this run writes into.
+    ///
+    /// What is narrowed is a directory another user may *write*, which is the
+    /// one that decides what a root daemon does. One others may only read is
+    /// left alone: that is what `RuntimeDirectory=` in the unit produces -
+    /// 0755, made by systemd, reset by it on every start - and a daemon that
+    /// changed it back on every start would be a warning a day and an
+    /// argument it cannot win. The notes themselves are 0600 either way, so
+    /// there is nothing to read through it.
+    fn ensure_state_dir(&self) -> io::Result<()> {
+        // `recursive` returns Ok for a directory that was already there, and
+        // leaves its mode alone - hence the check that follows.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.state_dir)?;
+        let meta = fs::metadata(&self.state_dir)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            match fs::set_permissions(&self.state_dir, perms) {
+                Ok(()) => eprintln!(
+                    "warning: {} was mode {mode:o}, which lets other users put \
+                     what they like where the ownership notes go - narrowed to 700",
+                    self.state_dir.display()
+                ),
+                Err(e) => eprintln!(
+                    "warning: {} is mode {mode:o} and cannot be narrowed: {e} - \
+                     another user can replace the ownership notes, and so decide \
+                     what this removes from a card",
+                    self.state_dir.display()
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// What this daemon put there itself. Kept on disk so a restart does not
@@ -366,7 +430,24 @@ impl Syncer {
         };
         if !usable {
             let set = self.read_owned(dev);
-            self.remember(dev, &set);
+            if self.note_is_readable(dev) {
+                self.remember(dev, &set);
+            } else {
+                // The read failed, and what `read_owned` returns then is an
+                // empty set that means "could not tell", not "owns nothing".
+                // Remembering it would be worse than the failure: the copy is
+                // believed for as long as the file's identity, size and
+                // timestamp do not change, and a file this could not read is
+                // a file nothing changed - so one unreadable moment would be
+                // taken as the answer for good, long after whatever caused it
+                // had gone. Every entry the note names would stay in the card
+                // with nothing on record saying it is ours, which is the
+                // orphan the notes exist to prevent.
+                //
+                // Nothing on record instead, so the next look reads the file
+                // again and the device comes back the moment it can be read.
+                self.notes.borrow_mut().remove(dev);
+            }
         }
         match self.notes.borrow().get(dev) {
             Some(note) => f(&note.macs),
@@ -428,16 +509,26 @@ impl Syncer {
                 // --flush and the orphan sweep would unlink it - in every
                 // case abandoning entries that are still in the card with
                 // nothing left to say they are ours.
-                eprintln!(
-                    "warning: cannot read {}: {e} - leaving that device alone \
-                     until it can be read",
-                    self.state_path(dev).display()
-                );
-                self.unreadable.borrow_mut().insert(dev.to_string());
+                // Said when it starts, not on every attempt: the file is
+                // read again on every look for as long as it cannot be read -
+                // that is what stops one bad moment becoming permanent - and
+                // a look happens per batch of learning.
+                if self.unreadable.borrow_mut().insert(dev.to_string()) {
+                    eprintln!(
+                        "warning: cannot read {}: {e} - leaving that device alone \
+                         until it can be read",
+                        self.state_path(dev).display()
+                    );
+                }
                 return set;
             }
         }
-        self.unreadable.borrow_mut().remove(dev);
+        if self.unreadable.borrow_mut().remove(dev) {
+            eprintln!(
+                "{}: readable again, {dev} is back in the reckoning",
+                self.state_path(dev).display()
+            );
+        }
         set
     }
 
@@ -458,24 +549,50 @@ impl Syncer {
     /// up because it iterates the notes.
     fn locked<R>(&self, dev: &str, f: impl FnOnce() -> R) -> R {
         use std::os::fd::AsRawFd;
+        // Every write to a note goes through here, so this is where the
+        // directory holding them gets its one look per run. An error is not
+        // reported here: whatever it was, the open below runs into it too and
+        // says so with the name of the file somebody is waiting on.
+        if !self.dir_checked.replace(true) {
+            let _ = self.ensure_state_dir();
+        }
         let path = self.state_dir.join(format!(".{dev}.owned.lock"));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .or_else(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    fs::create_dir_all(&self.state_dir)?;
-                    fs::OpenOptions::new().create(true).append(true).open(&path)
-                } else {
-                    Err(e)
-                }
-            });
-        let Ok(file) = file else {
+        let open = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+        };
+        let file = open().or_else(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                self.ensure_state_dir()?;
+                open()
+            } else {
+                Err(e)
+            }
+        });
+        let file = match file {
+            Ok(file) => file,
             // No lock to be had. Carrying on unlocked is what this did
             // before there was a lock at all; refusing to write would strand
-            // whatever was just registered.
-            return f();
+            // whatever was just registered - so the note still gets written,
+            // and this says what it was written without.
+            //
+            // Once per device: this sits on the path a burst of learning
+            // takes, and a line per batch would bury the one that matters.
+            // A permission or a read-only filesystem does not come and go.
+            Err(e) => {
+                if self.lock_warned.borrow_mut().insert(dev.to_string()) {
+                    eprintln!(
+                        "warning: cannot lock {}: {e} - writing the ownership \
+                         note for {dev} unlocked, so a --once or --flush run by \
+                         hand at the same moment can lose entries from it",
+                        path.display()
+                    );
+                }
+                return f();
+            }
         };
         let fd = file.as_raw_fd();
         unsafe { libc::flock(fd, libc::LOCK_EX) };
@@ -547,19 +664,36 @@ impl Syncer {
         // running; two of them sharing one temporary file means one truncates
         // what the other is writing and then renames it into place, and the
         // note that results is neither's.
+        // 0600 rather than what `fs::write` asks for, which is 0666 with the
+        // process umask taken off it: the note the rename leaves behind keeps
+        // the mode of the temporary file it came from, and a note other users
+        // may write is a note that decides what this daemon takes out of a
+        // card. The directory is 0700 as well; this is the second lock on the
+        // same door, for the case where the directory was made by something
+        // else.
+        let put = |tmp: &PathBuf| -> io::Result<()> {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(tmp)?
+                .write_all(text.as_bytes())
+        };
         let write = || -> io::Result<()> {
             let tmp = self
                 .state_dir
                 .join(format!(".{dev}.owned.{}.tmp", std::process::id()));
-            if let Err(e) = fs::write(&tmp, &text) {
+            if let Err(e) = put(&tmp) {
                 // The directory is created by the unit and survives a
                 // restart; asking for it on every write was a syscall per
                 // write for a thing that is already there.
                 if e.kind() != io::ErrorKind::NotFound {
                     return Err(e);
                 }
-                fs::create_dir_all(&self.state_dir)?;
-                fs::write(&tmp, &text)?;
+                self.ensure_state_dir()?;
+                put(&tmp)?;
             }
             fs::rename(&tmp, self.state_path(dev)).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
@@ -631,8 +765,12 @@ impl Syncer {
             .open(&path)
             .or_else(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
-                    fs::create_dir_all(&self.state_dir)?;
-                    fs::OpenOptions::new().create(true).append(true).open(&path)
+                    self.ensure_state_dir()?;
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .open(&path)
                 } else {
                     Err(e)
                 }
@@ -1901,6 +2039,151 @@ mod state_tests {
             after.load_owned("nic0").is_empty(),
             "an uplink with no note owns nothing"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The notes decide what this daemon takes back out of a card, and the
+    /// daemon is root. A note another user may write is a note another user
+    /// may use to have root remove entries - or, through a symlink in a
+    /// directory they may write, to have root write somewhere else entirely.
+    /// The mode is asked for rather than left to whatever umask the daemon
+    /// was started with.
+    #[test]
+    fn the_notes_are_out_of_other_users_reach() {
+        let dir = scratch("modes");
+        let mut set = crate::hash::set();
+        set.insert(BEHIND_NIC);
+
+        // The umask is the whole point: `create_dir_all` and `fs::write` ask
+        // for 0777 and 0666 and let it take bits off, so on a host whose
+        // daemon was started without one they got everything they asked for.
+        // Nought here, so this test is about the code rather than about the
+        // umask whoever runs it happens to have.
+        let was = unsafe { libc::umask(0) };
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the directory is reachable by others");
+        assert_eq!(
+            mode(&dir.join("nic1.owned")),
+            0o600,
+            "the note is readable, or writable, by others"
+        );
+
+        // A directory left behind by an older run, or by a hand, is not one
+        // we chose the mode of - so it is looked at rather than trusted.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let later = Syncer::new(Vec::new(), dir.clone());
+        later.save_owned("nic2", &set);
+        assert_eq!(
+            mode(&dir),
+            0o700,
+            "a world-writable state directory was left as it was found"
+        );
+
+        // What `RuntimeDirectory=` in the unit makes, and remakes on every
+        // start. Others may read it and the notes in it are 0600, so there is
+        // nothing to take; changing it back every start would be a warning a
+        // day and an argument with systemd that this cannot win.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let later = Syncer::new(Vec::new(), dir.clone());
+        later.save_owned("nic3", &set);
+        assert_eq!(
+            mode(&dir),
+            0o755,
+            "the mode systemd gives this directory was fought over"
+        );
+        unsafe { libc::umask(was) };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A note that cannot be read means "could not tell", and the daemon
+    /// leaves that device alone until it can. What it must not do is decide
+    /// that once: the copy in memory is believed for as long as the file's
+    /// identity, size and timestamp do not change, and a file that could not
+    /// be read is a file nothing changed - so remembering the empty set that
+    /// a failed read returns would make one bad moment permanent, and every
+    /// entry the note names would stay in the card owned by nobody.
+    #[test]
+    fn a_note_that_could_not_be_read_is_not_remembered_as_an_empty_one() {
+        let dir = scratch("unreadable");
+        let mut set = crate::hash::set();
+        set.insert(BEHIND_NIC);
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        assert_eq!(s.load_owned("nic1"), set);
+
+        // A directory where the note should be: reading it fails, and not
+        // with "it is not there" - which is the one failure that does mean
+        // "owns nothing".
+        let path = dir.join("nic1.owned");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let s = Syncer::new(Vec::new(), dir.clone());
+        assert!(s.load_owned("nic1").is_empty());
+        assert!(!s.note_is_readable("nic1"), "the failure went unnoticed");
+        assert!(
+            s.notes.borrow().get("nic1").is_none(),
+            "an unreadable note was remembered as an empty one, which is the \
+             answer this device would then have for good"
+        );
+
+        // And the moment it can be read, it is read.
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, format!("{}\n", format_mac(&BEHIND_NIC))).unwrap();
+        assert_eq!(s.load_owned("nic1"), set);
+        assert!(s.note_is_readable("nic1"));
+
+        // The same file, unchanged, unreadable for a moment and readable
+        // again - the case the remembered copy would otherwise answer for.
+        // Only reachable as somebody who is not root.
+        if unsafe { libc::geteuid() } != 0 {
+            let s = Syncer::new(Vec::new(), dir.clone());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(s.load_owned("nic1").is_empty());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                s.load_owned("nic1"),
+                set,
+                "the note came back and this went on believing it was empty"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A lock that cannot be taken is not a reason to drop what was just
+    /// registered on the floor - the note is still written. It is a reason to
+    /// say so: unlocked is how entries got lost to a `--flush` run by hand at
+    /// the wrong moment, and that is not something to find out about from the
+    /// symptom.
+    #[test]
+    fn a_lock_that_cannot_be_taken_is_said_once_and_the_note_still_written() {
+        let dir = scratch("lockless");
+        fs::create_dir_all(&dir).unwrap();
+        // Something where the lock file goes, that opening cannot get past
+        // and that is not "it is not there".
+        fs::create_dir(dir.join(".nic1.owned.lock")).unwrap();
+
+        let mut set = crate::hash::set();
+        set.insert(BEHIND_NIC);
+        let s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned("nic1", &set);
+        assert_eq!(
+            s.load_owned("nic1"),
+            set,
+            "the note was not written, so what was registered has no owner"
+        );
+        assert!(
+            s.lock_warned.borrow().contains("nic1"),
+            "the note was written unlocked and nothing said so"
+        );
+
+        // Said once. This sits on the path a burst of learning takes, and the
+        // reasons an open fails do not come and go.
+        set.insert(BEHIND_GUEST);
+        s.save_owned("nic1", &set);
+        assert_eq!(s.lock_warned.borrow().len(), 1);
+        assert_eq!(s.load_owned("nic1"), set);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -44,6 +44,12 @@ UMask=0077
 # stops cleaning up after itself. /run is a tmpfs, so a reboot still clears
 # it - which is right, the card's filter is empty by then too.
 RuntimeDirectory=sriov-mac-sync
+# 0700 rather than the 0755 this defaults to. Nothing else has any business
+# reading which addresses are registered, and a directory no other user may
+# write is one no other user can put a symlink in for a root daemon to write
+# through. The daemon narrows a directory it finds writable by others anyway;
+# this means it never finds one.
+RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 PrivateTmp=yes
 

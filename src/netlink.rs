@@ -178,6 +178,14 @@ pub struct Socket {
     /// an allocation and a walk over n bytes to zero them - paid on every
     /// notification batch, every dump attempt and every acknowledgement. It
     /// only ever grows, to whatever the largest answer needed.
+    ///
+    /// It is deliberately not shrunk afterwards. What it grows to is not a
+    /// spike that passed: it is the size of this host's forwarding table in
+    /// one datagram, which the next dump asks for again in five minutes.
+    /// Giving it back means finding it out again the only way there is - a
+    /// dump that overruns, is thrown away, and is asked for a second time -
+    /// on a host large enough for that to be the expensive case. The ceiling
+    /// on the growing is what keeps this bounded, and it is in `dump_into`.
     buf: Vec<u8>,
     fd: OwnedFd,
     seq: u32,

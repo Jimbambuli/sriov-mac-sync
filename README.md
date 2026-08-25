@@ -409,6 +409,9 @@ N vlan 22`) or by the guest itself when the VF is trusted.
 
 **This daemon only removes what it added.** It keeps a note in
 `/run/sriov-mac-sync/`; entries put there by something else are left alone.
+The notes are written 0600 and the directory is 0700 - a note another user can
+write is a note that decides what a root daemon takes out of a card, and the
+unit asks systemd for the same mode.
 The note outlives the pair it was made for on purpose: when a device stops
 being an uplink - the bridge is taken apart, the port moves elsewhere - what
 was registered for it is taken back out. Left in place it would go on telling

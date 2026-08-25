@@ -26,9 +26,17 @@
 //! learns the seed can still construct collisions - but it is the difference
 //! between an attack anybody can copy from a blog post and one that needs the
 //! contents of this process's memory.
+//!
+//! The pool is asked without waiting, because a daemon that waits here waits
+//! in the middle of the boot it was ordered into - and at that point in a
+//! boot the pool is the one thing that may not be ready yet. So a refusal
+//! falls through to what the kernel handed this process at exec and to what
+//! this start differs in, rather than to a constant: weaker than the pool,
+//! and still not the same number on every host in the fleet.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The odd 64-bit constant rustc's FxHash uses: 2^64 / phi, rounded to odd.
@@ -44,29 +52,99 @@ fn seed() -> u64 {
     if existing != 0 {
         return existing;
     }
-    let mut bytes = [0u8; 8];
-    let got = unsafe {
-        libc::getrandom(
-            bytes.as_mut_ptr() as *mut libc::c_void,
-            bytes.len(),
-            libc::GRND_NONBLOCK,
-        )
-    };
-    // A kernel that will not hand out randomness leaves the seed at a fixed
-    // value rather than a weak one: the daemon still works, it simply has the
-    // predictability this is meant to remove. It has never been seen to
-    // happen outside early boot.
-    let fresh = if got == bytes.len() as isize {
-        u64::from_ne_bytes(bytes) | 1
-    } else {
-        MULTIPLIER
-    };
+    let fresh = fresh_seed();
     // First writer wins; everyone else takes what is there. Two hashers in
     // one process must never disagree about where a key belongs.
     match SEED.compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed) {
         Ok(_) => fresh,
         Err(already) => already,
     }
+}
+
+/// `AT_RANDOM`: the address of sixteen bytes the kernel puts on the initial
+/// stack for every process it starts. The number is the same on every
+/// architecture Linux has, and libc does not export it.
+const AT_RANDOM: libc::c_ulong = 25;
+
+/// This process's seed, from the first source that answers.
+///
+/// The seed is chosen once and then never changes, so there is no second
+/// chance at it: whatever this returns is what the daemon hashes with until
+/// it exits. That is why a source that will not answer has to fall through
+/// to another one rather than to a constant. A daemon started by systemd at
+/// boot - which is how this one is started - can easily ask before the
+/// kernel's pool is initialised, and that used to leave every host in the
+/// fleet hashing with the same arrangement: exactly the thing a guest behind
+/// the bridge gets to aim at.
+fn fresh_seed() -> u64 {
+    if let Some(n) = from_getrandom() {
+        return n | 1;
+    }
+    // The pool is not ready. What is left is not as good - the bytes the
+    // kernel handed this process at exec came from the same pool, and a
+    // clock at boot is a narrow range - but between them they differ from
+    // one process to the next, which the constant did not.
+    (from_auxv() ^ from_the_moment()) | 1
+}
+
+/// Eight bytes from the kernel, if it has any to give without waiting.
+///
+/// `GRND_NONBLOCK` rather than a wait: a daemon that blocks here blocks the
+/// boot it was ordered into. The failure it buys is handled above.
+fn from_getrandom() -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    let mut got = 0;
+    while got < bytes.len() {
+        let n = unsafe {
+            libc::getrandom(
+                bytes[got..].as_mut_ptr() as *mut libc::c_void,
+                bytes.len() - got,
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if n > 0 {
+            got += n as usize;
+        } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    Some(u64::from_ne_bytes(bytes))
+}
+
+/// The bytes the kernel put on the stack when it started this process.
+///
+/// Drawn from the same pool `getrandom` refused from, so at early boot they
+/// are no better than it is - but they are drawn per process, so two daemons
+/// on two hosts do not get the same ones.
+fn from_auxv() -> u64 {
+    let at = unsafe { libc::getauxval(AT_RANDOM) } as *const u8;
+    if at.is_null() {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    // Sixteen bytes, valid for as long as the process is. Eight are taken.
+    unsafe { std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), bytes.len()) };
+    u64::from_ne_bytes(bytes)
+}
+
+/// Whatever this particular start differs in: two clocks, the process id and
+/// an address the loader placed. None of it is secret and none of it is
+/// worth much on its own; the point is only that it is not a constant.
+fn from_the_moment() -> u64 {
+    let mut mono: libc::timespec = unsafe { std::mem::zeroed() };
+    let mut real: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono);
+        libc::clock_gettime(libc::CLOCK_REALTIME, &mut real);
+    }
+    let stack = &mono as *const libc::timespec as u64;
+    (mono.tv_nsec as u64).rotate_left(17)
+        ^ (real.tv_nsec as u64).rotate_left(31)
+        ^ (real.tv_sec as u64)
+        ^ stack.rotate_left(43)
+        ^ (std::process::id() as u64).rotate_left(7)
 }
 
 #[derive(Clone, Copy)]
@@ -214,5 +292,39 @@ mod tests {
             a, unseeded,
             "the hash has to depend on the seed, or seeding it changed nothing"
         );
+    }
+
+    /// The seed is chosen once and never again, so the path taken when the
+    /// kernel's pool is not ready yet - a daemon started at boot - decides
+    /// the arrangement for that whole process's life. It used to be a
+    /// constant, which is to say the same arrangement on every host that
+    /// started early. Whatever it is now, it has to differ between starts.
+    #[test]
+    fn the_seed_without_the_pool_still_differs_between_starts() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert((super::from_auxv() ^ super::from_the_moment()) | 1);
+        }
+        assert!(
+            seen.len() > 1,
+            "the fallback seed was the same every time: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&MULTIPLIER),
+            "the fallback seed is the constant an attacker reproduces at home"
+        );
+        assert!(
+            !seen.contains(&0),
+            "a seed of zero hashes everything to zero"
+        );
+    }
+
+    /// Whatever the seed came from, a hasher built from it has to hash - the
+    /// odd bit matters, since an even multiplier throws away a bit of the
+    /// state on every step and a zero one throws away all of it.
+    #[test]
+    fn the_seed_is_odd_whichever_source_gave_it() {
+        assert_eq!(super::fresh_seed() & 1, 1);
+        assert_eq!(super::seed() & 1, 1);
     }
 }
