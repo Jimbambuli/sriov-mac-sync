@@ -633,6 +633,15 @@ fn run() -> Result<bool, String> {
             // A deadline, not a sleep. Wake-ups that turn out to be none of our
             // business must not push the full pass further away.
             let mut next_full = Instant::now();
+            // When the picture is next read afresh regardless of what
+            // anybody says. Held apart from `next_full`, which only bounds
+            // how often a pass may run: the refresh used to be gated on the
+            // pass calling itself "timed", and every batch renames the pass -
+            // so on a host whose bridges age entries, which is every host,
+            // the condition stopped being true and the daemon never
+            // self-corrected. The `[timed]` line the trial looks for
+            // disappeared with it.
+            let mut next_refresh = Instant::now();
             // Which of the three reasons for a pass actually produced work is
             // the only way to tell whether the timed one earns its keep.
             let mut trigger = "start";
@@ -670,18 +679,18 @@ fn run() -> Result<bool, String> {
                 if stopping() {
                     break;
                 }
+                // The refresh exists to catch what the events missed, an
+                // interface change whose notification never arrived included.
+                // It believes nothing it was told, and it brings the pass
+                // forward so that what it reads is acted on.
+                if Instant::now() >= next_refresh {
+                    stale = true;
+                    syncer.vf_stale = true;
+                    trigger = "timed";
+                    next_full = next_full.min(Instant::now());
+                    next_refresh = Instant::now() + interval;
+                }
                 if Instant::now() >= next_full {
-                    // The timed pass exists to catch what the events missed,
-                    // an interface change whose notification never arrived
-                    // included. It reads afresh - and the flag is set here,
-                    // where the reason for this pass is known, not after one
-                    // where it only says what the next would be called.
-                    if trigger == "timed" {
-                        stale = true;
-                        // The timed pass exists to find what the events
-                        // missed, so it believes nothing it was told.
-                        syncer.vf_stale = true;
-                    }
                     // Autodetection is redone every pass. A NIC that gets its
                     // VFs later, or a bridge built after boot, must not need a
                     // restart to be noticed - and starting before the network
@@ -763,7 +772,9 @@ fn run() -> Result<bool, String> {
                     trigger = "timed";
                 }
 
-                let due = next_full.saturating_duration_since(Instant::now());
+                let due = next_full
+                    .min(next_refresh)
+                    .saturating_duration_since(Instant::now());
                 let woken = match mon.wait(due.as_millis().min(i32::MAX as u128) as i32) {
                     Ok(w) => w,
                     Err(e) => {
