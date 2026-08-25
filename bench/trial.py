@@ -35,6 +35,7 @@ Honesty notes, so the numbers are read for what they are:
 
 import argparse
 import atexit
+import json
 import os
 import re
 import select
@@ -231,7 +232,7 @@ def fdb_residue():
     ]
 
 
-def learn_on(dev, mac):
+def learn_on(dev, mac, vlan=None):
     """Make the bridge believe it learnt an address on a port of our choosing.
 
     A `dynamic` entry is what learning produces - not permanent, not self -
@@ -239,27 +240,68 @@ def learn_on(dev, mac):
     from the real thing. This is how the wire side is reachable at all in a
     trial that has only one host: an address that turns up on the uplink's own
     port is what a guest migrating away looks like from here, and there is no
-    other way to produce one without a second machine sending frames."""
-    run(["bridge", "fdb", "add", mac_str(mac), "dev", dev, "master", "dynamic"])
+    other way to produce one without a second machine sending frames.
+
+    With a VLAN, in the VLAN: on a vlan-aware bridge an entry added without
+    one goes in through the vid-0 path and lands in every VLAN the port has -
+    twenty-two of them on the host this was written for, which is a far larger
+    footprint than the test needs and a far larger one to clean up."""
+    # `replace`, not `add`: within a VLAN the address is already on the port
+    # the guest is behind, and moving it is exactly what a guest that migrated
+    # away looks like. `add` is refused with EEXIST, which is how this scenario
+    # first appeared to fail against a daemon that was right.
+    cmd = ["bridge", "fdb", "replace", mac_str(mac), "dev", dev, "master", "dynamic"]
+    if vlan is not None:
+        cmd += ["vlan", str(vlan)]
+    run(cmd)
 
 
-def unlearn_on(dev, mac):
-    run(["bridge", "fdb", "del", mac_str(mac), "dev", dev, "master"])
+def unlearn_on(dev, mac, vlan=None):
+    cmd = ["bridge", "fdb", "del", mac_str(mac), "dev", dev, "master"]
+    if vlan is not None:
+        cmd += ["vlan", str(vlan)]
+    run(cmd)
+
+
+def admin_vf_address(pf, index):
+    """The address set for a virtual function *from the host* - which is a
+    different field from the netdev's own address, and normally unset.
+
+    Restoring the wrong one is how a benchmark leaves a host changed: writing
+    a netdev address back through `ip link set <pf> vf N mac` pins an
+    administrative address where there was none, which survives the run and
+    can stop a guest later given that function from setting its own."""
+    out = run(["ip", "-j", "-d", "link", "show", pf]).stdout
+    try:
+        info = json.loads(out)[0].get("vfinfo_list", [])
+    except (ValueError, IndexError):
+        return None
+    for vf in info:
+        if vf.get("vf") == index:
+            return vf.get("address")
+    return None
 
 
 def free_virtual_function(uplink):
-    """A virtual function of the uplink's own physical function that nothing
-    is using: bound on the host (so not handed to a guest), not the uplink,
-    and not a port of any bridge. Its address can be borrowed for a moment.
+    """A virtual function nothing is using, whose address can be borrowed for
+    a moment: bound on the host (so not handed to a guest), not the uplink
+    itself, in no bridge, administratively down, with no addresses and nothing
+    stacked on it.
 
-    None when there is no such function, which is the ordinary case on a host
-    whose functions are all in guests - the scenario then says so and is
-    skipped rather than failed."""
-    pf_link = f"/sys/class/net/{uplink}/device/physfn"
-    if not os.path.isdir(pf_link):
+    Looks both ways - at the uplink's own physical function when the uplink is
+    a VF, and at the uplink itself when it is a PF. Only looking sideways made
+    this scenario skip itself, silently, on every host whose uplink is a
+    physical function.
+
+    None when there is no such function - the ordinary case on a host whose
+    functions are all in guests. The scenario then says so and is skipped
+    rather than failed."""
+    here = f"/sys/class/net/{uplink}/device"
+    physfn = f"{here}/physfn"
+    pf_dir = os.path.realpath(physfn) if os.path.isdir(physfn) else os.path.realpath(here)
+    if not os.path.isdir(f"{pf_dir}/net"):
         return None
-    pf_dir = os.path.realpath(pf_link)
-    pf_names = os.listdir(f"{pf_dir}/net") if os.path.isdir(f"{pf_dir}/net") else []
+    pf_names = os.listdir(f"{pf_dir}/net")
     if not pf_names:
         return None
     pf = pf_names[0]
@@ -271,12 +313,20 @@ def free_virtual_function(uplink):
         if not os.path.isdir(net):
             continue  # handed to a guest; not ours to touch
         for name in os.listdir(net):
-            if name == uplink:
+            if name == uplink or name == pf:
                 continue
-            if os.path.exists(f"/sys/class/net/{name}/master"):
-                continue  # in a bridge; somebody is using it
-            current = read(f"/sys/class/net/{name}/address")
-            return pf, index, name, current
+            base = f"/sys/class/net/{name}"
+            if os.path.exists(f"{base}/master"):
+                continue  # in a bridge
+            if "UP" in read(f"{base}/flags_str") if os.path.exists(f"{base}/flags_str") else False:
+                continue
+            if read(f"{base}/operstate") == "up":
+                continue  # carrying traffic for somebody
+            if any(e.startswith("upper_") for e in os.listdir(base)):
+                continue  # a macvtap or vlan sits on it
+            if run(["ip", "-j", "addr", "show", "dev", name]).stdout.count('"local"'):
+                continue  # it answers on an address of its own
+            return pf, index, name, admin_vf_address(pf, index)
     return None
 
 
@@ -553,18 +603,21 @@ class Trial:
                          "the address was never registered, so nothing could "
                          "be reflected - see S1")
             return
+        # One uplink, not all of them: an address on this uplink's wire is
+        # behind the bridge as far as a second uplink of the same bridge is
+        # concerned, and registered there quite correctly. Requiring it gone
+        # everywhere would fail a daemon doing the right thing.
+        uplink = self.uplinks[0]
         t0 = time.monotonic_ns()
-        for u in self.uplinks:
-            learn_on(u, mac)
+        learn_on(uplink, mac, self.args.vlan)
         deadline = t0 + 5_000_000_000
         gone = False
         while time.monotonic_ns() < deadline and not gone:
             mon.pump(time.monotonic_ns() + 100_000_000)
-            gone = all(mac_str(mac) not in self_macs(u) for u in self.uplinks)
+            gone = mac_str(mac) not in self_macs(uplink)
         took = (time.monotonic_ns() - t0) / 1e6
-        noted_gone = all(mac_str(mac).encode() not in note_bytes(u) for u in self.uplinks)
-        for u in self.uplinks:
-            unlearn_on(u, mac)
+        noted_gone = mac_str(mac).encode() not in note_bytes(uplink)
+        unlearn_on(uplink, mac, self.args.vlan)
         self.verdict(
             "wire reflection", gone and noted_gone,
             f"unregistered {took:.1f} ms after the address appeared on the "
@@ -594,6 +647,10 @@ class Trial:
                          "physical function is free to borrow an address from")
             return
         pf, index, vf_name, original = found
+        # `None` means the driver reports no administrative address for it;
+        # putting the netdev's own address there instead would pin one where
+        # there was none, which survives the run.
+        original = original or "00:00:00:00:00:00"
         mac = self.macs(1)[0]
         cleanup_vf = (pf, index, original)
         self.cleanup.vf_address = cleanup_vf
@@ -623,7 +680,16 @@ class Trial:
         registered = mac_str(mac) in self_macs(uplink)
 
         run(["ip", "link", "set", pf, "vf", str(index), "mac", original])
+        restored = admin_vf_address(pf, index)
         self.cleanup.vf_address = None
+        if restored != original:
+            self.verdict(
+                "virtual function address", False,
+                f"{pf} vf {index} was left at {restored} instead of {original} - "
+                f"put it back by hand with `ip link set {pf} vf {index} mac "
+                f"{original}`")
+            purge_learned_residue()
+            return
         if registered:
             run(["bridge", "fdb", "del", mac_str(mac), "dev", uplink, "self", "permanent"])
         purge_learned_residue()
