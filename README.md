@@ -3,6 +3,56 @@
 Make hosts that sit *behind* a Linux bridge reachable from an SR-IOV virtual
 function.
 
+## Is this your problem?
+
+- A guest with a VF passed through reaches everything on the physical switch,
+  but not a container, a second VM, or a device on another NIC in the same
+  host.
+- Ping to those peers times out. Nothing is logged, nothing is dropped by a
+  firewall you can find.
+- ARP or ND for the very same address resolves fine, which is what makes it
+  look like an MTU or filtering problem. It is neither.
+- `tcpdump` on the uplink shows the frame leaving on the wire, addressed to
+  something that is not out there.
+
+That is the NIC's internal switch — a VEB — missing on an address it has never
+been told about, and sending the frame out of the physical port because that is
+what a miss does. The fix is to put the address in the uplink's unicast filter.
+Keeping that filter in step with everything the bridge learns, as it changes,
+is what this daemon does.
+
+Confirmed on this hardware — the daemon is driver-agnostic, and this is where
+the failure and the fix were reproduced end to end:
+
+| NIC | driver |
+|---|---|
+| Mellanox ConnectX-4 Lx | `mlx5_core` |
+| Mellanox ConnectX-3 Pro | `mlx4_core` |
+| Intel 82599ES | `ixgbe` |
+| Intel X710 | `i40e` |
+
+None of these can present a virtual function as a real bridge port, which is
+the proper answer where the hardware has it: `ixgbe`, `i40e` and `mlx4` have no
+switchdev mode to switch to, and the ConnectX-4 Lx refuses the switch. See
+[What this is not](#what-this-is-not).
+
+## Quickstart
+
+The released binary is statically linked and needs nothing on the target:
+
+```
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync
+install -m 755 sriov-mac-sync /usr/local/sbin/
+
+sriov-mac-sync --check              does this NIC accept filter entries at all?
+sriov-mac-sync --once --dry-run     what would be registered, and why
+```
+
+If `--check` passes and `--dry-run` names the addresses you expected, install
+the unit and let it run — see [Build and install](#build-and-install). If it
+does not, [Verify it actually works](#verify-it-actually-works) says how to
+tell the two failure modes apart.
+
 ## The problem
 
 You pass a VF to a VM — a router, a firewall, anything that has to talk to the
@@ -304,19 +354,11 @@ How the pass scales with the size of the forwarding table is a question for
 topology, a share of entries out on the wire, asserted to stay roughly
 linear (measured: 40x the entries cost 28x the time).
 
-Measured working:
-
-| NIC | driver |
-|---|---|
-| Mellanox ConnectX-4 Lx | `mlx5_core` |
-| Mellanox ConnectX-3 Pro | `mlx4_core` |
-| Intel 82599ES | `ixgbe` |
-| Intel X710 | `i40e` |
-
-Two Mellanox generations and two Intel ones, all in legacy eswitch mode, all
-with the same signature: a peer behind the bridge is unreachable while ARP for
-it resolves, registering its address fixes it, and removing the registration
-breaks it again. Reports for other hardware are welcome — the four steps above
+The hardware this was confirmed on is listed [at the
+top](#is-this-your-problem): two Mellanox generations and two Intel ones, all
+in legacy eswitch mode, all with the same signature: a peer behind the bridge
+is unreachable while ARP for it resolves, registering its address fixes it, and
+removing the registration breaks it again. Reports for other hardware are welcome — the four steps above
 are the whole test.
 
 ## Limits and things worth knowing
@@ -505,6 +547,21 @@ registers anything.
 It is not a substitute for switchdev / bridge offload. Where the hardware can
 represent VFs as real bridge ports, use that instead — it is the proper answer
 and needs no daemon. This exists for the cards that cannot.
+
+Those are not a shrinking remainder. `ixgbe` (82599, X520, X540, X550), `i40e`
+(X710, XL710) and `mlx4` (ConnectX-3) carry no switchdev support at all: their
+modules pull in devlink for firmware info, parameters and regions, and not a
+single switchdev symbol. There is no mode to switch to and no representor to
+put in a bridge — not *yet*, but at all. `mlx5` and `ice` do carry it, but on
+`mlx5` it is a per-card property: a ConnectX-4 Lx answers the mode change with
+`Failed setting eswitch to offloads` (EINVAL) on firmware 14.32.1912, with a
+bound VF or without. For that hardware the gap does not close by waiting, only
+by replacing the card.
+
+Do not go and try it on a machine you care about, just to see. The driver
+tears the legacy eswitch down *before* it builds the offloads one, and when
+the second step fails the first is not undone: the VFs stay dark and the host
+needs a reboot to get its eswitch back.
 
 ## Implementation
 
