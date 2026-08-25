@@ -527,6 +527,24 @@ functions, follows bonds on the way, and registers the address — the same
 again. If your guests are the only thing you need to reach, that script is
 smaller than this and does the job.
 
+[yujincheng08/mlx4_br](https://github.com/yujincheng08/mlx4_br) is closer still,
+and was found only after this was written: a C++ daemon that listens on the same
+two netlink groups, propagates an address the bridge has learnt into the other
+bridge ports' filters with `NTF_SELF`, mirrors deletions back out, follows bonds,
+and ships as a Debian and an OpenWrt package. Same problem, same mechanism. If it
+works for you, there is no reason to change.
+
+Where the two differ: it propagates a learnt address to every other port of the
+bridge that learnt it, rather than working out which port is an SR-IOV uplink and
+following the chain down to it. Where the NIC is not itself a port of that bridge
+— a bridge stacked on a VLAN interface of another bridge, which is what Proxmox
+SDN vnets produce — the address never arrives at the filter that needs it. And it
+keeps no record of what it registered: entries are mirrored as events arrive, so
+after a restart its own entries are indistinguishable from anything else that put
+an address there, and there is no `--dry-run`, `--check`, `--status` or `--flush`
+to ask what it would do or take it all back. What it has and this does not: an
+OpenWrt package.
+
 Two things led to this being written instead:
 
 **Only configured guests are covered.** A hookscript knows what is in
