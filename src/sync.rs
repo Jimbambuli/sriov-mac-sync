@@ -167,6 +167,10 @@ pub struct Syncer {
     /// note is still written, unlocked; what this stops is a line about it on
     /// every address of every burst.
     lock_warned: std::cell::RefCell<Set<String>>,
+    /// Whether an unlistable state directory has been said out loud. Once:
+    /// the list is asked for on every batch, and the condition does not
+    /// come and go.
+    dir_list_warned: std::cell::Cell<bool>,
     /// Whether the state directory has been looked at this run. Its mode is
     /// only ours to decide when we are the ones who made it, and the one in
     /// /run outlives the process: a run under an older build, or under a
@@ -327,6 +331,7 @@ impl Syncer {
             unreadable: std::cell::RefCell::new(crate::hash::set()),
             lock_warned: std::cell::RefCell::new(crate::hash::set()),
             dir_checked: std::cell::Cell::new(false),
+            dir_list_warned: std::cell::Cell::new(false),
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -449,6 +454,11 @@ impl Syncer {
                 self.notes.borrow_mut().remove(dev);
             }
         }
+        // The shared borrow of `notes` is held while `f` runs. Nothing `f`
+        // does today reaches back into these notes - and nothing may: a
+        // callback that calls load_owned, read_owned or remember here is an
+        // immediate double-borrow panic, which the release profile turns
+        // into an abort.
         match self.notes.borrow().get(dev) {
             Some(note) => f(&note.macs),
             // Nothing on record: no file, or one that could not be read.
@@ -595,8 +605,32 @@ impl Syncer {
             }
         };
         let fd = file.as_raw_fd();
-        unsafe { libc::flock(fd, libc::LOCK_EX) };
+        // The taking of the lock can fail - EINTR, since nothing here sets
+        // SA_RESTART, is the one that actually happens. Failing and running
+        // anyway used to be silent, which is the exact hole the open-failure
+        // warning above was written to close; now it is retried, and a
+        // failure that is not an interruption gets the same warning.
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if self.lock_warned.borrow_mut().insert(dev.to_string()) {
+                eprintln!(
+                    "warning: cannot take the lock on {}: {e} - writing the \
+                     ownership note for {dev} unlocked, so a --once or --flush \
+                     run by hand at the same moment can lose entries from it",
+                    path.display()
+                );
+            }
+            break;
+        }
         let out = f();
+        // Dropping the file below releases the lock either way; the explicit
+        // unlock only shortens the window, so its result changes nothing.
         unsafe { libc::flock(fd, libc::LOCK_UN) };
         out
     }
@@ -818,24 +852,52 @@ impl Syncer {
     /// from memory, for the same reason everything else here is: a --flush
     /// from a second process is a thing that happens.
     pub fn registered(&self) -> usize {
-        self.noted_devices()
+        self.noted_devices_or_none()
             .iter()
             .map(|dev| self.load_owned(dev).len())
             .sum()
     }
 
-    fn noted_devices(&self) -> Vec<String> {
+    /// Every device with a note. "The directory is not there" means none -
+    /// nothing was ever noted. Any other failure to list it means the
+    /// answer is unknown, which is not the same thing, and the difference
+    /// is what --flush's exit code stands on.
+    fn noted_devices(&self) -> io::Result<Vec<String>> {
         let mut out = Vec::new();
-        if let Ok(rd) = fs::read_dir(&self.state_dir) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(dev) = name.strip_suffix(".owned") {
-                    out.push(dev.to_string());
+        match fs::read_dir(&self.state_dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if let Some(dev) = name.strip_suffix(".owned") {
+                        out.push(dev.to_string());
+                    }
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         out.sort();
-        out
+        Ok(out)
+    }
+
+    /// The same list for the callers that can only shrug at a failure - a
+    /// scheduling heuristic and the orphan sweep. They act on "none" the
+    /// harmless way (no sweep, no warning threshold), so an unlistable
+    /// directory costs a warning, once, rather than an invented answer.
+    fn noted_devices_or_none(&self) -> Vec<String> {
+        match self.noted_devices() {
+            Ok(v) => v,
+            Err(e) => {
+                if !self.dir_list_warned.replace(true) {
+                    eprintln!(
+                        "warning: cannot list {}: {e} - the notes in it, if any, \
+                         are out of reach until it can be listed",
+                        self.state_dir.display()
+                    );
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Take back what was registered for a device that is no longer an uplink.
@@ -861,7 +923,7 @@ impl Syncer {
         }
         let now = Instant::now();
         let live: Set<String> = self.pairs.iter().map(|p| p.dev.clone()).collect();
-        let noted = self.noted_devices();
+        let noted = self.noted_devices_or_none();
         // Forget devices whose note is gone, or that came back.
         self.absent_since
             .retain(|dev, _| noted.contains(dev) && !live.contains(dev));
@@ -889,8 +951,8 @@ impl Syncer {
 
     fn drop_orphans(&mut self, sock: &mut dyn FdbWriter, topo: &Topology, apply: bool) {
         for dev in self.orphaned() {
-            let owned = self.load_owned(&dev);
             if !apply || self.dry_run {
+                let owned = self.load_owned(&dev);
                 if !owned.is_empty() {
                     eprintln!(
                         "{dev}: no longer an uplink, {} address(es) still registered",
@@ -899,32 +961,50 @@ impl Syncer {
                 }
                 continue;
             }
-            if owned.is_empty() {
-                let _ = fs::remove_file(self.state_path(&dev));
-                continue;
-            }
-            let (gone, kept) = match topo.get(&dev) {
-                Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
-                // The device itself is gone, and a unicast filter does not
-                // outlive its netdev - the entries died with it. (A device
-                // that was merely renamed keeps its entries under the new
-                // name, but a note under the old name could never reach them
-                // anyway.)
-                None => (owned.len(), crate::hash::set()),
-            };
-            if kept.is_empty() && self.note_is_readable(&dev) {
-                eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
-                let _ = fs::remove_file(self.state_path(&dev));
-            } else {
-                // What could not be removed is still in the card; forgetting
-                // it here is how a registration becomes permanent.
-                eprintln!(
-                    "{dev}: no longer an uplink, removed {gone} address(es), \
-                     {} could not be removed and stay on record",
-                    kept.len()
-                );
-                self.save_owned(&dev, &kept);
-            }
+            // Under the note's lock, for the same reason flush works under
+            // it: between reading the note and unlinking it, somebody else's
+            // append would otherwise vanish with the file.
+            self.locked(&dev, || {
+                let owned = self.load_owned(&dev);
+                if owned.is_empty() {
+                    // Empty because it says so, or empty because it could not
+                    // be read? The two arrive here looking identical, and only
+                    // the first is a note this may unlink: removing an
+                    // unreadable note abandons every entry it names, still in
+                    // the card, with nothing left on record - the orphan the
+                    // notes exist to prevent. Unreadable is left alone until
+                    // it can be read, the same answer read_owned already gave
+                    // out loud.
+                    if self.note_is_readable(&dev) {
+                        let _ = fs::remove_file(self.state_path(&dev));
+                    }
+                    return;
+                }
+                let (gone, kept) = match topo.get(&dev) {
+                    Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
+                    // The device itself is gone, and a unicast filter does not
+                    // outlive its netdev - the entries died with it. (A device
+                    // that was merely renamed keeps its entries under the new
+                    // name, but a note under the old name could never reach
+                    // them anyway.)
+                    None => (owned.len(), crate::hash::set()),
+                };
+                if kept.is_empty() && self.note_is_readable(&dev) {
+                    eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
+                    let _ = fs::remove_file(self.state_path(&dev));
+                } else {
+                    // What could not be removed is still in the card;
+                    // forgetting it here is how a registration becomes
+                    // permanent. write_owned, because the lock is already
+                    // held.
+                    eprintln!(
+                        "{dev}: no longer an uplink, removed {gone} address(es), \
+                         {} could not be removed and stay on record",
+                        kept.len()
+                    );
+                    self.write_owned(&dev, &kept);
+                }
+            });
         }
     }
 
@@ -1013,9 +1093,6 @@ impl Syncer {
             return;
         };
         let Some(pf_link) = topo.at(pf) else { return };
-        if pf_link.numvfs == 0 || self.warned_unknown_vf.contains(dev) {
-            return;
-        }
         // An address of all zeroes is the driver saying "nobody set one".
         let named = vf_macs
             .iter()
@@ -1023,8 +1100,17 @@ impl Syncer {
             .count();
         let here = pf_link.vf_netdevs.len();
         let unknowable = pf_link.numvfs as usize > named.max(here);
-        self.warned_unknown_vf.insert(dev.to_string());
-        if unknowable {
+        if !unknowable {
+            // Nothing unknowable right now - including no functions at all.
+            // The mark comes off, so a situation that arises later, or
+            // arises again, gets its warning: "told once" means once per
+            // situation, not once per process. It used to be set on the
+            // way past this point, and an uplink whose first pass was
+            // harmless could then never warn at all.
+            self.warned_unknown_vf.remove(dev);
+            return;
+        }
+        if self.warned_unknown_vf.insert(dev.to_string()) {
             eprintln!(
                 "warning: {}: {} of {}'s {} virtual function(s) have no address set \
                  from this host and no interface here, so their addresses cannot be \
@@ -1694,28 +1780,46 @@ impl Syncer {
     pub fn flush(&mut self, sock: &mut dyn FdbWriter) -> io::Result<bool> {
         let topo = Topology::from_links(&sock.dump_links()?);
         let mut clean = true;
-        for dev in self.noted_devices() {
-            let owned = self.load_owned(&dev);
+        // A directory that cannot be listed fails the flush outright: the
+        // promise here is "everything comes back out", and claiming it for
+        // notes nobody could even enumerate would be the lie an operator
+        // acts on.
+        for dev in self.noted_devices()? {
             if self.dry_run {
+                let owned = self.load_owned(&dev);
                 println!("{dev}: would remove {} address(es)", owned.len());
                 continue;
             }
-            let (gone, kept) = match topo.get(&dev) {
-                Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
-                None => (owned.len(), crate::hash::set()),
-            };
-            if kept.is_empty() && self.note_is_readable(&dev) {
-                let _ = fs::remove_file(self.state_path(&dev));
-                println!("{dev}: removed {gone} address(es)");
-            } else {
-                self.save_owned(&dev, &kept);
-                println!(
-                    "{dev}: removed {gone} address(es), {} could not be removed \
-                     and stay on record",
-                    kept.len()
-                );
-                clean = false;
-            }
+            // Read, unregister and unlink under the note's lock. A daemon
+            // appends to this note the moment it registers, and a line
+            // appended into this window used to be destroyed by the rename
+            // or unlink below - leaving that entry in the card with no owner
+            // on record. The removals wait on rtnl while the lock is held;
+            // that wait is precisely what the daemon's append has to sit out.
+            let settled = self.locked(&dev, || {
+                let owned = self.load_owned(&dev);
+                let (gone, kept) = match topo.get(&dev) {
+                    Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
+                    None => (owned.len(), crate::hash::set()),
+                };
+                if kept.is_empty() && self.note_is_readable(&dev) {
+                    let _ = fs::remove_file(self.state_path(&dev));
+                    println!("{dev}: removed {gone} address(es)");
+                    true
+                } else {
+                    // write_owned, not save_owned: the lock is already held,
+                    // and taking it again on a second descriptor would wait
+                    // on itself.
+                    self.write_owned(&dev, &kept);
+                    println!(
+                        "{dev}: removed {gone} address(es), {} could not be removed \
+                         and stay on record",
+                        kept.len()
+                    );
+                    false
+                }
+            });
+            clean &= settled;
         }
         Ok(clean)
     }
@@ -2400,16 +2504,22 @@ mod state_tests {
         /// note at this path. That is the window the merge exists for, and
         /// there is no other way to be inside it from a test.
         meanwhile: Option<(PathBuf, Mac)>,
+        /// What dump_links answers. Only --flush reads the topology through
+        /// the socket; an empty answer means every noted device looks gone,
+        /// which is one case of many - so a test can now say otherwise.
+        links: Vec<crate::netlink::LinkInfo>,
+        /// Milliseconds each removal takes. A flush with entries to remove
+        /// then stands in its read-unregister-unlink window long enough for
+        /// another thread to try the things the lock exists to serialise.
+        del_delay_ms: u64,
     }
 
     impl FdbWriter for FakeSock {
         fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
             Ok(self.fdb.clone())
         }
-        // Only --flush reads the topology through the socket, and the tests
-        // that use this hand it in directly.
         fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
-            Ok(Vec::new())
+            Ok(self.links.clone())
         }
         fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
             Ok(self.vf.clone())
@@ -2428,6 +2538,9 @@ mod state_tests {
                 }
                 self.added.push((ifindex, *mac));
             } else {
+                if self.del_delay_ms > 0 {
+                    std::thread::sleep(Dur::from_millis(self.del_delay_ms));
+                }
                 self.removed.push((ifindex, *mac));
             }
             Ok(())
@@ -2616,9 +2729,14 @@ mod state_tests {
         .unwrap();
         let s = ready_syncer(&dir);
         let owned = s.load_owned("nic1");
-        // CRLF is trimmed, uppercase is not an address to parse_mac, garbage is dropped.
+        // CRLF is trimmed, garbage is dropped, and uppercase IS an address -
+        // parse_mac takes both cases, which matters for a note edited by
+        // hand. (This comment used to claim the opposite, and the missing
+        // length check below would have hidden either answer.)
         assert!(owned.contains(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]));
+        assert!(owned.contains(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]));
         assert!(owned.contains(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03]));
+        assert_eq!(owned.len(), 3, "the garbage line was counted as an address");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2638,6 +2756,270 @@ mod state_tests {
         );
         assert!(!dir.join("nic1.owned").exists(), "the settled note lingers");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An orphan whose note cannot be read is not an orphan that owns
+    /// nothing - it is an orphan nobody can answer for. load_owned returns
+    /// the empty set for both, and the empty branch used to unlink the note
+    /// on that answer: one unreadable moment and the note was gone for good,
+    /// with every entry it named still in the card and nothing left to say
+    /// it was ours. The sibling branch fifteen lines down guards exactly
+    /// this with note_is_readable; the empty branch has to as well.
+    #[test]
+    fn an_orphan_with_an_unreadable_note_keeps_it() {
+        let dir = scratch("orphan-unreadable");
+        fs::create_dir_all(&dir).unwrap();
+        // A note that cannot be read but could be unlinked: a symlink loop.
+        // (Root reads through any permission bits, so chmod cannot stand in.)
+        let path = dir.join("nic1.owned");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        s.authoritative = true;
+        let topo = host(mac(1));
+        let mut sock = FakeSock::default();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&path).is_ok(),
+            "an unreadable note was unlinked - its entries are now nobody's"
+        );
+        assert!(sock.removed.is_empty(), "nothing was known to remove");
+
+        // The moment it can be read again, the sweep may finish its work.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, format!("{}\n", format_mac(&mac(0x91)))).unwrap();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+        assert_eq!(
+            sock.removed,
+            vec![(2, mac(0x91))],
+            "a readable orphan note is swept as before"
+        );
+        assert!(!path.exists(), "the settled note lingers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// --flush against a live topology: what the note names is taken back
+    /// out of the named device's filter, and the settled note is unlinked.
+    /// This path ran only against an empty topology in every earlier test -
+    /// the branch that does the actual unregistering was never exercised.
+    #[test]
+    fn a_flush_takes_back_what_the_notes_name_and_says_when_it_could_not() {
+        let dir = scratch("flush-real");
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        let both: Set<Mac> = [mac(0x61), mac(0x62)].into_iter().collect();
+        s.save_owned("nic1", &both);
+        let mut sock = FakeSock {
+            links: vec![crate::netlink::LinkInfo {
+                index: 5,
+                name: "nic1".into(),
+                mac: Some(mac(1)),
+                kind: Some("veth".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(s.flush(&mut sock).unwrap(), "a clean flush says so");
+        let mut removed = sock.removed.clone();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![(5, mac(0x61)), (5, mac(0x62))],
+            "the flush did not go through the device the note names"
+        );
+        assert!(!dir.join("nic1.owned").exists(), "the settled note lingers");
+
+        // And when one refuses to go, it stays on record and the flush says
+        // it was not clean - that exit code is the operator's only signal.
+        s.save_owned("nic1", &both);
+        let mut sock = FakeSock {
+            links: vec![crate::netlink::LinkInfo {
+                index: 5,
+                name: "nic1".into(),
+                mac: Some(mac(1)),
+                kind: Some("veth".into()),
+                ..Default::default()
+            }],
+            fail_del: [(mac(0x62), libc::EIO)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(!s.flush(&mut sock).unwrap(), "a dirty flush claimed clean");
+        assert_eq!(
+            s.load_owned("nic1"),
+            [mac(0x62)].into_iter().collect::<Set<_>>(),
+            "what could not be removed has to stay on record"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bridge missing from one reading makes every wanted address vanish,
+    /// and a pass that believed it would remove everything - during exactly
+    /// the ifreload moment the daemon exists to survive. The pass must leave
+    /// that pair alone entirely.
+    #[test]
+    fn a_missing_bridge_fails_closed() {
+        let dir = scratch("bridge-gone");
+        let mut s = ready_syncer(&dir);
+        s.save_owned("nic1", &[mac(0x71)].into_iter().collect::<Set<_>>());
+        // A topology in which nic1 exists but vmbr1 does not.
+        let topo = Builder::new().add("nic1", 2, Some(mac(1))).build();
+        let mut sock = FakeSock::default();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+        assert!(
+            sock.removed.is_empty(),
+            "a missing bridge was taken for permission to remove"
+        );
+        assert_eq!(
+            s.load_owned("nic1"),
+            [mac(0x71)].into_iter().collect::<Set<_>>(),
+            "the note has to survive the blink"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A line appended while --flush is inside its read-unregister-unlink
+    /// window must not be destroyed by the unlink. The window is real: a
+    /// removal waits on rtnl, and the daemon appends the moment it registers.
+    /// Losing the line leaves the freshly registered entry in the card with
+    /// no owner on record - the orphan everything here exists to prevent.
+    /// The writers hold the note's lock for exactly this reason, so the
+    /// flush has to hold it across its window too.
+    #[test]
+    fn a_flush_cannot_lose_a_line_appended_while_it_runs() {
+        let dir = scratch("flush-interleave");
+        let appended: Mac = mac(0x77);
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        s.save_owned(
+            "nic1",
+            &[mac(0x75), mac(0x76)].into_iter().collect::<Set<_>>(),
+        );
+
+        // A daemon in another process, registering an address and noting it
+        // while the flush stands in its window.
+        let other_dir = dir.clone();
+        let daemon = std::thread::spawn(move || {
+            std::thread::sleep(Dur::from_millis(80));
+            let other = Syncer::new(Vec::new(), other_dir);
+            other.append_owned("nic1", &[appended]);
+        });
+
+        let mut sock = FakeSock {
+            links: vec![crate::netlink::LinkInfo {
+                index: 5,
+                name: "nic1".into(),
+                mac: Some(mac(1)),
+                kind: Some("veth".into()),
+                ..Default::default()
+            }],
+            del_delay_ms: 150,
+            ..Default::default()
+        };
+        s.flush(&mut sock).unwrap();
+        daemon.join().unwrap();
+
+        let note = fs::read_to_string(dir.join("nic1.owned")).unwrap_or_default();
+        assert!(
+            note.contains(&format_mac(&appended)),
+            "the flush destroyed a line appended while it ran - that entry \
+             is now in the card with no owner on record"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The lock is a lock: a second holder waits. Nothing anywhere proved
+    /// this before - every earlier test covered only the failure to open
+    /// the lock file.
+    #[test]
+    fn the_note_lock_actually_excludes_a_second_holder() {
+        let dir = scratch("lock-excludes");
+        fs::create_dir_all(&dir).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b2 = barrier.clone();
+        let d2 = dir.clone();
+        let holder = std::thread::spawn(move || {
+            let s = Syncer::new(Vec::new(), d2);
+            s.locked("nic1", || {
+                b2.wait(); // the other thread now heads for the lock
+                std::thread::sleep(Dur::from_millis(200));
+            });
+        });
+        let s = Syncer::new(Vec::new(), dir.clone());
+        barrier.wait();
+        let waited = Instant::now();
+        s.locked("nic1", || {});
+        assert!(
+            waited.elapsed() >= Dur::from_millis(100),
+            "the second holder got in while the first still held the lock"
+        );
+        holder.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The unknowable-VF warning is for when the situation arises - which is
+    /// not necessarily the first pass. A VF that is fully named today and
+    /// handed to a guest tomorrow (its admin address cleared) becomes
+    /// unknowable then; marking the uplink "warned" on a pass that had
+    /// nothing to warn about silences the warning for the life of the
+    /// process. And once the situation passes, it re-arms, the way the
+    /// pinned-address warning does.
+    #[test]
+    fn the_unknowable_vf_warning_fires_when_the_situation_arises() {
+        let dir = scratch("unknowable-late");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+
+        // Pass one: the single VF has an address, nothing is unknowable.
+        s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
+        assert!(
+            !s.warned_unknown_vf.contains("nic1"),
+            "a pass with nothing to warn about must not use up the warning"
+        );
+
+        // Pass two: the address is gone - a guest took the VF. Now it warns.
+        s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
+        assert!(
+            s.warned_unknown_vf.contains("nic1"),
+            "the situation arose and the warning did not fire"
+        );
+
+        // While it persists: once was enough (the set held it).
+        s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
+        assert!(s.warned_unknown_vf.contains("nic1"));
+
+        // It clears, and a later return deserves a fresh warning.
+        s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
+        assert!(
+            !s.warned_unknown_vf.contains("nic1"),
+            "a situation that ended has to re-arm its warning"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// --flush's one promise is "everything this daemon put in comes back
+    /// out". A state directory that cannot be listed used to read as "no
+    /// notes": flush printed nothing, removed nothing, and exited 0 - success
+    /// claimed for work it could not even enumerate. Being unable to tell
+    /// what exists is a failure, and the exit code has to say so.
+    #[test]
+    fn a_state_directory_that_cannot_be_listed_fails_a_flush_loudly() {
+        let dir = scratch("flush-unlistable");
+        // A regular file where the directory should be: read_dir fails with
+        // ENOTDIR, for root too.
+        fs::write(&dir, b"not a directory").unwrap();
+        let mut s = Syncer::new(Vec::new(), dir.clone());
+        let mut sock = FakeSock::default();
+        let out = s.flush(&mut sock);
+        assert!(
+            out.is_err(),
+            "an unlistable state directory was reported as a clean flush"
+        );
+        // The quiet callers stay quiet in their answers - a scheduling
+        // heuristic and the orphan sweep must not invent devices - but they
+        // must not panic either.
+        assert_eq!(s.registered(), 0);
+        s.authoritative = true;
+        assert!(s.orphaned().is_empty());
+        let _ = fs::remove_file(&dir);
     }
 
     /// The uplink may itself be a VF; the exclusions then belong to its PF -
@@ -3550,15 +3932,18 @@ mod state_tests {
             "and once looked at, not looked at again every pass for ever"
         );
 
-        // With both addresses known, there is nothing to report - the flag is
-        // still set, because the question was asked and answered.
+        // With both addresses known there is nothing to report, and nothing
+        // to silence either: the mark stays off, so the warning is armed for
+        // the day a guest takes one of these and the situation actually
+        // arises. It used to be set here - "asked and answered" - which
+        // silenced the warning for the life of the process.
         let mut quiet = Syncer::new(s.pairs.clone(), dir.clone());
         quiet.warn_about_unknowable_vfs(
             &topo,
             "pf0",
             &[(2, [0x02, 0, 0, 0, 0, 9]), (2, [0x02, 0, 0, 0, 0, 10])],
         );
-        assert!(quiet.warned_unknown_vf.contains("pf0"));
+        assert!(!quiet.warned_unknown_vf.contains("pf0"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
