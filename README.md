@@ -590,13 +590,18 @@ type in the program.
 cargo test        # topology and parsing logic, no hardware needed
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+sudo bench/integration.sh target/release/sriov-mac-sync   # against a real kernel
 ```
 
 The parts most likely to be wrong on unfamiliar hardware are the ones that
 decide *which way the wire is* and *which addresses count*, and those are pure
 functions over a topology that tests build by hand — bonds, stacked VLAN
 interfaces, vnet bridges, a second unrelated bridge, a bridge carrying its own
-address. CI runs all of that, an MSRV build and a static build on every push to main and on pull requests.
+address. The integration script then holds the built binary to every mode's
+promise against the kernel itself, in a throwaway network namespace — real
+netlink, real /sys, veth standing in for the uplink — and refuses to run on a
+host where a daemon is already at work. CI runs all of that, an MSRV build
+and a static build on every push to main and on pull requests.
 
 ## License
 

@@ -42,6 +42,21 @@ jobs:
       - run: rustup toolchain install 1.74 --profile minimal
       - run: cargo +1.74 test
 
+  integration:
+    # The tests above drive the code against a fake socket. This drives the
+    # built binary against the kernel itself - a bridge and veth pairs in a
+    # throwaway network namespace, real netlink, real /sys - and holds every
+    # mode to its promise. The runner grants root via sudo and ships
+    # iproute2; the script refuses politely anywhere it might collide with a
+    # real daemon.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Release build
+        run: cargo build --release
+      - name: Against a real kernel
+        run: sudo bench/integration.sh target/release/sriov-mac-sync
+
   static:
     # The audience runs hypervisors, not build hosts. Prove that a binary can
     # be produced that does not depend on the build machine's C library, so it
