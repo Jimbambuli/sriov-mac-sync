@@ -422,10 +422,75 @@ impl Syncer {
         set
     }
 
+    /// Hold the note against everybody else while it is rewritten.
+    ///
+    /// `--once` and `--flush` are run by hand while the daemon is running,
+    /// and a pass takes long enough for that to happen inside one: a single
+    /// filter write has been measured waiting seconds on rtnl. Whoever
+    /// renamed last used to keep only its own lines, so an address one of
+    /// them had registered ended up in the card owned by nobody - which is
+    /// the orphan the notes exist to prevent, and which --flush cannot clean
+    /// up because it iterates the notes.
+    fn locked<R>(&self, dev: &str, f: impl FnOnce() -> R) -> R {
+        use std::os::fd::AsRawFd;
+        let path = self.state_dir.join(format!(".{dev}.owned.lock"));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .or_else(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    fs::create_dir_all(&self.state_dir)?;
+                    fs::OpenOptions::new().create(true).append(true).open(&path)
+                } else {
+                    Err(e)
+                }
+            });
+        let Ok(file) = file else {
+            // No lock to be had. Carrying on unlocked is what this did
+            // before there was a lock at all; refusing to write would strand
+            // whatever was just registered.
+            return f();
+        };
+        let fd = file.as_raw_fd();
+        unsafe { libc::flock(fd, libc::LOCK_EX) };
+        let out = f();
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        out
+    }
+
+    /// Write the note as the difference this caller made, not as the set it
+    /// started from: whatever else has been added meanwhile stays.
+    fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) {
+        if self.dry_run {
+            return;
+        }
+        self.locked(dev, || {
+            let current = self.read_owned(dev);
+            let mut merged = current;
+            for mac in after.iter() {
+                if !before.contains(mac) {
+                    merged.insert(*mac);
+                }
+            }
+            for mac in before.iter() {
+                if !after.contains(mac) {
+                    merged.remove(mac);
+                }
+            }
+            self.write_owned(dev, &merged);
+        });
+    }
+
     fn save_owned(&self, dev: &str, set: &Set<Mac>) {
         if self.dry_run {
             return;
         }
+        self.locked(dev, || self.write_owned(dev, set));
+    }
+
+    /// The write itself. Every caller holds the lock.
+    fn write_owned(&self, dev: &str, set: &Set<Mac>) {
         // Most passes change nothing, and rewriting the note every time would
         // be pointless work on a host that is simply idle. The remembered
         // copy answers this without reading the file - and when it cannot be
@@ -503,12 +568,17 @@ impl Syncer {
         if self.dry_run || added.is_empty() {
             return;
         }
-        use std::io::Write;
         // Only what the note does not already name. A line that is already
         // there would never be taken out again: a full pass rewrites the file
         // only when the set of addresses changed, and a duplicate does not
         // change the set - so the file would grow by a line every time an
-        // address was registered afresh, for ever.
+        // address was registered afresh, for ever. Read and write under one
+        // lock, or two writers each decide "not there yet" and both add it.
+        self.locked(dev, || self.append_owned_locked(dev, added));
+    }
+
+    fn append_owned_locked(&self, dev: &str, added: &[Mac]) {
+        use std::io::Write;
         let mut set = self.load_owned(dev);
         let fresh: Vec<Mac> = added
             .iter()
@@ -981,7 +1051,8 @@ impl Syncer {
                 .map(|e| e.mac)
                 .collect();
 
-            let mut owned = self.load_owned(&pair.dev);
+            let owned_before = self.load_owned(&pair.dev);
+            let mut owned = owned_before.clone();
             let mut added = 0usize;
             let mut removed = 0usize;
             let mut foreign = 0usize;
@@ -1066,7 +1137,10 @@ impl Syncer {
             }
 
             if apply {
-                self.save_owned(&pair.dev, &owned);
+                // What this pass claimed and released, applied to whatever
+                // the note holds now - not the picture it started from, which
+                // a --once running alongside may have added to since.
+                self.save_owned_merged(&pair.dev, &owned_before, &owned);
             }
 
             // Unsorted on purpose: outside --status only its length is read,
@@ -1960,6 +2034,11 @@ mod state_tests {
         fail_add: Map<Mac, i32>,
         /// raw OS error to answer a removal of this address with
         fail_del: Map<Mac, i32>,
+        /// A second process, writing the same note while the pass is inside
+        /// it: on the first successful add, this address is appended to the
+        /// note at this path. That is the window the merge exists for, and
+        /// there is no other way to be inside it from a test.
+        meanwhile: Option<(PathBuf, Mac)>,
     }
 
     impl FdbWriter for FakeSock {
@@ -1980,6 +2059,12 @@ mod state_tests {
                 return Err(io::Error::from_raw_os_error(*code));
             }
             if add {
+                if let Some((path, other)) = self.meanwhile.take() {
+                    let mut text = fs::read_to_string(&path).unwrap_or_default();
+                    text.push_str(&format_mac(&other));
+                    text.push('\n');
+                    fs::write(&path, text).unwrap();
+                }
                 self.added.push((ifindex, *mac));
             } else {
                 self.removed.push((ifindex, *mac));
@@ -2981,6 +3066,86 @@ mod state_tests {
             sock.removed,
             vec![(2, BEHIND_NIC)],
             "what is genuinely gone still gets cleaned up"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--once` beside a running daemon writes the same note. A pass takes
+    /// long enough for that to happen inside one - a single filter write has
+    /// waited seconds on rtnl - and whoever wrote last used to keep only its
+    /// own lines. The address the other one registered was then in the card
+    /// owned by nobody: the orphan the notes exist to prevent, and one
+    /// --flush cannot clean up, because it iterates the notes.
+    ///
+    /// Verified by mutation: writing the pass's own picture instead of its
+    /// difference loses the other writer's address.
+    #[test]
+    fn a_pass_writes_its_difference_not_its_picture() {
+        let dir = scratch("note-merge");
+        let s = Syncer::new(Vec::new(), dir.clone());
+
+        // What the pass read when it started.
+        let before = [BEHIND_NIC].into_iter().collect::<Set<_>>();
+        s.save_owned("nic1", &before);
+
+        // While it worked, somebody's --once registered another address.
+        let mut theirs = before.clone();
+        theirs.insert(UPLINK_WARD);
+        s.save_owned("nic1", &theirs);
+
+        // The pass finishes: it claimed one address and released none.
+        let mut after = before.clone();
+        after.insert(BEHIND_GUEST);
+        s.save_owned_merged("nic1", &before, &after);
+
+        assert_eq!(
+            s.load_owned("nic1"),
+            [BEHIND_NIC, UPLINK_WARD, BEHIND_GUEST]
+                .into_iter()
+                .collect::<Set<_>>(),
+            "both writers' addresses have to survive"
+        );
+
+        // And a release still releases.
+        let mut fewer = s.load_owned("nic1");
+        let start = fewer.clone();
+        fewer.remove(&BEHIND_NIC);
+        s.save_owned_merged("nic1", &start, &fewer);
+        assert!(!s.load_owned("nic1").contains(&BEHIND_NIC));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same window as the unit test above, but through a whole pass: the
+    /// note is written to from outside while the pass is between reading it
+    /// and writing it back. What the other writer added has to survive.
+    ///
+    /// Verified by mutation: with the pass writing its own picture instead of
+    /// its difference, the other address is gone.
+    #[test]
+    fn a_pass_does_not_overwrite_what_appeared_while_it_ran() {
+        let dir = scratch("note-window");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.save_owned("nic1", &crate::hash::set());
+        let mut sock = FakeSock {
+            fdb: fdb(),
+            vf: vec![(2, VF_ADMIN)],
+            // Somebody else's --once registers this the moment our pass
+            // writes its first entry.
+            meanwhile: Some((dir.join("nic1.owned"), OTHER_BRIDGE)),
+            ..Default::default()
+        };
+
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+        let note = s.load_owned("nic1");
+        assert!(
+            note.contains(&OTHER_BRIDGE),
+            "the other writer's address was thrown away: {note:?}"
+        );
+        assert!(
+            note.contains(&BEHIND_NIC),
+            "and our own registrations are still on record"
         );
         let _ = fs::remove_dir_all(&dir);
     }
