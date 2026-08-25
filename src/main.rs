@@ -274,9 +274,15 @@ fn read_conf(opts: &mut Options, text: &str) {
                     "warning: {CONF}: RESYNC is not a usable number of seconds, ignored: {value}"
                 ),
             },
-            "MAX_MACS" => match value.parse() {
+            "MAX_MACS" => match value
+                .parse()
+                .map_err(|_| ())
+                .and_then(|v| clamp_max_macs(v).map_err(|_| ()))
+            {
                 Ok(v) => opts.max_macs = v,
-                Err(_) => eprintln!("warning: {CONF}: MAX_MACS is not a number, ignored: {value}"),
+                Err(()) => {
+                    eprintln!("warning: {CONF}: MAX_MACS is not a usable count, ignored: {value}")
+                }
             },
             "EXTRA" => opts.extra.extend(addresses(value)),
             "EXCLUDE" => opts.exclude.extend(addresses(value)),
@@ -298,6 +304,19 @@ fn clamp_interval(v: u64) -> Result<u64, String> {
         return Err(format!(
             "the interval has to be between 1 and {MAX} seconds"
         ));
+    }
+    Ok(v)
+}
+
+/// A warning threshold of zero says the filter is always nine tenths full,
+/// which schedules the fast pass rate for ever - a typo that turns a quiet
+/// host into a busy one. And a threshold near usize::MAX overflows the
+/// arithmetic that asks "are we at nine tenths of it" - an abort in a debug
+/// build, a wrong answer in release. No hardware justifies either end.
+fn clamp_max_macs(v: usize) -> Result<usize, String> {
+    const MAX: usize = 1 << 20;
+    if v == 0 || v > MAX {
+        return Err(format!("--max has to be between 1 and {MAX}"));
     }
     Ok(v)
 }
@@ -337,11 +356,12 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                 )?
             }
             "--max" => {
-                opts.max_macs = args
-                    .next()
-                    .ok_or("--max needs a number")?
-                    .parse()
-                    .map_err(|_| "--max needs a number")?
+                opts.max_macs = clamp_max_macs(
+                    args.next()
+                        .ok_or("--max needs a number")?
+                        .parse()
+                        .map_err(|_| "--max needs a number")?,
+                )?
             }
             "--extra" => {
                 let value = args.next().ok_or("--extra needs addresses")?;
@@ -1236,6 +1256,65 @@ mod tests {
         assert_eq!(clamp_interval(300), Ok(300));
         let mut o = Options::default();
         assert!(parse_args_from(&mut o, args(&["--interval", "0"]).into_iter()).is_err());
+    }
+
+    /// Every way a --pair can be wrong, refused with a message that names
+    /// the mistake. Each of these typos would otherwise disable the wire
+    /// rule - the one protection that matters - and none of this was tested.
+    #[test]
+    fn a_pair_that_lies_about_the_topology_is_refused() {
+        use crate::sysfs::fixture::{mac, Builder};
+        let topo = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("br0")
+            .add("br0", 10, Some(mac(1)))
+            .bridge()
+            .lower("nic1")
+            .add("nic2", 3, Some(mac(2)))
+            .build();
+        let with = |pairs: &[&str]| {
+            let o = Options {
+                pairs: pairs.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
+            resolve_pairs(&topo, &o, false)
+        };
+        for (spec, names) in [
+            ("nic1", "malformed"),
+            ("ghost:br0", "no such interface"),
+            ("nic1:ghost", "not a bridge"),
+            ("nic1:nic2", "not a bridge"),
+            ("br0:br0", "its own uplink"),
+            ("nic2:br0", "not enslaved"),
+        ] {
+            let e = with(&[spec]).expect_err(spec);
+            assert!(e.contains(names), "{spec}: {e}");
+        }
+        let e = with(&["nic1:br0", "nic1:br0"]).expect_err("duplicate dev");
+        assert!(e.contains("already named"), "{e}");
+        let ok = with(&["nic1:br0"]).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].dev, "nic1");
+    }
+
+    /// --max 0 used to make "the filter is nine tenths full" permanently
+    /// true, which schedules the fast pass rate for ever; a huge value
+    /// overflowed the same arithmetic. Both are typos, and both now get an
+    /// answer instead of a behaviour.
+    #[test]
+    fn a_threshold_that_would_spin_or_overflow_is_refused() {
+        assert!(clamp_max_macs(0).is_err());
+        assert!(clamp_max_macs(usize::MAX / 2).is_err());
+        assert_eq!(clamp_max_macs(128), Ok(128));
+        let mut o = Options::default();
+        assert!(parse_args_from(&mut o, args(&["--max", "0"]).into_iter()).is_err());
+        let mut o = Options::default();
+        read_conf(&mut o, "MAX_MACS=0\n");
+        assert_eq!(
+            o.max_macs,
+            Options::default().max_macs,
+            "a refused threshold must not replace the default"
+        );
     }
 
     #[test]

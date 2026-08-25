@@ -151,6 +151,20 @@ pub struct LinkInfo {
 
 /// A batch of notifications: forwarding entries that changed, and whether any
 /// interface changed at all.
+/// The most one datagram's answer may demand, so a nonsensical size cannot
+/// be turned into an allocation that ends the process; and how many times a
+/// growing buffer is offered before an answer is declared unreachable.
+const CEILING: usize = 64 * 1024 * 1024;
+const ATTEMPTS: usize = 8;
+
+/// How one attempt at a one-interface question ended.
+enum OneEnd {
+    /// Answered, or ended by the kernel - the question is over.
+    Answered,
+    /// The answer was this many bytes and the buffer was not.
+    TooBig(usize),
+}
+
 /// How a dump ended. "Did not fit" and "was interrupted" both mean the answer
 /// cannot be used, but they ask different things of the caller: a bigger
 /// buffer, or simply another go.
@@ -340,6 +354,14 @@ impl Socket {
     /// an empty forwarding table, which ends with every entry removed. The
     /// sender's port id says who it was: zero is the kernel.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Dropping a datagram that is not the kernel's is the anti-spoofing
+        // rule; dropping them for ever is a way to be wedged. Unicast to a
+        // netlink pid needs no privilege, so any local process can keep this
+        // loop fed - and the callers' deadlines are checked between calls,
+        // not in here. A bounded batch of drops, then WouldBlock: the
+        // deadline caller re-enters (and re-checks its clock), the event
+        // reader reports an empty batch and the next poll wakes it again.
+        let mut dropped = 0;
         loop {
             let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
@@ -361,6 +383,10 @@ impl Socket {
                 return Err(e);
             }
             if from.nl_pid != 0 {
+                dropped += 1;
+                if dropped >= 64 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
                 continue; // not the kernel talking
             }
             return Ok(n as usize);
@@ -470,12 +496,63 @@ impl Socket {
         want: u16,
         sink: &mut impl FnMut(&[u8]),
     ) -> io::Result<()> {
+        self.request_one_from(64 * 1024, request, want, sink)
+    }
+
+    /// `request_one`, with the size its buffer starts from spelt out. Only a
+    /// test passes anything but the default, for the same reason `dump_from`
+    /// exists: growing is meant to be the rare path, and a test that cannot
+    /// reach it does not test it.
+    ///
+    /// An answer that does not fit is not an error, it is a big host: a
+    /// virtual-function list a few hundred entries long outgrows any fixed
+    /// buffer. The question is asked again into a bigger one - the same
+    /// grow-and-retry the dumps do, against the same ceiling. It used to be
+    /// a hard error instead, which failed vf_macs_of and with it the WHOLE
+    /// pass, on every pass, on exactly the hosts with the most functions to
+    /// exclude.
+    fn request_one_from(
+        &mut self,
+        start: usize,
+        request: &[u8],
+        want: u16,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
         let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
-        self.send(request)?;
-        let mut buf = self.take_buf(64 * 1024);
-        let out = self.request_one_into(&mut buf, seq, want, sink);
+        let mut buf = self.take_buf(start);
+        let out = self.request_one_grown(&mut buf, request, seq, want, sink);
         self.buf = buf;
         out
+    }
+
+    fn request_one_grown(
+        &mut self,
+        buf: &mut Vec<u8>,
+        request: &[u8],
+        seq: u32,
+        want: u16,
+        sink: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        for _ in 0..ATTEMPTS {
+            self.send(request)?;
+            match self.request_one_into(buf, seq, want, sink)? {
+                OneEnd::Answered => return Ok(()),
+                OneEnd::TooBig(need) => {
+                    if need > CEILING {
+                        return Err(io::Error::other(format!(
+                            "an answer wants {need} bytes in one datagram, beyond \
+                             the {CEILING} this is willing to allocate"
+                        )));
+                    }
+                    // Round up, like the dumps do: the next answer to the
+                    // same question need not be the same number of bytes.
+                    buf.resize(need.next_power_of_two().min(CEILING), 0);
+                }
+            }
+        }
+        Err(io::Error::other(format!(
+            "an answer did not fit in {ATTEMPTS} attempts of a growing buffer"
+        )))
     }
 
     fn request_one_into(
@@ -484,15 +561,16 @@ impl Socket {
         seq: u32,
         want: u16,
         sink: &mut impl FnMut(&[u8]),
-    ) -> io::Result<()> {
+    ) -> io::Result<OneEnd> {
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
             let n = self.recv_deadline(buf, deadline)?;
             if n > buf.len() {
                 // Whatever else the kernel sent for this question is still
-                // queued and would be read as the answer to the next one.
+                // queued and would be read as the answer to the next one;
+                // the retry asks afresh.
                 self.drain();
-                return Err(io::Error::other("the answer outgrew the buffer"));
+                return Ok(OneEnd::TooBig(n));
             }
             for msg in messages(&buf[..n]) {
                 if msg.seq != seq {
@@ -503,7 +581,7 @@ impl Socket {
                         if let Some(e) = nlmsg_error(msg.payload) {
                             return Err(e);
                         }
-                        return Ok(());
+                        return Ok(OneEnd::Answered);
                     }
                     // The question was asked without NLM_F_DUMP, so there is
                     // nothing to end - but a kernel is free to end it anyway,
@@ -513,11 +591,11 @@ impl Socket {
                     // deadline for an answer that has already been given.
                     // "Nothing to report" is the answer: sink is not called
                     // and the caller sees an empty result.
-                    NLMSG_DONE => return Ok(()),
+                    NLMSG_DONE => return Ok(OneEnd::Answered),
                     NLMSG_NOOP => continue,
                     k if k == want => {
                         sink(msg.payload);
-                        return Ok(());
+                        return Ok(OneEnd::Answered);
                     }
                     _ => {}
                 }
@@ -585,10 +663,6 @@ impl Socket {
         what: &str,
         mut parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
-        // Capped, so a nonsensical size cannot be turned into an allocation
-        // that ends the process.
-        const CEILING: usize = 64 * 1024 * 1024;
-        const ATTEMPTS: usize = 8;
         let mut req = request.to_vec();
         let mut out = Vec::new();
         for _ in 0..ATTEMPTS {
@@ -1004,10 +1078,15 @@ impl<'a> Iterator for Messages<'a> {
         let kind = u16::from_ne_bytes(self.buf[self.off + 4..self.off + 6].try_into().unwrap());
         let flags = u16::from_ne_bytes(self.buf[self.off + 6..self.off + 8].try_into().unwrap());
         let seq = u32::from_ne_bytes(self.buf[self.off + 8..self.off + 12].try_into().unwrap());
-        if len < NLMSG_HDR || self.off + len > self.buf.len() {
+        // checked_add, because len is four wire bytes taken at face value:
+        // on a 32-bit usize the plain sum can wrap, slip past this check and
+        // panic on the slice below. A 64-bit build cannot wrap here - this
+        // costs nothing and holds for both.
+        let end = self.off.checked_add(len)?;
+        if len < NLMSG_HDR || end > self.buf.len() {
             return None;
         }
-        let payload = &self.buf[self.off + NLMSG_HDR..self.off + len];
+        let payload = &self.buf[self.off + NLMSG_HDR..end];
         self.off += align4(len);
         Some(Message {
             kind,
@@ -1066,7 +1145,13 @@ fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
     if payload.len() < NDMSG_LEN {
         return None;
     }
-    let ifindex = i32::from_ne_bytes(payload[4..8].try_into().unwrap()) as u32;
+    // The kernel's index is signed and positive; anything else is not an
+    // interface this could ever act on - the same rejection parse_link makes.
+    let index = i32::from_ne_bytes(payload[4..8].try_into().unwrap());
+    if index <= 0 {
+        return None;
+    }
+    let ifindex = index as u32;
     let state = u16::from_ne_bytes(payload[8..10].try_into().unwrap());
     let flags = payload[10];
     let mut mac = None;
@@ -1097,7 +1182,11 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
     if payload.len() < IFINFOMSG_LEN {
         return;
     }
-    let ifindex = i32::from_ne_bytes(payload[4..8].try_into().unwrap()) as u32;
+    let index = i32::from_ne_bytes(payload[4..8].try_into().unwrap());
+    if index <= 0 {
+        return;
+    }
+    let ifindex = index as u32;
     for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
         if kind != IFLA_VFINFO_LIST {
             continue;
@@ -1406,6 +1495,213 @@ mod tests {
         assert_eq!(got[0].1, &[1, 2, 3, 4, 5, 6]);
     }
 
+    /// A 16-byte ifinfomsg body: family, type, index, flags - only the
+    /// index matters to the parser.
+    fn ifinfomsg(index: i32) -> Vec<u8> {
+        let mut v = vec![0u8; IFINFOMSG_LEN];
+        v[4..8].copy_from_slice(&index.to_ne_bytes());
+        v
+    }
+
+    /// parse_link had no test at all: the attribute walk, the nested
+    /// LINKINFO kind, the NUL the kernel puts on names, and the rejections
+    /// were all unasserted. These are the decoder's whole contract.
+    #[test]
+    fn parse_link_reads_what_the_topology_is_built_from() {
+        let mut body = ifinfomsg(7);
+        put_attr(&mut body, IFLA_IFNAME, b"nic1\0");
+        put_attr(&mut body, IFLA_ADDRESS, &[2, 0, 0, 0, 0, 9]);
+        put_attr(&mut body, IFLA_MASTER, &10u32.to_ne_bytes());
+        put_attr(&mut body, IFLA_LINK, &4u32.to_ne_bytes());
+        put_attr(&mut body, IFLA_PARENT_DEV_NAME, b"0000:01:00.0\0");
+        let mut nested = Vec::new();
+        put_attr(&mut nested, IFLA_INFO_KIND, b"vlan\0");
+        put_attr(&mut body, IFLA_LINKINFO, &nested);
+
+        let l = parse_link(&body).expect("a well-formed link message parses");
+        assert_eq!(l.index, 7);
+        assert_eq!(l.name, "nic1", "the kernel's trailing NUL stays out");
+        assert_eq!(l.mac, Some([2, 0, 0, 0, 0, 9]));
+        assert_eq!(l.master, Some(10));
+        assert_eq!(l.link, Some(4));
+        assert_eq!(l.kind.as_deref(), Some("vlan"));
+        assert_eq!(l.parent_dev.as_deref(), Some("0000:01:00.0"));
+
+        // The rejections: no index is no interface; no name is no interface.
+        assert!(parse_link(&ifinfomsg(0)).is_none());
+        assert!(parse_link(&ifinfomsg(-3)).is_none());
+        assert!(parse_link(&ifinfomsg(7)).is_none(), "nameless");
+        assert!(parse_link(&[0u8; 8]).is_none(), "shorter than an ifinfomsg");
+    }
+
+    /// collect_vf_macs walks three nesting levels, and nothing asserted any
+    /// of them. The all-zero address means "nobody set one" and is passed
+    /// through - filtering it is the caller's judgement, not the parser's.
+    #[test]
+    fn the_virtual_function_addresses_come_out_of_their_triple_nesting() {
+        let vf_mac = |mac: [u8; 6]| {
+            // struct ifla_vf_mac { u32 vf; u8 mac[32]; }
+            let mut v = Vec::new();
+            v.extend_from_slice(&0u32.to_ne_bytes());
+            v.extend_from_slice(&mac);
+            v.extend_from_slice(&[0u8; 26]);
+            v
+        };
+        let mut list = Vec::new();
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac([2, 0, 0, 0, 0, 1]));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac([2, 0, 0, 0, 0, 2]));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+
+        let mut body = ifinfomsg(5);
+        put_attr(&mut body, IFLA_VFINFO_LIST, &list);
+        let mut out = Vec::new();
+        collect_vf_macs(&body, &mut out);
+        assert_eq!(out, vec![(5, [2, 0, 0, 0, 0, 1]), (5, [2, 0, 0, 0, 0, 2])]);
+
+        // A message about no interface contributes nothing.
+        let mut bad = ifinfomsg(0);
+        put_attr(&mut bad, IFLA_VFINFO_LIST, &list);
+        let mut out = Vec::new();
+        collect_vf_macs(&bad, &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// The event reader classifies a batch: bridge neighbours in, other
+    /// address families out, link messages noted with their index. Nothing
+    /// exercised it before.
+    #[test]
+    fn a_notification_batch_is_read_for_what_it_is() {
+        let (mut sock, kernel) = kernel_pair();
+        let mut batch = Vec::new();
+        // A learned bridge entry.
+        batch.extend_from_slice(&msg(
+            RTM_NEWNEIGH,
+            0,
+            &ndmsg(4, 0x02, 0, Some([2, 0, 0, 0, 0, 3]), Some(9)),
+        ));
+        // An AF_INET neighbour - not ours.
+        let mut inet = ndmsg(4, 0x02, 0, Some([2, 0, 0, 0, 0, 4]), None);
+        inet[0] = libc::AF_INET as u8;
+        batch.extend_from_slice(&msg(RTM_NEWNEIGH, 0, &inet));
+        // An interface changing.
+        batch.extend_from_slice(&msg(RTM_NEWLINK, 0, &ifinfomsg(31)));
+        send_raw(&kernel, &batch);
+
+        let ev = sock.recv_events().unwrap();
+        assert_eq!(ev.fdb.len(), 1, "the AF_INET neighbour got in");
+        assert_eq!(ev.fdb[0].1.mac, [2, 0, 0, 0, 0, 3]);
+        assert!(ev.links_changed);
+        assert_eq!(ev.changed_links, vec![31]);
+
+        // Nothing queued reads as nothing, not as an error.
+        let quiet = sock.recv_events().unwrap();
+        assert!(quiet.fdb.is_empty() && !quiet.links_changed);
+    }
+
+    /// The registration request, byte for byte, and both answers to it. The
+    /// encoder had no test; a wrong flag here (CREATE without EXCL, a missing
+    /// NTF_SELF) would still "work" against a kernel and quietly mean
+    /// something else.
+    #[test]
+    fn a_registration_is_asked_for_exactly_and_both_answers_are_understood() {
+        let (mut sock, kernel) = kernel_pair();
+        let answers = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            for reply in [0i32, -libc::EEXIST] {
+                let n = unsafe {
+                    libc::recv(
+                        kernel.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+                seen.push(buf[..n as usize].to_vec());
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                let mut err = reply.to_ne_bytes().to_vec();
+                err.extend_from_slice(&buf[..NLMSG_HDR.min(n as usize)]);
+                send_raw(&kernel, &msg_seq(NLMSG_ERROR, seq, &err));
+            }
+            seen
+        });
+
+        sock.set_self_fdb(7, &[2, 0, 0, 0, 0, 5], true)
+            .expect("an acknowledgement of code zero is success");
+        let e = sock
+            .set_self_fdb(7, &[2, 0, 0, 0, 0, 5], true)
+            .expect_err("EEXIST has to reach the caller, who treats it as not-ours");
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+
+        drop(sock);
+        let seen = answers.join().unwrap();
+        assert_eq!(seen.len(), 2);
+        let req = &seen[0];
+        assert_eq!(
+            u16::from_ne_bytes(req[4..6].try_into().unwrap()),
+            RTM_NEWNEIGH
+        );
+        let flags = u16::from_ne_bytes(req[6..8].try_into().unwrap());
+        assert_eq!(
+            flags,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            "EXCL is what keeps somebody else's entry from being claimed"
+        );
+        assert_eq!(req[16], libc::AF_BRIDGE as u8);
+        assert_eq!(
+            u32::from_ne_bytes(req[20..24].try_into().unwrap()),
+            7,
+            "the interface index"
+        );
+        assert_eq!(
+            u16::from_ne_bytes(req[24..26].try_into().unwrap()),
+            NUD_PERMANENT
+        );
+        assert_eq!(req[26], NTF_SELF);
+        // The address attribute closes the request.
+        assert_eq!(&req[32..38], &[2, 0, 0, 0, 0, 5]);
+    }
+
+    /// Lengths come off the wire and are believed nowhere: a message that
+    /// claims four gigabytes, an attribute that runs past its buffer, an
+    /// attribute shorter than its own header - each ends the walk, none
+    /// panics. The kernel does not send these; the point is that nothing
+    /// else may be able to make this daemon abort by sending them either.
+    #[test]
+    fn hostile_lengths_end_the_walk_instead_of_the_process() {
+        // A message header claiming u32::MAX bytes.
+        let mut huge = Vec::new();
+        put_nlmsghdr(&mut huge, u32::MAX, RTM_NEWNEIGH, 0, 1);
+        assert_eq!(messages(&huge).count(), 0);
+
+        // A message claiming a little more than there is.
+        let mut over = Vec::new();
+        put_nlmsghdr(&mut over, (NLMSG_HDR + 8) as u32, RTM_NEWNEIGH, 0, 1);
+        over.extend_from_slice(&[0u8; 4]); // only 4 of the promised 8
+        assert_eq!(messages(&over).count(), 0);
+
+        // An attribute that runs past its buffer, after one good one.
+        let mut a = Vec::new();
+        put_attr(&mut a, 1, &[1, 2, 3, 4]);
+        a.extend_from_slice(&200u16.to_ne_bytes()); // len far past the end
+        a.extend_from_slice(&2u16.to_ne_bytes());
+        a.extend_from_slice(&[9u8; 4]);
+        let got: Vec<_> = attrs(&a).collect();
+        assert_eq!(got.len(), 1, "the good attribute, and only it");
+
+        // An attribute shorter than its own header.
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u16.to_ne_bytes());
+        b.extend_from_slice(&1u16.to_ne_bytes());
+        assert_eq!(attrs(&b).count(), 0);
+    }
+
     /// A question asked without NLM_F_DUMP has nothing to end, but a kernel
     /// may end it anyway - an interface that disappears between the asking
     /// and the answering gets exactly this. It used to fall through to the
@@ -1492,6 +1788,58 @@ mod tests {
         assert_eq!(got.len(), 8, "every entry has to come back, once");
 
         drop(sock); // ends the listener's loop
+        let attempts = listener.join().unwrap();
+        assert!(
+            attempts >= 2,
+            "the point of the test is that it took a second, bigger attempt"
+        );
+    }
+
+    /// The one-interface question grows its buffer the way a dump does. It
+    /// used to give up instead: a PF whose virtual-function list outgrew
+    /// 64 KiB - a few hundred functions, which ConnectX hardware sells -
+    /// failed vf_macs_of, which failed the WHOLE pass, on every pass, for
+    /// ever. Fail-closed was the right direction, but "this host is too big
+    /// to reconcile at all" is not a state, it is a bug.
+    ///
+    /// Verified by mutation: with the resend-after-growing removed, this
+    /// fails with "the answer outgrew the buffer".
+    #[test]
+    fn a_one_interface_answer_that_does_not_fit_grows_rather_than_failing() {
+        let (mut sock, kernel) = kernel_pair();
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut answered = 0;
+            loop {
+                let n = unsafe {
+                    libc::recv(
+                        kernel.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n < NLMSG_HDR as isize {
+                    return answered;
+                }
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                // One answer, 200 bytes of payload - more than the 64 the
+                // caller starts with, well under what it grows to.
+                send_raw(&kernel, &msg_seq(RTM_NEWLINK, seq, &[7u8; 200]));
+                answered += 1;
+            }
+        });
+
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETLINK, NLM_F_REQUEST, 9);
+        let mut seen = Vec::new();
+        sock.request_one_from(64, &req, RTM_NEWLINK, &mut |payload: &[u8]| {
+            seen.push(payload.len())
+        })
+        .expect("the question has to survive a buffer that starts too small");
+        assert_eq!(seen, vec![200], "the answer has to arrive, once");
+
+        drop(sock);
         let attempts = listener.join().unwrap();
         assert!(
             attempts >= 2,

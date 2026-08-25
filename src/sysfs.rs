@@ -254,6 +254,17 @@ impl Topology {
             } else {
                 could_have_device(l) && base.join("device").is_dir()
             };
+            // The dump and the reads below are two moments, and a rename in
+            // between - udev renames NICs at boot, which is when this daemon
+            // starts - makes <name> another interface's directory. Its VF
+            // count, driver and functions would then become THIS uplink's
+            // exclusions, which is the wrong set in the dangerous direction.
+            // One file says whether the directory still answers for this
+            // interface; on any disagreement the device-backed extras are
+            // skipped for this pass, and the next pass reads afresh.
+            let has_device = has_device
+                && read_trim(base.join("ifindex")).and_then(|s| s.parse::<u32>().ok())
+                    == Some(l.index);
 
             // sysfs carries a lower_<name> link for what an interface is
             // built on. Two relations produce those: a port's master, seen
