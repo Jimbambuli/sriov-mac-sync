@@ -72,7 +72,6 @@ struct Names {
     vf_netdevs: Vec<String>,
 }
 
-#[cfg(test)]
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -233,10 +232,12 @@ impl Topology {
         // with a kind has no device directory to find, and asking is one
         // statx that always fails. On a host full of containers that is
         // nearly every interface: 409 of them here, 3.2 ms of a 23 ms pass.
-        // An interface handing out virtual functions is asked regardless,
-        // since that is the case this daemon exists for and the count comes
-        // from the dump.
-        let could_have_device = |l: &crate::netlink::LinkInfo| l.kind.is_none() || l.num_vf > 0;
+        // The dump cannot say which interfaces have virtual functions - that
+        // count is only sent when the request asks for the functions
+        // themselves, which is the expensive thing this avoids - so the kind
+        // is the whole of the test. An interface handing out virtual
+        // functions is a driver bound to a bus device and has no kind.
+        let could_have_device = |l: &crate::netlink::LinkInfo| l.kind.is_none();
 
         let mut by_name: Map<String, u32> =
             Map::with_capacity_and_hasher(links.len(), Default::default());
@@ -269,7 +270,22 @@ impl Topology {
                 master: l.master,
                 lowers,
                 is_bridge: l.kind.as_deref() == Some("bridge"),
-                numvfs: l.num_vf,
+                // Not from the dump. IFLA_NUM_VF is only sent when the
+                // request carries RTEXT_FILTER_VF, which this one does not -
+                // that flag makes every driver with virtual functions answer
+                // out of its firmware, and avoiding it is why the dump is
+                // cheap. Reading one file for the interfaces that have a
+                // device behind them costs nothing by comparison, and the
+                // count is load-bearing: the autodetection looks for
+                // interfaces that hand out virtual functions, and the
+                // exclusions need the netdevs of those functions.
+                numvfs: if has_device {
+                    read_trim(base.join("device/sriov_numvfs"))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
                 driver: if has_device {
                     link_target_name(base.join("device/driver"))
                 } else {

@@ -221,6 +221,42 @@ fn is_registerable(mac: &Mac) -> bool {
     mac[0] & 1 == 0 && *mac != [0u8; 6]
 }
 
+/// Could a link message about this interface have changed a virtual
+/// function's address? `None` when this picture does not have the interface
+/// and so cannot say.
+///
+/// Asking the driver is the most expensive thing a pass does, and the answer
+/// only changes when somebody sets a virtual function's address - from the
+/// host, or from inside a guest that holds one. Neither has anything to do
+/// with a container's veth appearing, which on a busy host is what link
+/// messages mostly are.
+pub fn touches_virtual_functions(topo: &Topology, index: u32) -> Option<bool> {
+    topo.at(index)
+        .map(|link| link.numvfs > 0 || link.physfn.is_some())
+}
+
+/// The same question for a batch, against the picture as it was and the
+/// picture as it is.
+///
+/// Both are needed, and the first attempt at this used only the second: an
+/// interface that has just *gone* is not in the new picture, so every
+/// deletion counted as a reason to ask - which is every second event when
+/// containers come and go. The old picture still knows what it was. An
+/// interface neither picture has is a reason to ask, because nothing here can
+/// say what it was.
+pub fn vf_may_have_changed(
+    before: Option<&Topology>,
+    after: Option<&Topology>,
+    changed: &[u32],
+) -> bool {
+    changed.iter().any(|i| {
+        before
+            .and_then(|t| touches_virtual_functions(t, *i))
+            .or_else(|| after.and_then(|t| touches_virtual_functions(t, *i)))
+            .unwrap_or(true)
+    })
+}
+
 fn physical_function(topo: &Topology, dev: u32) -> u32 {
     topo.at(dev).and_then(|l| l.physfn).unwrap_or(dev)
 }
@@ -737,7 +773,7 @@ impl Syncer {
         apply: bool,
         topo: &Topology,
         topo_load: Duration,
-        interfaces_moved: bool,
+        vf_may_have_moved: bool,
     ) -> io::Result<Vec<Report>> {
         let started = Instant::now();
         let mut timings = Timings {
@@ -783,7 +819,7 @@ impl Syncer {
         // Carried answers count only when they were collected for these very
         // physical functions - a pass over a different pair list must not
         // inherit what was never about it.
-        let vf_macs = match (&self.carried_vf, interfaces_moved) {
+        let vf_macs = match (&self.carried_vf, vf_may_have_moved) {
             (Some((for_pfs, kept)), false) if *for_pfs == pfs => {
                 timings.vf_carried = true;
                 kept.clone()
@@ -2610,5 +2646,81 @@ mod state_tests {
             "the file is the truth: it holds what was appended and nothing else"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What a link message is about decides whether the driver has to be
+    /// asked about virtual function addresses again - the most expensive
+    /// thing a pass does. A container's veth is not a reason; the interface
+    /// that hands out the functions is.
+    ///
+    /// Verified by mutation: answering true always makes the veth case fail,
+    /// answering false always makes the other three fail.
+    #[test]
+    fn only_an_interface_with_virtual_functions_makes_their_addresses_stale() {
+        let topo = host(mac(1));
+        let veth = topo.index_of("veth0").unwrap();
+        let pf = topo.index_of("nic1").unwrap(); // has vfs(1) in the fixture
+        let plain = topo.index_of("nic2").unwrap();
+
+        let now = Some(&topo);
+        assert!(
+            !vf_may_have_changed(now, now, &[veth]),
+            "a container's veth says nothing about virtual functions"
+        );
+        assert!(
+            !vf_may_have_changed(now, now, &[plain, veth]),
+            "nor does an ordinary NIC in the same bridge"
+        );
+        assert!(
+            vf_may_have_changed(now, now, &[pf]),
+            "the interface handing out virtual functions is a reason to ask"
+        );
+        assert!(
+            vf_may_have_changed(now, now, &[veth, pf]),
+            "one reason in the batch is enough"
+        );
+        assert!(
+            vf_may_have_changed(now, now, &[9999]),
+            "an interface neither picture has is a reason to ask"
+        );
+
+        // A veth that has just been destroyed: gone from the new picture,
+        // still in the old one, and never a reason to ask. Judging by the new
+        // picture alone made every deletion a reason - which on a host with
+        // containers is every second link message.
+        let gone = crate::sysfs::Topology::assemble(Vec::new(), crate::hash::map());
+        assert!(
+            !vf_may_have_changed(now, Some(&gone), &[veth]),
+            "what it was is in the picture from before it went"
+        );
+        assert!(
+            vf_may_have_changed(now, Some(&gone), &[pf]),
+            "and a virtual function going is still a reason"
+        );
+    }
+
+    /// The same rule for a virtual function itself: a guest setting its own
+    /// address is announced as a link message about that interface, and it
+    /// changes what must be excluded without moving a forwarding entry.
+    #[test]
+    fn a_virtual_function_of_its_own_counts_too() {
+        let topo = Builder::new()
+            .add("pf0", 2, Some(mac(1)))
+            .vfs(2)
+            .add("pf0v0", 3, Some(mac(2)))
+            .physfn("pf0")
+            .add("tap0", 4, Some(mac(3)))
+            .build();
+        let now = Some(&topo);
+        assert!(vf_may_have_changed(
+            now,
+            now,
+            &[topo.index_of("pf0v0").unwrap()]
+        ));
+        assert!(!vf_may_have_changed(
+            now,
+            now,
+            &[topo.index_of("tap0").unwrap()]
+        ));
     }
 }

@@ -61,7 +61,6 @@ const IFLA_MASTER: u16 = 10;
 const IFLA_LINK: u16 = 5;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_INFO_KIND: u16 = 1;
-const IFLA_NUM_VF: u16 = 21;
 const IFLA_PARENT_DEV_NAME: u16 = 56;
 const IFLA_EXT_MASK: u16 = 29;
 const IFLA_VFINFO_LIST: u16 = 22;
@@ -145,7 +144,6 @@ pub struct LinkInfo {
     /// is why the kind has to be consulted before believing it
     pub link: Option<u32>,
     pub kind: Option<String>,
-    pub num_vf: u32,
     /// the bus device behind this interface, when the kernel names one. Its
     /// presence answers "is there a device/ directory" without a stat.
     pub parent_dev: Option<String>,
@@ -167,6 +165,11 @@ enum DumpEnd {
 pub struct Events {
     pub fdb: Vec<(u16, FdbEntry)>,
     pub links_changed: bool,
+    /// Which interfaces the link messages were about. An interface appearing
+    /// or going says the picture has to be read again; whether it says the
+    /// virtual functions' addresses have to be asked for again depends on
+    /// which interface it was, and that is the caller's judgement to make.
+    pub changed_links: Vec<u32>,
 }
 
 pub struct Socket {
@@ -780,6 +783,14 @@ impl Socket {
         for msg in messages(&buf[..n]) {
             if msg.kind == RTM_NEWLINK || msg.kind == RTM_DELLINK {
                 out.links_changed = true;
+                if msg.payload.len() >= IFINFOMSG_LEN {
+                    if let Ok(bytes) = msg.payload[4..8].try_into() {
+                        let index = i32::from_ne_bytes(bytes);
+                        if index > 0 {
+                            out.changed_links.push(index as u32);
+                        }
+                    }
+                }
                 continue;
             }
             if msg.kind != RTM_NEWNEIGH && msg.kind != RTM_DELNEIGH {
@@ -909,9 +920,6 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                 if i != 0 {
                     out.link = Some(i);
                 }
-            }
-            IFLA_NUM_VF if value.len() >= 4 => {
-                out.num_vf = u32::from_ne_bytes(value[..4].try_into().ok()?);
             }
             IFLA_PARENT_DEV_NAME => {
                 let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());

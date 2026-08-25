@@ -613,6 +613,15 @@ fn run() -> Result<bool, String> {
             // to find what the events missed.
             let mut held: Option<Topology> = None;
             let mut stale = true;
+            // Whether the virtual functions' addresses have to be asked for
+            // again. Held apart from `stale` because the two have different
+            // reasons: any interface appearing or going invalidates the
+            // picture, but only an interface that has virtual functions - or
+            // is one - can have changed what they are called. Asking is the
+            // most expensive thing a pass does, and on a host full of
+            // containers most link messages are a veth nobody here cares
+            // about.
+            let mut vf_stale = true;
             // When the last full pass ran, so event storms are answered with
             // a bounded pass rate rather than with waiting. Registrations
             // never wait: every batch goes through the fast path the moment
@@ -631,6 +640,9 @@ fn run() -> Result<bool, String> {
                     // where it only says what the next would be called.
                     if trigger == "timed" {
                         stale = true;
+                        // The timed pass exists to find what the events
+                        // missed, so it believes nothing it was told.
+                        vf_stale = true;
                     }
                     // Autodetection is redone every pass. A NIC that gets its
                     // VFs later, or a bridge built after boot, must not need a
@@ -682,8 +694,9 @@ fn run() -> Result<bool, String> {
                             trigger = "timed";
                             continue;
                         };
-                        match syncer.reconcile(&mut sock, true, topo, topo_load, reloaded) {
+                        match syncer.reconcile(&mut sock, true, topo, topo_load, vf_stale) {
                             Ok(reports) => {
+                                vf_stale = false;
                                 report_changes(
                                     &reports,
                                     opts.dry_run,
@@ -713,6 +726,7 @@ fn run() -> Result<bool, String> {
                         eprintln!("warning: waiting for events failed: {e}");
                         next_full = Instant::now();
                         stale = true;
+                        vf_stale = true;
                         trigger = "recovery";
                         continue;
                     }
@@ -732,6 +746,7 @@ fn run() -> Result<bool, String> {
                         // What was in the messages that never arrived is not
                         // knowable, so nothing carried over may be believed.
                         stale = true;
+                        vf_stale = true;
                         trigger = "lost events";
                         continue;
                     }
@@ -752,6 +767,11 @@ fn run() -> Result<bool, String> {
                     "forwarding change"
                 };
 
+                // What the batch's link messages were about, judged against
+                // the picture as it stands - before it is read again, because
+                // an interface that has just gone is only in this one.
+                let before_reload: Vec<u32> = events.changed_links.clone();
+
                 // Register what just appeared before anything else, so the
                 // first reply to it is not sent into the void.
                 //
@@ -759,14 +779,19 @@ fn run() -> Result<bool, String> {
                 // the same picture, so read it here if it is wanted and let
                 // that one have it too. Reading it twice for one event was
                 // the whole of what this used to cost.
+                let mut previous: Option<Topology> = None;
                 if stale || held.is_none() {
                     match read_topology(&mut sock) {
                         Ok(t) => {
-                            held = Some(t);
+                            previous = held.replace(t);
                             stale = false;
                         }
                         Err(e) => eprintln!("warning: {e}"),
                     }
+                }
+                if !before_reload.is_empty() {
+                    vf_stale |=
+                        sync::vf_may_have_changed(previous.as_ref(), held.as_ref(), &before_reload);
                 }
                 // Whether the batch left anything for a pass to do. A pass
                 // dumps the host's whole forwarding table, so a batch that

@@ -8,8 +8,10 @@ came out right, and reports what it cost:
   S2  pairs sent 50 ms apart                 -> close-succession latency
   S3  a burst of sixteen at once             -> burst turnaround, one figure
   S4  a hundred cold passes of --once        -> per-phase min/median/p95/max
-  S5  the test port deleted                  -> everything taken back, bounded
-  S6  the daemon's own journal and the state -> quiet, and byte-identical
+  S5  one of ours learnt on the uplink port  -> unregistered, and how fast
+  S6  a virtual function's own address       -> never registered at all
+  S7  the test port deleted                  -> everything taken back, bounded
+  S8  the daemon's own journal and the state -> quiet, and byte-identical
 
 The run fails loudly if any verification does not hold; the exit code says so.
 
@@ -100,12 +102,19 @@ class Cleanup:
 
     def __init__(self):
         self.done = False
+        # (pf, vf index, address it had) - set while a scenario borrows a
+        # virtual function's address, cleared when it gives it back.
+        self.vf_address = None
 
     def __call__(self, *_):
         if self.done:
             return
         self.done = True
         subprocess.run(["ip", "link", "del", VETH], capture_output=True)
+        if self.vf_address:
+            pf, idx, mac = self.vf_address
+            subprocess.run(["ip", "link", "set", pf, "vf", str(idx), "mac", mac],
+                           capture_output=True)
         purge_learned_residue()
         # No note surgery, ever: the daemon's ENOENT path heals the notes on
         # the next pass once the entries are gone from the card.
@@ -222,6 +231,55 @@ def fdb_residue():
     ]
 
 
+def learn_on(dev, mac):
+    """Make the bridge believe it learnt an address on a port of our choosing.
+
+    A `dynamic` entry is what learning produces - not permanent, not self -
+    and the kernel announces it the same way, so the daemon cannot tell it
+    from the real thing. This is how the wire side is reachable at all in a
+    trial that has only one host: an address that turns up on the uplink's own
+    port is what a guest migrating away looks like from here, and there is no
+    other way to produce one without a second machine sending frames."""
+    run(["bridge", "fdb", "add", mac_str(mac), "dev", dev, "master", "dynamic"])
+
+
+def unlearn_on(dev, mac):
+    run(["bridge", "fdb", "del", mac_str(mac), "dev", dev, "master"])
+
+
+def free_virtual_function(uplink):
+    """A virtual function of the uplink's own physical function that nothing
+    is using: bound on the host (so not handed to a guest), not the uplink,
+    and not a port of any bridge. Its address can be borrowed for a moment.
+
+    None when there is no such function, which is the ordinary case on a host
+    whose functions are all in guests - the scenario then says so and is
+    skipped rather than failed."""
+    pf_link = f"/sys/class/net/{uplink}/device/physfn"
+    if not os.path.isdir(pf_link):
+        return None
+    pf_dir = os.path.realpath(pf_link)
+    pf_names = os.listdir(f"{pf_dir}/net") if os.path.isdir(f"{pf_dir}/net") else []
+    if not pf_names:
+        return None
+    pf = pf_names[0]
+    for entry in sorted(os.listdir(pf_dir)):
+        if not entry.startswith("virtfn"):
+            continue
+        index = int(entry[len("virtfn"):])
+        net = f"{pf_dir}/{entry}/net"
+        if not os.path.isdir(net):
+            continue  # handed to a guest; not ours to touch
+        for name in os.listdir(net):
+            if name == uplink:
+                continue
+            if os.path.exists(f"/sys/class/net/{name}/master"):
+                continue  # in a bridge; somebody is using it
+            current = read(f"/sys/class/net/{name}/address")
+            return pf, index, name, current
+    return None
+
+
 def note_bytes(uplink):
     try:
         with open(f"/run/sriov-mac-sync/{uplink}.owned", "rb") as f:
@@ -290,7 +348,8 @@ def preflight(args, binary):
 
 
 class Trial:
-    def __init__(self, args, binary, uplinks):
+    def __init__(self, args, binary, uplinks, cleanup):
+        self.cleanup = cleanup
         self.args = args
         self.binary = binary
         self.uplinks = uplinks
@@ -480,8 +539,93 @@ class Trial:
                   f"cold form (fresh process and topology) - event latency is S1")
         self.verdict("cold pass statistics", ok, detail)
 
-    def s5_teardown(self, mon):
-        print("\nS5  the port disappears; everything has to come back out")
+    def s5_reflection(self, mon):
+        """A guest that moved to another host: its address, which we
+        registered while it was here, starts being learnt on the uplink's own
+        port. The registration is now worse than useless - the eSwitch keeps
+        handing that traffic to the uplink, and the bridge cannot send it back
+        out of the port it arrived on - so it has to come out."""
+        print("\nS5  an address of ours turns up on the wire")
+        mac = self.macs(1)[0]
+        self.send(mac)
+        if not self.await_registered(mon, [mac], time.monotonic_ns() + 3_000_000_000):
+            self.verdict("wire reflection", False,
+                         "the address was never registered, so nothing could "
+                         "be reflected - see S1")
+            return
+        t0 = time.monotonic_ns()
+        for u in self.uplinks:
+            learn_on(u, mac)
+        deadline = t0 + 5_000_000_000
+        gone = False
+        while time.monotonic_ns() < deadline and not gone:
+            mon.pump(time.monotonic_ns() + 100_000_000)
+            gone = all(mac_str(mac) not in self_macs(u) for u in self.uplinks)
+        took = (time.monotonic_ns() - t0) / 1e6
+        noted_gone = all(mac_str(mac).encode() not in note_bytes(u) for u in self.uplinks)
+        for u in self.uplinks:
+            unlearn_on(u, mac)
+        self.verdict(
+            "wire reflection", gone and noted_gone,
+            f"unregistered {took:.1f} ms after the address appeared on the "
+            f"uplink port, note cleared" if gone and noted_gone else
+            ("still in the filter after 5 s - a guest that moved away is a "
+             "black hole until the next pass" if not gone else
+             "out of the filter but still in the note - nothing owns it now"))
+
+    def s6_vf_address(self, mon):
+        """A virtual function's own address must never be registered.
+        Registering it tells the eSwitch that the guest holding that function
+        lives behind the bridge, and its traffic is sent past it.
+
+        The address is set from the host here, which is what a guest setting
+        its own does from the outside: the kernel announces it as a link
+        message and nothing in the forwarding tables moves."""
+        print("\nS6  an address that belongs to a virtual function")
+        # The uplink of the bridge under test, not just any watched uplink: a
+        # virtual function of some other card's physical function is an
+        # ordinary foreign address as far as this bridge is concerned, and
+        # registering it is correct. Getting that wrong made this scenario
+        # fail against a daemon that was right.
+        here = [d for (d, b) in watched_pairs(self.binary) if b == self.args.bridge]
+        if not here:
+            self.verdict("virtual function address", True,
+                         f"skipped: no watched uplink on {self.args.bridge}")
+            return
+        uplink = here[0]
+        found = free_virtual_function(uplink)
+        if not found:
+            self.verdict("virtual function address", True,
+                         "skipped: no virtual function of this uplink's own "
+                         "physical function is free to borrow an address from")
+            return
+        pf, index, vf_name, original = found
+        mac = self.macs(1)[0]
+        cleanup_vf = (pf, index, original)
+        self.cleanup.vf_address = cleanup_vf
+        run(["ip", "link", "set", pf, "vf", str(index), "mac", mac_str(mac)])
+        time.sleep(1.5)  # the link message, and the pass that answers it
+
+        # ... and now something behind the bridge speaks with that address.
+        self.send(mac)
+        time.sleep(1.5)
+        mon.pump(time.monotonic_ns() + 200_000_000)
+        registered = mac_str(mac) in self_macs(uplink)
+
+        run(["ip", "link", "set", pf, "vf", str(index), "mac", original])
+        self.cleanup.vf_address = None
+        if registered:
+            run(["bridge", "fdb", "del", mac_str(mac), "dev", uplink, "self", "permanent"])
+        purge_learned_residue()
+        self.verdict(
+            "virtual function address", not registered,
+            f"{vf_name}'s address stayed out of {uplink}'s filter while the "
+            f"bridge had learnt it" if not registered else
+            f"REGISTERED on {uplink} - the guest holding {vf_name} would have "
+            f"its traffic sent past it")
+
+    def s7_teardown(self, mon):
+        print("\nS7  the port disappears; everything has to come back out")
         t0 = time.monotonic_ns()
         run(["ip", "link", "del", VETH])
         purged = purge_learned_residue()
@@ -506,8 +650,8 @@ class Trial:
         self.verdict("removal after port loss", clean, detail)
         return clean
 
-    def s6_quiescence(self, since_epoch, pre_state):
-        print("\nS6  the daemon's own account, and the state afterwards")
+    def s8_quiescence(self, since_epoch, pre_state):
+        print("\nS8  the daemon's own account, and the state afterwards")
         j = run(["journalctl", "-u", "sriov-mac-sync", "-q",
                  "--since", f"@{since_epoch}", "-o", "cat"])
         noise = [l for l in j.stdout.splitlines()
@@ -574,7 +718,7 @@ def main():
     cleanup.arm()
     mon = Monitor()
 
-    t = Trial(args, args.binary, uplinks)
+    t = Trial(args, args.binary, uplinks, cleanup)
     t.setup_port()
     time.sleep(2.5)  # the port add is an interface event; let its pass run
 
@@ -582,10 +726,12 @@ def main():
     t.s2_settle_path(mon)
     t.s3_burst(mon)
     t.s4_pass_stats()
-    clean = t.s5_teardown(mon)
+    t.s5_reflection(mon)
+    t.s6_vf_address(mon)
+    clean = t.s7_teardown(mon)
     cleanup.done = True  # the veth is gone; nothing else was ever created
     time.sleep(1)
-    t.s6_quiescence(since_epoch, pre_state)
+    t.s8_quiescence(since_epoch, pre_state)
 
     print("\n" + "=" * 64)
     failed = [n for (n, ok, _) in t.results if not ok]
