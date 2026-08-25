@@ -566,7 +566,7 @@ fn run() -> Result<bool, String> {
         Mode::Flush => syncer.flush(&mut sock).map_err(|e| e.to_string()),
         Mode::Status => {
             let reports = syncer
-                .reconcile(&mut sock, false, &topo, topo_load, true)
+                .reconcile(&mut sock, false, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             for r in &reports {
                 println!("{} on {} ({})", r.dev, r.bridge, r.driver);
@@ -596,7 +596,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Once => {
             let reports = syncer
-                .reconcile(&mut sock, true, &topo, topo_load, true)
+                .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
             if opts.timings {
@@ -646,7 +646,7 @@ fn run() -> Result<bool, String> {
             // most expensive thing a pass does, and on a host full of
             // containers most link messages are a veth nobody here cares
             // about.
-            let mut vf_stale = true;
+
             // What reading the picture cost when an event read it, so the
             // pass that uses it can account for it. Without this a pass whose
             // topology was read moments earlier reports "0.000 ms" for it,
@@ -673,7 +673,7 @@ fn run() -> Result<bool, String> {
                         stale = true;
                         // The timed pass exists to find what the events
                         // missed, so it believes nothing it was told.
-                        vf_stale = true;
+                        syncer.vf_stale = true;
                     }
                     // Autodetection is redone every pass. A NIC that gets its
                     // VFs later, or a bridge built after boot, must not need a
@@ -732,9 +732,8 @@ fn run() -> Result<bool, String> {
                             trigger = "timed";
                             continue;
                         };
-                        match syncer.reconcile(&mut sock, true, topo, topo_load, vf_stale) {
+                        match syncer.reconcile(&mut sock, true, topo, topo_load) {
                             Ok(reports) => {
-                                vf_stale = false;
                                 report_changes(
                                     &reports,
                                     opts.dry_run,
@@ -764,7 +763,7 @@ fn run() -> Result<bool, String> {
                         eprintln!("warning: waiting for events failed: {e}");
                         next_full = Instant::now();
                         stale = true;
-                        vf_stale = true;
+                        syncer.vf_stale = true;
                         trigger = "recovery";
                         continue;
                     }
@@ -784,7 +783,7 @@ fn run() -> Result<bool, String> {
                         // What was in the messages that never arrived is not
                         // knowable, so nothing carried over may be believed.
                         stale = true;
-                        vf_stale = true;
+                        syncer.vf_stale = true;
                         trigger = "lost events";
                         continue;
                     }
@@ -829,9 +828,10 @@ fn run() -> Result<bool, String> {
                         Err(e) => eprintln!("warning: {e}"),
                     }
                 }
-                if !before_reload.is_empty() {
-                    vf_stale |=
-                        sync::vf_may_have_changed(previous.as_ref(), held.as_ref(), &before_reload);
+                if !before_reload.is_empty()
+                    && sync::vf_may_have_changed(previous.as_ref(), held.as_ref(), &before_reload)
+                {
+                    syncer.vf_stale = true;
                 }
                 // Whether the batch left anything for a pass to do. A pass
                 // dumps the host's whole forwarding table, so a batch that

@@ -405,7 +405,23 @@ impl Socket {
                     return Ok(DumpEnd::Interrupted);
                 }
                 match msg.kind {
-                    NLMSG_DONE => return Ok(DumpEnd::Done),
+                    // The end of a dump carries the dump callback's exit
+                    // code, and it is negative when the kernel gave up
+                    // partway - out of memory building the answer, say. Read
+                    // as a finished dump, that is a short forwarding table
+                    // read as a complete one, which ends with every
+                    // registration past the cut removed. Kernels that send no
+                    // body are taken at their word, as before.
+                    NLMSG_DONE => {
+                        if msg.payload.len() >= 4 {
+                            let code =
+                                i32::from_ne_bytes(msg.payload[..4].try_into().unwrap_or_default());
+                            if code != 0 {
+                                return Err(io::Error::from_raw_os_error(-code));
+                            }
+                        }
+                        return Ok(DumpEnd::Done);
+                    }
                     NLMSG_ERROR => {
                         // The request asks for no acknowledgement, so an error
                         // message is only ever bad news. One whose code reads
@@ -1497,6 +1513,66 @@ mod tests {
             RTEXT_FILTER_SKIP_STATS,
             "without this the kernel reads traffic counters out of the card \
              for every virtual function, on every pass, for nobody"
+        );
+    }
+
+    /// A dump the kernel abandons ends with NLMSG_DONE carrying a negative
+    /// errno. Believing that end is believing a short table is the whole
+    /// table - which is how every registration past the cut gets removed.
+    ///
+    /// Verified by mutation: without reading the code this returns Ok and the
+    /// entries are silently lost.
+    #[test]
+    fn a_dump_the_kernel_gave_up_on_is_not_a_finished_dump() {
+        let (mut sock, kernel) = kernel_pair();
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::recv(
+                        kernel.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n < NLMSG_HDR as isize {
+                    return;
+                }
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                // One entry, then "done" with -ENOMEM in its body.
+                send_raw(
+                    &kernel,
+                    &msg_seq(
+                        RTM_NEWNEIGH,
+                        seq,
+                        &ndmsg(1, 0x02, 0, Some([0x02, 0, 0, 0, 0, 1]), Some(5)),
+                    ),
+                );
+                send_raw(
+                    &kernel,
+                    &msg_seq(NLMSG_DONE, seq, &(-libc::ENOMEM).to_ne_bytes()),
+                );
+            }
+        });
+
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETNEIGH, NLM_F_REQUEST, 0);
+        let got = sock.dump_from(
+            64 * 1024,
+            &req,
+            RTM_NEWNEIGH,
+            "test",
+            |p, out: &mut Vec<usize>| out.push(p.len()),
+        );
+        drop(sock);
+        let _ = listener.join();
+
+        let err = got.expect_err("a dump that ended in an error is not an answer");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENOMEM),
+            "and it says which error, so the warning names it"
         );
     }
 }

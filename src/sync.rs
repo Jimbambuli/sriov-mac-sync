@@ -143,6 +143,13 @@ pub struct Syncer {
     /// list is kept so a pass over different pairs cannot inherit answers
     /// that were never about them.
     carried_vf: Option<CarriedVf>,
+    /// Whether the carried answer can still be believed. Set by whoever
+    /// notices an interface with virtual functions changing, cleared in the
+    /// one place a fresh answer is read - so the full pass and the fast path
+    /// cannot disagree about it. They did: main worked this out, passed it to
+    /// the pass and not to the fast path, and a batch arriving between the
+    /// change and the pass built its exclusions from the old list.
+    pub vf_stale: bool,
     /// Pinned addresses already warned about, per uplink, so the warning
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
@@ -290,10 +297,19 @@ impl Syncer {
             state_dir,
             timings: Timings::default(),
             carried_vf: None,
+            vf_stale: true,
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
         }
+    }
+
+    /// Record the driver's answer about the virtual functions, and that it
+    /// is current. One function, so the answer and "is it still true" cannot
+    /// be set apart from each other.
+    fn remember_vf(&mut self, pfs: Vec<u32>, macs: Vec<(u32, Mac)>) {
+        self.carried_vf = Some((pfs, macs));
+        self.vf_stale = false;
     }
 
     fn state_path(&self, dev: &str) -> PathBuf {
@@ -798,7 +814,6 @@ impl Syncer {
         apply: bool,
         topo: &Topology,
         topo_load: Duration,
-        vf_may_have_moved: bool,
     ) -> io::Result<Vec<Report>> {
         let started = Instant::now();
         let mut timings = Timings {
@@ -844,7 +859,7 @@ impl Syncer {
         // Carried answers count only when they were collected for these very
         // physical functions - a pass over a different pair list must not
         // inherit what was never about it.
-        let vf_macs = match (&self.carried_vf, vf_may_have_moved) {
+        let vf_macs = match (&self.carried_vf, self.vf_stale) {
             (Some((for_pfs, kept)), false) if *for_pfs == pfs => {
                 timings.vf_carried = true;
                 kept.clone()
@@ -853,7 +868,7 @@ impl Syncer {
                 let mark = Instant::now();
                 let fresh = sock.vf_macs_of(&pfs)?;
                 timings.vf_macs = mark.elapsed();
-                self.carried_vf = Some((pfs.clone(), fresh.clone()));
+                self.remember_vf(pfs.clone(), fresh.clone());
                 fresh
             }
         };
@@ -1114,11 +1129,15 @@ impl Syncer {
                 pfs.push(pf);
             }
         }
-        let vf_macs = match &self.carried_vf {
-            Some((for_pfs, kept)) if *for_pfs == pfs => kept.clone(),
+        // The same rule as the pass, from the same flag. The fast path used
+        // to reuse the carried answer whenever the physical functions
+        // matched, which is not the question: the addresses change without
+        // the list of functions changing at all.
+        let vf_macs = match (&self.carried_vf, self.vf_stale) {
+            (Some((for_pfs, kept)), false) if *for_pfs == pfs => kept.clone(),
             _ => {
                 let fresh = sock.vf_macs_of(&pfs)?;
-                self.carried_vf = Some((pfs.clone(), fresh.clone()));
+                self.remember_vf(pfs.clone(), fresh.clone());
                 fresh
             }
         };
@@ -1275,15 +1294,22 @@ impl Syncer {
             //
             // Looked up here rather than folded into `skip` when the batch is
             // prepared: on a busy segment that set holds every address the
-            // switch carries - fourteen thousand of them on the host this was
-            // measured on - and copying it into the skip set cost 550 us per
+            // switch carries and copying it into the skip set cost 550 us per
             // batch, which is to say per address learnt anywhere on the
             // bridge. Two lookups are two lookups whatever the set holds.
+            //
+            // The batch counts as ours all the same. Only a full pass ever
+            // replaces this set from the real forwarding table, so a refusal
+            // that bought no pass would suppress its own correction: a guest
+            // that moved away and came back would stay unregistered until an
+            // unrelated event or the timer, up to the whole interval, while
+            // address resolution for it succeeds and the unicast disappears.
             if self
                 .carried_wire
                 .get(&fp.dev)
                 .is_some_and(|w| w.contains(&entry.mac))
             {
+                ours = true;
                 continue;
             }
             if entry.ifindex == fp.port {
@@ -1936,9 +1962,7 @@ mod state_tests {
             ..Default::default()
         };
         let mut s = ready_syncer(&dir);
-        let reports = s
-            .reconcile(&mut sock, true, &topo, Dur::ZERO, true)
-            .unwrap();
+        let reports = s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
         let registered: Set<Mac> = sock.added.iter().map(|(_, m)| *m).collect();
         let (want, _, _) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &[(2, VF_ADMIN)]);
@@ -1967,7 +1991,7 @@ mod state_tests {
         let mut s = ready_syncer(&dir);
         let (want, _, wire) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &vf);
         s.carried_wire.insert("nic1".into(), wire);
-        s.carried_vf = Some((vec![2], vf.clone()));
+        s.remember_vf(vec![2], vf.clone());
 
         for entry in fdb() {
             let mut sock = FakeSock::default();
@@ -2004,8 +2028,7 @@ mod state_tests {
             ..Default::default()
         };
         let mut s = ready_syncer(&dir);
-        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
-            .unwrap();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
         assert!(
             !s.load_owned("nic1").contains(&BEHIND_GUEST),
             "an entry somebody else created was claimed - it would be deleted later"
@@ -2033,8 +2056,7 @@ mod state_tests {
                 .collect::<Map<_, _>>(),
             ..Default::default()
         };
-        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
-            .unwrap();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
         let owned = s.load_owned("nic1");
         assert!(!owned.contains(&gone_mac), "ENOENT means gone, not stuck");
         assert!(
@@ -2072,8 +2094,7 @@ mod state_tests {
             vf: vec![(2, VF_ADMIN)],
             ..Default::default()
         };
-        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
-            .unwrap();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
         s.flush(&mut sock).unwrap();
         assert!(
             sock.added.is_empty() && sock.removed.is_empty(),
@@ -2119,8 +2140,7 @@ mod state_tests {
         s.authoritative = true;
         s.save_owned("nic1", &[mac(0x71)].into_iter().collect::<Set<_>>());
         let mut sock = FakeSock::default();
-        s.reconcile(&mut sock, true, &topo, Dur::ZERO, true)
-            .unwrap();
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
         assert_eq!(
             sock.removed,
             vec![(2, mac(0x71))],
@@ -2193,8 +2213,7 @@ mod state_tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            s.reconcile(&mut sock, false, &topo, Dur::ZERO, true)
-                .unwrap();
+            s.reconcile(&mut sock, false, &topo, Dur::ZERO).unwrap();
         }
         assert!(sock.added.is_empty() && sock.removed.is_empty());
         assert_eq!(
@@ -2285,11 +2304,11 @@ mod state_tests {
                 ..Default::default()
             };
             // warm once, then measure the median of five
-            let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO, true);
+            let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO);
             let mut runs: Vec<u128> = (0..5)
                 .map(|_| {
                     let t = Instant::now();
-                    let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO, true);
+                    let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO);
                     t.elapsed().as_micros()
                 })
                 .collect();
@@ -2323,7 +2342,7 @@ mod state_tests {
         let dir = scratch("reflection");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
         // It was behind the bridge a moment ago, registered and noted.
         s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
 
@@ -2356,7 +2375,7 @@ mod state_tests {
         let dir = scratch("reflection-foreign");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
 
         let mut sock = FakeSock::default();
         s.fast_apply(
@@ -2383,7 +2402,7 @@ mod state_tests {
         let dir = scratch("reflection-order");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
 
         let mut sock = FakeSock::default();
         s.fast_apply(
@@ -2416,7 +2435,7 @@ mod state_tests {
         let dir = scratch("deletion");
         let topo = host(mac(1));
         let mut s = ready_syncer(&dir);
-        s.carried_vf = Some((vec![2], vec![(2, VF_ADMIN)]));
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
         s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
 
         let mut sock = FakeSock::default();
@@ -2520,7 +2539,7 @@ mod state_tests {
         let vf = vec![(2, VF_ADMIN)];
 
         let mut s = ready_syncer(&dir);
-        s.carried_vf = Some((vec![2], vf.clone()));
+        s.remember_vf(vec![2], vf.clone());
         let mut sock = FakeSock::default();
 
         // Somebody else's address, learnt out on the wire. Nothing of ours.
@@ -2575,7 +2594,7 @@ mod state_tests {
 
         // One of ours turning up on the wire: unregistered here, reconciled there.
         let mut s2 = ready_syncer(&dir);
-        s2.carried_vf = Some((vec![2], vf));
+        s2.remember_vf(vec![2], vf);
         s2.save_owned("nic1", &[BEHIND_GUEST].into_iter().collect::<Set<_>>());
         assert!(
             s2.fast_apply(
@@ -2790,6 +2809,87 @@ mod state_tests {
             "half a note",
             "and did not go through the other process's temporary file"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A guest that moved away and came back: its address is in the set the
+    /// last pass saw on the wire, so the fast path refuses to register it -
+    /// rightly, because only a full dump can say where it is now. What it
+    /// must not do is refuse *and* decide the batch was worth nothing: the
+    /// full pass is the only thing that ever replaces that set, so the
+    /// refusal would suppress its own correction and the guest would stay
+    /// unreachable from the VFs until the timer, up to a full interval.
+    ///
+    /// Verified by mutation: without `ours = true` on that path this returns
+    /// Nothing and no pass is bought.
+    #[test]
+    fn an_address_the_wire_set_still_holds_still_buys_a_pass() {
+        let dir = scratch("wire-return");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+        // The last pass saw this address out on the wire.
+        s.carried_wire
+            .insert("nic1".into(), [BEHIND_NIC].into_iter().collect::<Set<_>>());
+
+        let mut sock = FakeSock::default();
+        let urgency = s
+            .fast_apply(
+                &mut sock,
+                &topo,
+                // ... and now it is learnt behind the bridge again.
+                &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+            )
+            .unwrap();
+
+        assert!(
+            sock.added.is_empty(),
+            "the fast path cannot know it has really moved back; only a dump can"
+        );
+        assert_eq!(
+            urgency,
+            Urgency::Now,
+            "but the pass that can find out has to be scheduled"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The fast path and the full pass have to agree about whether the
+    /// carried answer on the virtual functions can still be believed. It used
+    /// to be the pass's business alone: the fast path reused the answer
+    /// whenever the list of physical functions matched, which is not the
+    /// question - the addresses change without that list changing at all.
+    ///
+    /// Verified by mutation: reusing the answer on a PF-list match alone lets
+    /// the fast path register a virtual function's own address here.
+    #[test]
+    fn the_fast_path_asks_again_when_the_answer_went_stale() {
+        let dir = scratch("vf-stale");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        // What the last pass was told, and then somebody set a VF's address.
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+        s.vf_stale = true;
+
+        let fresh: Mac = [0x02, 0x99, 0x99, 0x99, 0x99, 0x99];
+        let mut sock = FakeSock {
+            vf: vec![(2, fresh)],
+            ..Default::default()
+        };
+        s.fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, fresh))],
+        )
+        .unwrap();
+
+        assert!(
+            sock.added.is_empty(),
+            "the address is a virtual function's own; registering it sends \
+             that guest's traffic past it: {:?}",
+            sock.added
+        );
+        assert!(!s.vf_stale, "and having asked, the answer is current again");
         let _ = fs::remove_dir_all(&dir);
     }
 }
