@@ -621,6 +621,13 @@ fn run() -> Result<bool, String> {
             catch_signals();
             let mut mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
+            // A device that drops out of one reading is not gone: an
+            // interface reload takes a bridge away for a moment, and taking
+            // its guests' addresses out of a live filter over that is the
+            // outage this daemon exists to prevent. Long enough to outlive
+            // `ifreload -a`, short enough that a bridge genuinely taken apart
+            // is tidied up within the interval.
+            syncer.orphan_grace = Duration::from_secs(60);
             let mut said_empty = false;
             let interval = Duration::from_secs(opts.interval);
             // A deadline, not a sleep. Wake-ups that turn out to be none of our

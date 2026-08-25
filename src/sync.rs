@@ -150,6 +150,13 @@ pub struct Syncer {
     /// the pass and not to the fast path, and a batch arriving between the
     /// change and the pass built its exclusions from the old list.
     pub vf_stale: bool,
+    /// How long a device has to have been absent from the pair list before
+    /// its note counts as an orphan. Zero for one-shot commands, which mean
+    /// now; the daemon sets it to something that outlives an interface
+    /// reload.
+    pub orphan_grace: Duration,
+    /// When each noted device was first seen to be missing.
+    absent_since: Map<String, Instant>,
     /// Pinned addresses already warned about, per uplink, so the warning
     /// appears when the situation arises and not once per pass forever -
     /// seventeen thousand identical journal lines a day teach an operator
@@ -298,6 +305,8 @@ impl Syncer {
             timings: Timings::default(),
             carried_vf: None,
             vf_stale: true,
+            orphan_grace: Duration::ZERO,
+            absent_since: crate::hash::map(),
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -592,18 +601,53 @@ impl Syncer {
     /// Take back what was registered for a device that is no longer an uplink.
     /// Left alone, the card goes on steering those addresses to a port that
     /// leads nowhere, and nothing short of a reboot undoes it.
-    fn orphaned(&self) -> Vec<String> {
+    /// Devices with a note that are no longer uplinks - and have not been for
+    /// long enough to believe it.
+    ///
+    /// The grace period is the whole point. A device drops out of one reading
+    /// for reasons that have nothing to do with it being gone: `ifreload -a`
+    /// or `ifdown vmbr1 && ifup vmbr1` takes a Proxmox node's bridge away for
+    /// a moment, and every registered address would be deleted from a live
+    /// uplink's filter within 200 ms of a routine network reload - the exact
+    /// outage this daemon exists to prevent, caused by the daemon.
+    ///
+    /// Zero grace is the one-shot behaviour: somebody running --once or
+    /// --flush by hand means now, and there is no earlier reading to compare
+    /// against anyway.
+    fn orphaned(&mut self) -> Vec<String> {
         if !self.authoritative {
+            self.absent_since.clear();
             return Vec::new();
         }
-        let live: Set<&str> = self.pairs.iter().map(|p| p.dev.as_str()).collect();
-        self.noted_devices()
-            .into_iter()
-            .filter(|d| !live.contains(d.as_str()))
-            .collect()
+        let now = Instant::now();
+        let live: Set<String> = self.pairs.iter().map(|p| p.dev.clone()).collect();
+        let noted = self.noted_devices();
+        // Forget devices whose note is gone, or that came back.
+        self.absent_since
+            .retain(|dev, _| noted.contains(dev) && !live.contains(dev));
+        let mut out = Vec::new();
+        for dev in noted {
+            if live.contains(&dev) {
+                continue;
+            }
+            let since = *self.absent_since.entry(dev.clone()).or_insert_with(|| {
+                if !self.orphan_grace.is_zero() {
+                    eprintln!(
+                        "{dev}: no longer among the uplinks; waiting {:?} before \
+                         taking its addresses back out",
+                        self.orphan_grace
+                    );
+                }
+                now
+            });
+            if now.duration_since(since) >= self.orphan_grace {
+                out.push(dev);
+            }
+        }
+        out
     }
 
-    fn drop_orphans(&self, sock: &mut dyn FdbWriter, topo: &Topology, apply: bool) {
+    fn drop_orphans(&mut self, sock: &mut dyn FdbWriter, topo: &Topology, apply: bool) {
         for dev in self.orphaned() {
             let owned = self.load_owned(&dev);
             if !apply || self.dry_run {
@@ -1763,7 +1807,7 @@ mod state_tests {
 
         // `--once --pair nic0:vmbr0` next to a running daemon that also looks
         // after nic1 must not take nic1's addresses away.
-        let s = Syncer::new(
+        let mut s = Syncer::new(
             vec![Pair {
                 dev: "nic0".into(),
                 bridge: "vmbr0".into(),
@@ -2890,6 +2934,54 @@ mod state_tests {
             sock.added
         );
         assert!(!s.vf_stale, "and having asked, the answer is current again");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An interface reload takes a bridge away for a moment. Deleting a live
+    /// uplink's registrations over that - within 200 ms, on a routine
+    /// `ifreload -a` - is the outage this daemon exists to prevent, performed
+    /// by the daemon. A device has to stay gone before its note is believed
+    /// to be an orphan.
+    ///
+    /// Verified by mutation: with the grace period ignored the first pass
+    /// takes the addresses out.
+    #[test]
+    fn a_device_that_blinks_is_not_an_orphan() {
+        let dir = scratch("orphan-grace");
+        let topo = host(mac(1));
+        let mut s = ready_syncer(&dir);
+        s.orphan_grace = Dur::from_secs(60);
+        s.save_owned("nic1", &[BEHIND_NIC].into_iter().collect::<Set<_>>());
+
+        // The bridge went; autodetection finds nothing this pass.
+        s.pairs.clear();
+        let mut sock = FakeSock::default();
+        s.drop_orphans(&mut sock, &topo, true);
+        assert!(
+            sock.removed.is_empty(),
+            "an interface that has been gone for an instant is not gone: {:?}",
+            sock.removed
+        );
+        assert_eq!(
+            s.load_owned("nic1").len(),
+            1,
+            "and its note stays, or the entries become orphans nothing owns"
+        );
+
+        // It comes back, as it does after ifreload.
+        s.pairs.push(pair());
+        s.drop_orphans(&mut sock, &topo, true);
+        assert!(sock.removed.is_empty(), "still nothing to remove");
+
+        // A device that really is gone, with the grace period behind it.
+        s.pairs.clear();
+        s.orphan_grace = Dur::ZERO;
+        s.drop_orphans(&mut sock, &topo, true);
+        assert_eq!(
+            sock.removed,
+            vec![(2, BEHIND_NIC)],
+            "what is genuinely gone still gets cleaned up"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
