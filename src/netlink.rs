@@ -282,6 +282,16 @@ impl Socket {
             return Err(io::Error::last_os_error());
         }
 
+        // Zeroed and then filled in, rather than written as a literal: the
+        // struct has a padding field libc does not make public, so there is
+        // no literal to write. That is deliberate on libc's part, and it is
+        // what makes zeroing the right way to start one of these - the
+        // padding has to be zero and this is the only way to say so. It is
+        // sound for the same reason it is necessary: every field of a
+        // `sockaddr_nl` is an integer, and all-zero is a value each of them
+        // can hold. A struct that ever held something that cannot be zero -
+        // a reference, a `NonNull` - would need a different treatment, and
+        // libc cannot add one to this without breaking every caller.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as u16;
         addr.nl_groups = groups;

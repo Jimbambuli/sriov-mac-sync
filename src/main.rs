@@ -226,6 +226,15 @@ fn load_conf(opts: &mut Options) {
             return;
         }
     };
+    read_conf(opts, &text);
+}
+
+/// The file's contents, apart from finding them. Every way a line can be
+/// malformed ends in a warning and the next line; a configuration file is not
+/// a thing to die on, and this runs before the daemon has done anything.
+/// Separate from `load_conf` so a test can hand it the awkward lines rather
+/// than needing a file at a fixed path in /etc.
+fn read_conf(opts: &mut Options, text: &str) {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -235,11 +244,15 @@ fn load_conf(opts: &mut Options) {
         // Dropping it in silence contradicts the whole point of the warnings
         // below - the setting they wrote down never takes effect and nothing
         // says so.
-        if !line.contains('=') {
+        //
+        // The split is the test. Asking `contains` first and then unwrapping
+        // the same split was two answers to one question, and the second one
+        // was a panic if they ever stopped agreeing - a daemon that dies on a
+        // line of configuration rather than warning about it.
+        let Some((key, value)) = line.split_once('=') else {
             eprintln!("warning: {CONF}: not a setting, ignored: {line}");
             continue;
-        }
-        let (key, value) = line.split_once('=').unwrap();
+        };
         // "RESYNC=300  # seconds" means 300, not a parse warning - but a hash
         // inside quotes is part of the value, not the start of a comment.
         // Nothing this file takes can legitimately contain one today; the
@@ -1082,6 +1095,48 @@ mod tests {
                 "{value:?} split but did not parse"
             );
         }
+    }
+
+    /// Every way a line of the configuration file can be malformed, in one
+    /// place. None of them may be a panic: this runs before the daemon has
+    /// done anything, and a daemon that dies on a stray line of /etc leaves a
+    /// host with no filter maintenance at all - over a line it could have
+    /// warned about and stepped over.
+    #[test]
+    fn a_malformed_configuration_line_is_stepped_over() {
+        let mut o = Options::default();
+        read_conf(
+            &mut o,
+            "\n\
+             # a comment\n\
+             this line has no equals sign at all\n\
+             =\n\
+             =a value with no key\n\
+             NONSENSE=whatever\n\
+             RESYNC=\n\
+             RESYNC=not a number\n\
+             MAX_MACS=\n\
+             EXCLUDE=\n\
+             \t  RESYNC = 600  # with a comment and spaces round the key\n\
+             EXCLUDE=02:00:00:00:00:01\n",
+        );
+        assert_eq!(o.interval, 600, "the one good setting did not take effect");
+        assert_eq!(o.exclude, vec!["02:00:00:00:00:01"]);
+        assert_eq!(o.max_macs, Options::default().max_macs);
+    }
+
+    /// The value keeps its own equals signs. Splitting on the last one, or
+    /// refusing the line, would both be wrong - and the key is what decides
+    /// what the value means.
+    #[test]
+    fn only_the_first_equals_sign_separates_a_setting_from_its_value() {
+        let mut o = Options::default();
+        read_conf(&mut o, "PAIRS=nic0:vmbr0 odd=name\n");
+        assert_eq!(
+            o.pairs,
+            vec!["nic0:vmbr0", "odd=name"],
+            "the value lost an equals sign of its own"
+        );
     }
 
     #[test]
