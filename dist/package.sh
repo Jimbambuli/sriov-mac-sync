@@ -81,35 +81,61 @@ Homepage: https://github.com/Jimbambuli/sriov-mac-sync
 Description: $DESC
 $LONG
 EOF
-	# Nothing is enabled or started here. This programs a NIC's filters, and
-	# whether that is right on a given host is answered by --check and
-	# --dry-run, not by a package installer.
+	# Enabled and started, which is what installing a service on Debian means.
+	# deb-systemd-invoke rather than systemctl start, because it is the one
+	# that honours policy-rc.d - in a chroot or an image build, nothing should
+	# come up.
 	cat > "$root/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-[ -d /run/systemd/system ] && systemctl daemon-reload || true
 if [ "$1" = configure ]; then
+	if [ -x /usr/bin/deb-systemd-helper ]; then
+		deb-systemd-helper unmask sriov-mac-sync.service >/dev/null || true
+		deb-systemd-helper enable sriov-mac-sync.service >/dev/null || true
+	fi
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload || true
+		if [ -x /usr/bin/deb-systemd-invoke ]; then
+			deb-systemd-invoke start sriov-mac-sync.service || true
+		else
+			systemctl enable --now sriov-mac-sync.service || true
+		fi
+	fi
 	cat <<'MSG'
-sriov-mac-sync is installed but not started. Check the hardware first:
+sriov-mac-sync is running. What it decided:
 
-    sriov-mac-sync --check
-    sriov-mac-sync --once --dry-run
+    sriov-mac-sync --status
 
-If both look right:  systemctl enable --now sriov-mac-sync
+It registers nothing it did not learn from the bridge, and removing this
+package takes its entries back out of the card.
 MSG
 fi
 EOF
+	# Stop first, then flush: a running daemon would put back what --flush
+	# removes on its very next pass. Removing the package undoes its effect on
+	# the hardware, which is the other half of being allowed to start by
+	# default.
 	cat > "$root/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
-if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
-	systemctl stop sriov-mac-sync.service || true
+if [ "$1" = remove ]; then
+	if [ -d /run/systemd/system ]; then
+		deb-systemd-invoke stop sriov-mac-sync.service >/dev/null 2>&1 \
+			|| systemctl stop sriov-mac-sync.service >/dev/null 2>&1 || true
+	fi
+	[ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 fi
 EOF
 	cat > "$root/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
-[ -d /run/systemd/system ] && systemctl daemon-reload || true
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+fi
+if [ "$1" = purge ] && [ -x /usr/bin/deb-systemd-helper ]; then
+	deb-systemd-helper purge sriov-mac-sync.service >/dev/null || true
+	deb-systemd-helper unmask sriov-mac-sync.service >/dev/null || true
+fi
 EOF
 	chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/prerm" "$root/DEBIAN/postrm"
 
@@ -141,13 +167,15 @@ EOF
 	cat > "$root/control/conffiles" <<'EOF'
 /etc/sriov-mac-sync.conf
 EOF
+	# Same behaviour as the .deb: enabled and started. IPKG_INSTROOT is set
+	# when the package is being unpacked into an image being built rather than
+	# onto a running system, and then nothing may be started.
 	cat > "$root/control/postinst" <<'EOF'
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
-echo "sriov-mac-sync installed. Check the hardware first:"
-echo "    sriov-mac-sync --check"
-echo "    sriov-mac-sync --once --dry-run"
-echo "Then: /etc/init.d/sriov-mac-sync enable && /etc/init.d/sriov-mac-sync start"
+/etc/init.d/sriov-mac-sync enable
+/etc/init.d/sriov-mac-sync start
+echo "sriov-mac-sync is running. What it decided:  sriov-mac-sync --status"
 exit 0
 EOF
 	chmod 755 "$root/control/postinst"

@@ -42,7 +42,9 @@ Everything below is statically linked and depends on nothing at all - no
 runtime, no libc, no configuration. Take whichever suits the machine.
 
 **Debian, Ubuntu, Proxmox VE** — installs the binary, a systemd unit and a
-commented `/etc/sriov-mac-sync.conf`, and starts nothing:
+commented `/etc/sriov-mac-sync.conf`, then enables and starts the service, which
+is what installing a service on Debian means. Removing the package takes its
+entries back out of the card again:
 
 ```
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_amd64.deb
@@ -89,15 +91,22 @@ The Debian packages install a manual page, `sriov-mac-sync(8)`, which says all
 of the above and rather more about what gets registered and what deliberately
 does not. From a checkout: `man ./dist/sriov-mac-sync.8`.
 
-Then, before starting anything:
+To see what it decided:
+
+```
+sriov-mac-sync --status             what is detected, wanted and registered
+```
+
+And before installing anything at all, or on a host where you would rather look
+first:
 
 ```
 sriov-mac-sync --check              does this NIC accept filter entries at all?
 sriov-mac-sync --once --dry-run     what would be registered, and why
 ```
 
-If both look right, `systemctl enable --now sriov-mac-sync`, or on OpenWrt
-`/etc/init.d/sriov-mac-sync enable && /etc/init.d/sriov-mac-sync start`.
+`--check` only proves the kernel took the entry. Whether the card acts on it is
+[a question for traffic](#verify-it-actually-works).
 
 If `--check` passes and `--dry-run` names the addresses you expected, install
 the unit and let it run — see [Build and install](#build-and-install). If it

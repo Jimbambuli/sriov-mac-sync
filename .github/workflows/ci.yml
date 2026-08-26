@@ -117,9 +117,16 @@ jobs:
           # The header line, not a sentence: man wraps its text at whatever
           # width it guesses, and a phrase that fits here breaks in half there.
           MANWIDTH=200 man -l /tmp/page.8 | grep -q "^SRIOV-MAC-SYNC(8)"
+          # Installing a service on Debian means enabling it. Whether it also
+          # came up is not asserted: a runner is not a machine where a daemon
+          # that programs a NIC has anything to do, and policy-rc.d is allowed
+          # to stop it.
+          test "$(systemctl is-enabled sriov-mac-sync)" = enabled
+          systemctl is-active sriov-mac-sync || echo "(not running here, fine)"
           sudo dpkg --purge sriov-mac-sync
           ! test -e /usr/sbin/sriov-mac-sync
           ! test -e /etc/sriov-mac-sync.conf
+          ! systemctl is-enabled sriov-mac-sync 2>/dev/null
       - name: The .ipk is one opkg would take
         run: |
           for f in dist/out/*.ipk; do
