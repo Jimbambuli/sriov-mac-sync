@@ -721,6 +721,21 @@ addresses as integers rather than six-byte arrays, for instance, would work on
 a share of that 0.35 ms - under 1% of a pass, for a change that touches every
 type in the program.
 
+## Versions
+
+Releases are dated: `YEAR.MONTH.N`, where `N` counts releases within that month.
+`2026.9.1` is the first release of September 2026, and the number tells you how
+old a build is, which is the question people actually ask about a daemon.
+
+There is no semantic-version promise here, and pretending otherwise would be
+theatre: this is a program, not a library. Nothing depends on it as a crate -
+there is no `[lib]` target - so a major number would only ever have been a way
+of announcing that a change felt important, which is not information.
+
+Releases up to 1.5.0 used semantic versions. Package managers order the new
+scheme after the old one correctly (`dpkg`, `apk` and cargo all read 2026 as
+greater than 1), so an upgrade from any of them works.
+
 ## Development
 
 ```
