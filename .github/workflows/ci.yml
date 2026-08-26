@@ -73,7 +73,7 @@ jobs:
         # full apk-tools, and no distribution ships version 3 yet.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -qq -y meson ninja-build libssl-dev zlib1g-dev fakeroot
+          sudo apt-get install -qq -y meson ninja-build libssl-dev zlib1g-dev fakeroot groff
           git clone -q --depth 1 https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
           meson setup /tmp/apk-tools/build /tmp/apk-tools -Dprefix=/usr >/dev/null
           ninja -C /tmp/apk-tools/build >/dev/null
@@ -103,8 +103,8 @@ jobs:
           # ever read on a machine where nobody can check it against anything.
           test -f /usr/share/man/man8/sriov-mac-sync.8.gz
           zcat /usr/share/man/man8/sriov-mac-sync.8.gz > /tmp/page.8
-          test -z "$(groff -man -Tutf8 /tmp/page.8 2>&1 >/dev/null)" \
-            || (groff -man -Tutf8 /tmp/page.8 >/dev/null && exit 1)
+          warnings=$(groff -man -Tutf8 /tmp/page.8 2>&1 >/dev/null || true)
+          if [ -n "$warnings" ]; then echo "$warnings"; exit 1; fi
           man -l /tmp/page.8 | grep -q "keep an SR-IOV uplink"
           sudo dpkg --purge sriov-mac-sync
           ! test -e /usr/sbin/sriov-mac-sync
