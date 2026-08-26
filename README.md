@@ -587,6 +587,18 @@ an address has been assigned to a VF from the PF side, the guest may not change
 it — `RTNETLINK answers: Operation not permitted` — so assign it before the VF
 driver binds, or rebind afterwards.
 
+**ixgbe: registrations cost milliseconds, and bursts cost more per entry.**
+On an 82599 the registration lands on the VF, and `ixgbevf` answers every
+change to its unicast list by re-sending the *whole* list to the PF through
+the VF/PF mailbox, one polled transaction per address. The cost of one
+registration therefore grows with how many are already in the filter:
+measured on real hardware, a lone address takes ~6 ms, and a burst of
+sixteen ~320 ms first-learn-to-last-register — quadratic in the burst, and
+the same before and after any daemon version, because the per-address kernel
+interface leaves nothing to batch. `mlx5` and `i40e` place an address in
+tens of microseconds. In steady state none of this matters; it is the price
+of many *new* guests appearing behind an `ixgbe` uplink at once.
+
 **FreeBSD guests: turn off local loopback.** FreeBSD's `mlx5en` enables it by
 default (`dev.mce.N.conf.uc_local_lb` and `mc_local_lb`, both `1`). The guest's
 own neighbour solicitations come back to it, FreeBSD spots the loop, restarts
