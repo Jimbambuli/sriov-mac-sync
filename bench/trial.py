@@ -641,7 +641,9 @@ class Trial:
             if r.returncode != 0:
                 failures += 1
                 continue
-            for line in r.stderr.splitlines():
+            # --timings prints to stdout (with the rest of a one-shot run's output);
+            # older harnesses read stderr and saw nothing.
+            for line in r.stdout.splitlines():
                 m = re.match(r"\s+(pass total|topology|fdb dump|vf macs|orphans|pairs)\s+([0-9.]+) ms",
                              line)
                 if m:
