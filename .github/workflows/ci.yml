@@ -106,7 +106,9 @@ jobs:
           zcat /usr/share/man/man8/sriov-mac-sync.8.gz > /tmp/page.8
           warnings=$(groff -man -Tutf8 /tmp/page.8 2>&1 >/dev/null || true)
           if [ -n "$warnings" ]; then echo "$warnings"; exit 1; fi
-          man -l /tmp/page.8 | grep -q "keep an SR-IOV uplink"
+          # The header line, not a sentence: man wraps its text at whatever
+          # width it guesses, and a phrase that fits here breaks in half there.
+          MANWIDTH=200 man -l /tmp/page.8 | grep -q "^SRIOV-MAC-SYNC(8)"
           sudo dpkg --purge sriov-mac-sync
           ! test -e /usr/sbin/sriov-mac-sync
           ! test -e /etc/sriov-mac-sync.conf
