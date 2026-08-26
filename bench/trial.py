@@ -34,6 +34,7 @@ Honesty notes, so the numbers are read for what they are:
 """
 
 import argparse
+import glob
 import atexit
 import json
 import os
@@ -94,6 +95,75 @@ def fmt_ms(ns):
 
 def percentile(sorted_vals, p):
     return sorted_vals[min(len(sorted_vals) - 1, int(p * (len(sorted_vals) - 1) + 0.5))]
+
+
+class Governor:
+    """The CPU frequency governor, pinned for the measurement and put back
+    afterwards.
+
+    A benchmark that does not say what the CPU was doing is not reproducible,
+    and on a host left in `powersave` - which is where a hypervisor that pays
+    its own electricity bill belongs - the first pass of a burst is measured
+    while the governor is still ramping. Pinning it to `performance` removes
+    that from the numbers.
+
+    Putting it back matters more than setting it: this runs on someone's live
+    machine, and a benchmark that quietly leaves the CPUs pinned has changed
+    the host it was only supposed to observe. atexit covers the normal end and
+    every sys.exit, including the one the signal handlers take.
+    """
+
+    PATTERN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+
+    def __init__(self):
+        self.previous = {}
+        self.pinned = False
+
+    def pin(self, wanted="performance"):
+        paths = sorted(glob.glob(self.PATTERN))
+        if not paths:
+            print("(no cpufreq here; governor left alone)")
+            return
+        try:
+            for path in paths:
+                with open(path) as fh:
+                    self.previous[path] = fh.read().strip()
+            for path in paths:
+                with open(path, "w") as fh:
+                    fh.write(wanted)
+        except OSError as e:
+            # Not root, or a kernel that will not have it. Say so and measure
+            # anyway - a number with a caveat beats no number.
+            print(f"(cannot set the governor: {e}; measuring as found)")
+            self.previous.clear()
+            return
+        was = sorted(set(self.previous.values()))
+        self.pinned = True
+        atexit.register(self.restore)
+        print(f"governor: {wanted} for the duration (was {', '.join(was)})")
+
+    def restore(self):
+        if not self.pinned:
+            return
+        self.pinned = False
+        for path, value in self.previous.items():
+            try:
+                with open(path, "w") as fh:
+                    fh.write(value)
+            except OSError:
+                pass
+        print(f"governor: back to {', '.join(sorted(set(self.previous.values())))}")
+
+    def describe(self):
+        """What the numbers below were measured under."""
+        paths = sorted(glob.glob(self.PATTERN))
+        if not paths:
+            return "no cpufreq"
+        seen = set()
+        for path in paths:
+            with open(path) as fh:
+                seen.add(fh.read().strip())
+        return ", ".join(sorted(seen))
 
 
 class Cleanup:
@@ -775,6 +845,10 @@ def main():
     ap.add_argument("--rounds", type=int, default=100,
                     help="cold --once passes for the statistics section")
     ap.add_argument("--binary", default="/usr/local/sbin/sriov-mac-sync")
+    ap.add_argument("--governor", default="performance",
+                    help="CPU governor to pin for the run, restored at the end; "
+                         "'leave' measures the machine as it is (default: "
+                         "performance)")
     args = ap.parse_args()
 
     uplinks = preflight(args, args.binary)
@@ -786,6 +860,12 @@ def main():
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(10))
     except (OSError, AttributeError):
         print("(running without SCHED_FIFO; timestamps carry scheduling noise)")
+
+    governor = Governor()
+    if args.governor != "leave":
+        governor.pin(args.governor)
+    else:
+        print(f"governor: left as found ({governor.describe()})")
 
     since_epoch = f"{time.time():.6f}"
     pre_state = {u: (self_macs(u), note_bytes(u)) for u in uplinks}
@@ -810,6 +890,7 @@ def main():
     t.s8_quiescence(since_epoch, pre_state)
 
     print("\n" + "=" * 64)
+    print(f"Measured with the governor at: {governor.describe()}")
     failed = [n for (n, ok, _) in t.results if not ok]
     if failed:
         print(f"VERDICT: FAILED ({', '.join(failed)})")
