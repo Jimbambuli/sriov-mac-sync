@@ -605,9 +605,14 @@ bridge ports' filters with `NTF_SELF`, mirrors deletions back out, follows bonds
 and ships as a Debian and an OpenWrt package. Same problem, same mechanism. If it
 works for you, there is no reason to change.
 
-Where the two differ: it propagates a learnt address to every other port of the
-bridge that learnt it, rather than working out which port is an SR-IOV uplink and
-following the chain down to it. Where the NIC is not itself a port of that bridge
+Where the two differ: it recognises an uplink by driver name, from a fixed list
+of `mlx4_core`, `mlx5_core`, `iavf` and `ixgbevf`. On Intel those are the virtual
+function drivers, so a bridge whose port is an `ixgbe` or `i40e` physical
+function - the usual arrangement, and the one most of the forum threads are
+about - matches nothing and is left alone; so is any card outside the list. It
+then propagates a learnt address to every other port of the bridge that learnt
+it, rather than working out which port is an SR-IOV uplink and following the
+chain down to it. Where the NIC is not itself a port of that bridge
 — a bridge stacked on a VLAN interface of another bridge, which is what Proxmox
 SDN vnets produce — the address never arrives at the filter that needs it. And it
 keeps no record of what it registered: entries are mirrored as events arrive, so
