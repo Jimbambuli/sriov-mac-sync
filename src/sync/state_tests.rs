@@ -449,10 +449,12 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
 }
 
 /// A batch that would grow the filter asks the driver afresh instead of
-/// believing the carried answer. A virtual function's address can change
-/// without any link message - setting it while the PF is administratively
-/// down announces nothing, seen on mlx4 - so the carried answer may be the
-/// only thing standing between a guest and its traffic being sent past it.
+/// believing the carried answer - when a physical function is mute. A
+/// virtual function's address can change without any link message when its
+/// PF is administratively down (netdev_state_change() on a down device
+/// announces nothing, seen on mlx4), so the carried answer may be the only
+/// thing standing between a guest and its traffic being sent past it. The
+/// fixture's PFs are down - the builder's default, and the careful side.
 /// Shrinking batches keep the carried answer: they cost at most a filter
 /// slot until the next pass.
 #[test]
@@ -505,6 +507,56 @@ fn a_batch_that_would_register_asks_the_driver_afresh() {
     )
     .unwrap();
     assert_eq!(sock.vf_asked, asked, "a deletion-only batch stays cheap");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The counterpart: an up physical function announces its VF-address
+/// changes, every announcement marks the carried answer stale, and the
+/// carried answer is then as good as a fresh one - so additions do not pay
+/// the driver question. On the cards where that question is expensive
+/// (mlx5 answers out of firmware, ~0.6 ms) the PFs are up, which is what
+/// keeps the fast path fast there; the mute-PF case above is the mlx4
+/// shape, where the question costs next to nothing.
+#[test]
+fn an_up_pf_lets_additions_trust_the_carried_answer() {
+    let dir = scratch("grow-trust");
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .up()
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .lower("nic2")
+        .build();
+    let mut s = ready_syncer(&dir);
+    s.remember_vf(vec![2], Vec::new());
+    // The fake world holds an address the carried answer does not - in the
+    // real world an up PF would have announced it, the answer would be
+    // stale, and this batch would ask. Here nothing announced, so the
+    // trust shows plainly: no question, and the address goes in.
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+    )
+    .unwrap();
+    assert_eq!(
+        sock.vf_asked, 0,
+        "an up PF announces, so additions keep the carried answer"
+    );
+    assert!(
+        sock.added.iter().any(|(_, m)| *m == VF_ADMIN),
+        "the carried answer is believed - that is the deal, and why the \
+         announcement channel must exist"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

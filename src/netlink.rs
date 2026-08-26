@@ -137,6 +137,10 @@ impl FdbEntry {
 pub struct LinkInfo {
     pub index: u32,
     pub name: String,
+    /// administratively up (IFF_UP). Load-bearing for the exclusions: a down
+    /// physical function announces nothing when a VF address changes, so only
+    /// an up one lets a carried driver answer be believed for additions.
+    pub up: bool,
     pub mac: Option<[u8; 6]>,
     /// what this interface is enslaved to, by index
     pub master: Option<u32>,
@@ -1018,8 +1022,11 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
     if index <= 0 {
         return None;
     }
+    // struct ifinfomsg: family, pad, type, index, flags, change.
+    let flags = u32::from_ne_bytes(payload[8..12].try_into().ok()?);
     let mut out = LinkInfo {
         index: index as u32,
+        up: flags & (libc::IFF_UP as u32) != 0,
         ..Default::default()
     };
     for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
@@ -1523,7 +1530,14 @@ mod tests {
 
         let l = parse_link(&body).expect("a well-formed link message parses");
         assert_eq!(l.index, 7);
+        assert!(!l.up, "no flags set means administratively down");
         assert_eq!(l.name, "nic1", "the kernel's trailing NUL stays out");
+
+        // The same message with IFF_UP in the header flags.
+        let mut up = ifinfomsg(7);
+        up[8..12].copy_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        put_attr(&mut up, IFLA_IFNAME, b"nic1\0");
+        assert!(parse_link(&up).expect("parses").up);
         assert_eq!(l.mac, Some([2, 0, 0, 0, 0, 9]));
         assert_eq!(l.master, Some(10));
         assert_eq!(l.link, Some(4));

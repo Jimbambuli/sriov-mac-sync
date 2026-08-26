@@ -1120,18 +1120,26 @@ impl Syncer {
             }
         }
 
-        // A carried answer decides nothing that grows a filter. A virtual
-        // function's address changes without any link message when the PF is
+        // A carried answer decides nothing that grows a filter - unless every
+        // physical function it covers can be heard from. A virtual function's
+        // address changes without any link message when its PF is
         // administratively down - netdev_state_change() on a down device
         // announces nothing, seen on mlx4 - so no event marks the carried
         // answer stale, and the only moment left to catch the change is
-        // before an addition. Decided first with the carried answer, and
-        // only a batch that would register something asks the driver afresh
-        // and decides again: reflection and deletions above still act on the
-        // carried answer, because shrinking on stale news is healed by the
-        // next pass, while growing on stale news sends a guest's traffic
-        // past it until the timed pass, up to the whole interval.
-        if vf_carried {
+        // before an addition. An up PF does announce (measured on mlx5, from
+        // the host and from inside a guest alike), the announcement marks the
+        // answer stale, and the carried answer is then as good as a fresh
+        // one. So the question lands exactly where it is cheap: asked on the
+        // mute cards (mlx4, ~0.01 ms), skipped on the ones whose firmware
+        // makes it expensive (mlx5, ~0.6 ms) - those announce. Decided first
+        // with the carried answer, and only a batch that would register
+        // something asks the driver afresh and decides again: reflection and
+        // deletions above still act on the carried answer, because shrinking
+        // on stale news is healed by the next pass, while growing on stale
+        // news sends a guest's traffic past it until the timed pass, up to
+        // the whole interval. A PF this picture cannot see counts as mute.
+        let a_pf_is_mute = pfs.iter().any(|&pf| !topo.at(pf).is_some_and(|l| l.up));
+        if vf_carried && a_pf_is_mute {
             let mut would: Map<String, Vec<Mac>> = crate::hash::map();
             for (kind, entry) in events {
                 if *kind != crate::netlink::RTM_NEWNEIGH {
