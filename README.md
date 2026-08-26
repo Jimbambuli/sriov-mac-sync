@@ -63,6 +63,11 @@ curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/s
 install -m 755 sriov-mac-sync-$(uname -m) /usr/local/sbin/sriov-mac-sync
 ```
 
+**With a Rust toolchain** — `cargo install sriov-mac-sync` builds it from
+[crates.io](https://crates.io/crates/sriov-mac-sync) and puts it in
+`~/.cargo/bin`. The unit and the example configuration are then in the checkout
+or in the crate's own `dist/`.
+
 Then, before starting anything:
 
 ```
