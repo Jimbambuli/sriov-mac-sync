@@ -294,6 +294,20 @@ fn physical_function(topo: &Topology, dev: u32) -> u32 {
     topo.at(dev).and_then(|l| l.physfn).unwrap_or(dev)
 }
 
+/// Every physical function whose VF addresses must be excluded for `dev`.
+///
+/// Usually one - a VF has a PF, a PF is its own. A multiport card that shares
+/// one PCI function across its ports is the exception: each port's netdev
+/// reports only its own port's VF addresses, so a VF there has a PF netdev per
+/// port and all of them must be asked, or a sibling VF on the other port is
+/// left out of the exclusion set and its address registered past its guest.
+fn physical_functions(topo: &Topology, dev: u32) -> Vec<u32> {
+    match topo.at(dev) {
+        Some(l) if !l.pf_netdevs.is_empty() => l.pf_netdevs.clone(),
+        _ => vec![physical_function(topo, dev)],
+    }
+}
+
 impl Syncer {
     pub fn new(pairs: Vec<Pair>, state_dir: PathBuf) -> Self {
         Syncer {
@@ -481,20 +495,21 @@ impl Syncer {
                 skip.insert(mac);
             }
         }
-        let pf = physical_function(topo, dev);
-        if let Some(pf_link) = topo.at(pf) {
-            if let Some(mac) = pf_link.mac {
-                skip.insert(mac);
-            }
-            for (ifindex, mac) in vf_macs {
-                if *ifindex == pf_link.index {
-                    skip.insert(*mac);
+        for pf in physical_functions(topo, dev) {
+            if let Some(pf_link) = topo.at(pf) {
+                if let Some(mac) = pf_link.mac {
+                    skip.insert(mac);
                 }
-            }
-            for vf in &pf_link.vf_netdevs {
-                if let Some(l) = topo.at(*vf) {
-                    if let Some(mac) = l.mac {
-                        skip.insert(mac);
+                for (ifindex, mac) in vf_macs {
+                    if *ifindex == pf_link.index {
+                        skip.insert(*mac);
+                    }
+                }
+                for vf in &pf_link.vf_netdevs {
+                    if let Some(l) = topo.at(*vf) {
+                        if let Some(mac) = l.mac {
+                            skip.insert(mac);
+                        }
                     }
                 }
             }
@@ -516,14 +531,19 @@ impl Syncer {
     /// Nothing can be done about it here - the address is not knowable - so
     /// the operator is told, once, with the two ways to close it.
     fn warn_about_unknowable_vfs(&mut self, topo: &Topology, dev: &str, vf_macs: &[(u32, Mac)]) {
-        let Some(pf) = topo.index_of(dev).map(|d| physical_function(topo, d)) else {
+        let Some(pfs) = topo.index_of(dev).map(|d| physical_functions(topo, d)) else {
             return;
         };
-        let Some(pf_link) = topo.at(pf) else { return };
+        // numvfs and host-bound netdevs are device-level - the same on every
+        // port netdev of a shared function - so the first PF answers for them;
+        // only the set addresses are per-port, and are counted across them all.
+        let Some(pf_link) = pfs.first().and_then(|&pf| topo.at(pf)) else {
+            return;
+        };
         // An address of all zeroes is the driver saying "nobody set one".
         let named = vf_macs
             .iter()
-            .filter(|(index, mac)| *index == pf && *mac != [0u8; 6])
+            .filter(|(index, mac)| pfs.contains(index) && *mac != [0u8; 6])
             .count();
         let here = pf_link.vf_netdevs.len();
         let unknowable = pf_link.numvfs as usize > named.max(here);
@@ -693,9 +713,10 @@ impl Syncer {
             let Some(dev) = topo.index_of(&pair.dev) else {
                 continue;
             };
-            let pf = physical_function(topo, dev);
-            if topo.at(pf).is_some() && !pfs.contains(&pf) {
-                pfs.push(pf);
+            for pf in physical_functions(topo, dev) {
+                if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                    pfs.push(pf);
+                }
             }
         }
         // Carried answers count only when they were collected for these very
@@ -971,9 +992,10 @@ impl Syncer {
             let Some(dev) = topo.index_of(&pair.dev) else {
                 continue;
             };
-            let pf = physical_function(topo, dev);
-            if topo.at(pf).is_some() && !pfs.contains(&pf) {
-                pfs.push(pf);
+            for pf in physical_functions(topo, dev) {
+                if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                    pfs.push(pf);
+                }
             }
         }
         // The same rule as the pass, from the same flag. The fast path used

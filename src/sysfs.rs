@@ -41,8 +41,16 @@ pub struct Link {
     pub is_bridge: bool,
     pub numvfs: u32,
     pub driver: Option<String>,
-    /// the PF, when this interface is a virtual function
+    /// the PF, when this interface is a virtual function. On a card where one
+    /// PCI function backs several ports, `physfn/net` lists a netdev per port
+    /// and this is whichever came first; `pf_netdevs` holds them all.
     pub physfn: Option<u32>,
+    /// every PF netdev of this virtual function's PCI function - more than one
+    /// when a multiport card shares a single function across its ports, where
+    /// each port's netdev reports only its own port's VF addresses. The
+    /// exclusion set must take them all in, or a sibling VF on the other port
+    /// goes unexcluded and its address is registered past the guest holding it.
+    pub pf_netdevs: Vec<u32>,
     /// netdevs of this interface's VFs, as far as they are bound on the host
     pub vf_netdevs: Vec<u32>,
     /// what has this interface as a lower - the inverse of `lowers`, worked
@@ -71,6 +79,7 @@ struct Names {
     master: Option<String>,
     lowers: Vec<String>,
     physfn: Option<String>,
+    pf_netdevs: Vec<String>,
     vf_netdevs: Vec<String>,
 }
 
@@ -163,9 +172,12 @@ impl Topology {
                 // read_dir on a missing directory fails by itself; asking
                 // twice was one syscall per interface for nothing.
                 if let Ok(rd) = fs::read_dir(dev.join("physfn/net")) {
-                    if let Some(e) = rd.flatten().next() {
-                        names.physfn = Some(e.file_name().to_string_lossy().into_owned());
+                    for e in rd.flatten() {
+                        names
+                            .pf_netdevs
+                            .push(e.file_name().to_string_lossy().into_owned());
                     }
+                    names.physfn = names.pf_netdevs.first().cloned();
                 }
             }
 
@@ -203,6 +215,7 @@ impl Topology {
             link.master = names.master.as_ref().and_then(idx);
             link.lowers = names.lowers.iter().filter_map(idx).collect();
             link.physfn = names.physfn.as_ref().and_then(idx);
+            link.pf_netdevs = names.pf_netdevs.iter().filter_map(idx).collect();
             link.vf_netdevs = names.vf_netdevs.iter().filter_map(idx).collect();
             links.push(link);
         }
@@ -309,9 +322,12 @@ impl Topology {
 
             if has_device {
                 if let Ok(rd) = fs::read_dir(base.join("device/physfn/net")) {
-                    if let Some(e) = rd.flatten().next() {
-                        link.physfn = e.file_name().to_str().and_then(|n| by_name.get(n)).copied();
+                    for e in rd.flatten() {
+                        if let Some(i) = e.file_name().to_str().and_then(|n| by_name.get(n)) {
+                            link.pf_netdevs.push(*i);
+                        }
                     }
+                    link.physfn = link.pf_netdevs.first().copied();
                 }
                 if link.numvfs > 0 {
                     if let Ok(rd) = fs::read_dir(base.join("device")) {
@@ -610,6 +626,7 @@ pub(crate) mod fixture {
         master: Option<String>,
         lowers: Vec<String>,
         physfn: Option<String>,
+        pf_netdevs: Vec<String>,
     }
 
     impl Builder {
@@ -664,6 +681,16 @@ pub(crate) mod fixture {
             self
         }
 
+        /// Every PF netdev of a virtual function's PCI function, for the
+        /// multiport-shared-function case where `physfn/net` lists more than
+        /// one. Sets `physfn` to the first as the kernel walk would.
+        pub fn pf_netdevs(mut self, pfs: &[&str]) -> Self {
+            let n = self.last_names();
+            n.pf_netdevs = pfs.iter().map(|p| p.to_string()).collect();
+            n.physfn = n.pf_netdevs.first().cloned();
+            self
+        }
+
         pub fn build(self) -> Topology {
             let by_name: Map<String, u32> = self
                 .links
@@ -679,6 +706,14 @@ pub(crate) mod fixture {
                     l.master = n.master.as_ref().and_then(idx);
                     l.lowers = n.lowers.iter().filter_map(idx).collect();
                     l.physfn = n.physfn.as_ref().and_then(idx);
+                    // A VF described with only `physfn` has that one PF as its
+                    // whole function; the multiport case names them explicitly.
+                    let pf_names = if n.pf_netdevs.is_empty() {
+                        n.physfn.iter().cloned().collect()
+                    } else {
+                        n.pf_netdevs.clone()
+                    };
+                    l.pf_netdevs = pf_names.iter().filter_map(idx).collect();
                     l
                 })
                 .collect();
