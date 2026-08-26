@@ -88,7 +88,7 @@ jobs:
           test -x /usr/sbin/sriov-mac-sync
           /usr/sbin/sriov-mac-sync --version
           grep -q "^ExecStart=/usr/sbin/sriov-mac-sync$" \
-            /lib/systemd/system/sriov-mac-sync.service
+            /usr/lib/systemd/system/sriov-mac-sync.service
           sudo dpkg --purge sriov-mac-sync
           ! test -e /usr/sbin/sriov-mac-sync
           ! test -e /etc/sriov-mac-sync.conf

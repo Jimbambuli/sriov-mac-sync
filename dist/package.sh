@@ -45,12 +45,15 @@ deb() {     # arch-suffix debian-arch
 	echo "== .deb for $2"
 	root=$(mktemp -d)
 	chmod 755 "$root"   # mktemp makes it 0700, and in a .deb that is the mode of /
-	mkdir -p "$root/DEBIAN" "$root/usr/sbin" "$root/lib/systemd/system" \
+	mkdir -p "$root/DEBIAN" "$root/usr/sbin" "$root/usr/lib/systemd/system" \
 		"$root/etc" "$root/usr/share/doc/sriov-mac-sync"
 
 	install -m 755 "$OUT/sriov-mac-sync-$1" "$root/usr/sbin/sriov-mac-sync"
-	unit_for_package > "$root/lib/systemd/system/sriov-mac-sync.service"
-	chmod 644 "$root/lib/systemd/system/sriov-mac-sync.service"
+	# /usr/lib, not /lib: on a merged-usr system - which every supported
+	# Debian now is - /lib is an alias, and shipping files through an aliased
+	# path is what dpkg spent the transition learning to refuse.
+	unit_for_package > "$root/usr/lib/systemd/system/sriov-mac-sync.service"
+	chmod 644 "$root/usr/lib/systemd/system/sriov-mac-sync.service"
 	# Every line in it is commented out, so shipping it changes no behaviour -
 	# it is there to be read and edited in place.
 	install -m 644 dist/sriov-mac-sync.conf.example "$root/etc/sriov-mac-sync.conf"
