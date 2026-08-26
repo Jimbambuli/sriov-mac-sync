@@ -1,6 +1,6 @@
 [package]
 name = "sriov-mac-sync"
-version = "2026.8.1"
+version = "2026.8.2"
 edition = "2021"
 rust-version = "1.74"
 description = "Make hosts behind a Linux bridge reachable from an SR-IOV virtual function"
