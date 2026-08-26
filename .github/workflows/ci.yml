@@ -94,6 +94,7 @@ jobs:
           qemu-aarch64-static dist/out/sriov-mac-sync-aarch64 --help > /dev/null
       - name: The .deb installs, works and purges
         run: |
+          set -x
           sudo dpkg -i dist/out/sriov-mac-sync_*_amd64.deb
           test -x /usr/sbin/sriov-mac-sync
           /usr/sbin/sriov-mac-sync --version
