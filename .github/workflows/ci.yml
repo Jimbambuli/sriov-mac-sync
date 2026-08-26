@@ -113,15 +113,24 @@ jobs:
           done
       - name: The .apk is one OpenWrt would take
         run: |
-          for f in dist/out/*.apk; do
-            test -s "$f" || (echo "$f is empty" && exit 1)
-          done
-          # Ownership is the part that goes wrong silently: apk records what it
-          # finds on disk, and files owned by the builder install as nobody.
-          /tmp/apk-tools/build/src/apk extract --allow-untrusted \
-            --destination /tmp/apkcheck dist/out/sriov-mac-sync-*-x86_64.apk
+          APK=/tmp/apk-tools/build/src/apk
+          mkdir -p /tmp/apkcheck
+          $APK extract --allow-untrusted --destination /tmp/apkcheck \
+            dist/out/sriov-mac-sync-*-x86_64.apk
           test -x /tmp/apkcheck/usr/sbin/sriov-mac-sync
           test -x /tmp/apkcheck/etc/init.d/sriov-mac-sync
+          # Ownership is what goes wrong silently: apk records what it finds on
+          # disk, so a package built without fakeroot installs as nobody. It has
+          # to be read from the metadata - extracting as a normal user cannot
+          # preserve it, which is why checking the extracted tree proves
+          # nothing.
+          for f in dist/out/*.apk; do
+            if $APK adbdump "$f" | grep -E "^ +(user|group): " | grep -qv ": root$"; then
+              echo "$f: something in there is not owned by root"
+              exit 1
+            fi
+          done
+          echo "every file in every .apk is owned by root"
       - uses: actions/upload-artifact@v5
         with:
           name: packages
