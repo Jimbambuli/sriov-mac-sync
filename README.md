@@ -80,6 +80,10 @@ install -m 755 sriov-mac-sync-$(uname -m) /usr/local/sbin/sriov-mac-sync
 `~/.cargo/bin`. The unit and the example configuration are then in the checkout
 or in the crate's own `dist/`.
 
+The Debian packages install a manual page, `sriov-mac-sync(8)`, which says all
+of the above and rather more about what gets registered and what deliberately
+does not. From a checkout: `man ./dist/sriov-mac-sync.8`.
+
 Then, before starting anything:
 
 ```

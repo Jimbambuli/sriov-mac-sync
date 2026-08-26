@@ -1,0 +1,207 @@
+.TH SRIOV\-MAC\-SYNC 8 "August 2026" "sriov\-mac\-sync" "System Administration"
+.SH NAME
+sriov\-mac\-sync \- keep an SR\-IOV uplink's unicast filter in step with the bridge behind it
+.SH SYNOPSIS
+.B sriov\-mac\-sync
+.RI [ OPTION ]...
+.SH DESCRIPTION
+A network card in SR\-IOV mode forwards between its physical function, its
+virtual functions and the wire with an internal switch \(em a VEB. That switch
+does not learn: it delivers to the addresses it has been told about, which are
+the ones the driver programmed for each function and nothing else.
+.PP
+A host that puts a bridge behind such a card breaks that assumption. Containers,
+other guests, the host's own address, a printer on a second card \(em all of them
+live behind the bridge, and the VEB has never heard of any of them. A frame from
+a virtual function to one of those addresses is a miss, and a miss leaves through
+the physical port. The frame goes out on the wire, addressed to something that is
+not out there, and nothing is logged.
+.PP
+The signature is unmistakable once you know it: ARP or ND resolves, because that
+is broadcast and gets flooded, while the unicast reply never arrives.
+.PP
+.B sriov\-mac\-sync
+watches the bridge's forwarding database over rtnetlink and writes what the
+bridge has learnt into the uplink's unicast filter, adding addresses as they
+appear and removing them as the bridge ages them out. It works out which
+interface is the uplink structurally \(em an interface with virtual functions, or
+one that is a virtual function \(em following bonds and stacked bridges, so a card
+sitting under a VLAN\-aware bridge or an SDN vnet is found too.
+.PP
+It records what it registered, in
+.IR /run/sriov\-mac\-sync ,
+and removes only its own entries. Addresses that belong out on the wire \(em the
+uplink's own, its siblings', a bond member's \(em are never registered, and one
+that moves out onto the wire is taken back out.
+.SH OPTIONS
+.TP
+.B (no option)
+Run as a daemon.
+.TP
+.B \-\-once
+Reconcile once and exit.
+.TP
+.B \-\-status
+Show what is detected, wanted and registered.
+.TP
+.B \-\-check
+Test whether the uplink accepts unicast filter entries at all. This only proves
+that the kernel took the entry; whether the card acts on it is a property of the
+driver and cannot be asked. See
+.B VERIFYING
+below.
+.TP
+.B \-\-flush
+Remove every address this daemon registered. A plain stop deliberately leaves
+them in place, because they are what makes the peers reachable.
+.TP
+.B \-\-dry\-run
+Report the changes without applying them.
+.TP
+.B \-\-timings
+After every pass, say what each phase cost and what it found, and name anything
+that failed along the way.
+.TP
+.BI \-\-pair " DEV:BR"
+Uplink and bridge to manage. Repeatable, and skips autodetection entirely.
+.TP
+.BI \-\-interval " SEC"
+Seconds between full reconciliations (default 300). This is a safety net, not
+the mechanism: addresses are registered the moment the kernel reports them.
+.TP
+.BI \-\-max " NUM"
+Warn above this many addresses on one uplink (default 128). The vport list on a
+ConnectX\-4 Lx holds 128; other hardware differs and the size cannot be queried.
+.TP
+.BI \-\-exclude " MACS"
+Addresses never to register, separated by commas or whitespace.
+.TP
+.BI \-\-extra " MACS"
+Addresses to register unconditionally, for a device that never speaks first. The
+wire\-side and own\-address rules still override this.
+.TP
+.B \-v ", " \-\-verbose
+Explain what is skipped and why.
+.TP
+.B \-h ", " \-\-help
+Print the usage text.
+.TP
+.B \-\-version
+Print the version.
+.SH CONFIGURATION
+.I /etc/sriov\-mac\-sync.conf
+is read at startup if it exists. Every setting is optional and corresponds to an
+option above: shell\-style
+.IR KEY=VALUE ,
+one per line, with
+.B #
+starting a comment.
+.TP
+.B PAIRS
+Space\-separated
+.I DEV:BRIDGE
+pairs. Empty means autodetect.
+.TP
+.B RESYNC
+Seconds between full reconciliations.
+.TP
+.B MAX_MACS
+Warning threshold per uplink.
+.TP
+.B EXCLUDE
+Addresses never to register.
+.TP
+.B EXTRA
+Addresses to register unconditionally.
+.SH VERIFYING
+That the kernel accepted an entry is not the same as the card acting on it.
+Test with traffic, in this order:
+.IP 1. 4
+From inside the virtual function's guest, ping something behind the bridge. It
+should fail.
+.IP 2. 4
+.B bridge fdb add
+.I <that mac>
+.B dev
+.I <uplink>
+.B self permanent
+.IP 3. 4
+Ping again. It should work.
+.IP 4. 4
+.B bridge fdb del
+the same entry. It should fail again.
+.PP
+If step 3 changes nothing, this approach does not work on that hardware and this
+daemon will not help.
+.SH FILES
+.TP
+.I /etc/sriov\-mac\-sync.conf
+Optional configuration.
+.TP
+.I /run/sriov\-mac\-sync/
+One note per uplink, recording which entries are this daemon's. Kept across a
+restart on purpose; a reboot clears it, which is right, because the card's filter
+is empty by then too.
+.TP
+.I /usr/lib/systemd/system/sriov\-mac\-sync.service
+The service, as installed by the Debian package.
+.TP
+.I /etc/init.d/sriov\-mac\-sync
+The procd service, as installed by the OpenWrt package.
+.SH EXIT STATUS
+.B 0
+on success. Non\-zero when a requested action failed \(em an uplink that could not
+be found, a filter the kernel refused, a configuration that named nothing.
+.SH SIGNALS
+.B SIGTERM
+and
+.B SIGINT
+stop the daemon and leave the registrations in the card. Use
+.B \-\-flush
+to take them back.
+.SH EXAMPLES
+Before starting anything, ask whether this hardware plays along at all:
+.PP
+.RS 4
+.EX
+sriov\-mac\-sync \-\-check
+sriov\-mac\-sync \-\-once \-\-dry\-run
+.EE
+.RE
+.PP
+Run it against one explicit pair, without autodetection:
+.PP
+.RS 4
+.EX
+sriov\-mac\-sync \-\-pair nic1v0:vmbr1
+.EE
+.RE
+.PP
+Ask a running installation what it thinks the world looks like:
+.PP
+.RS 4
+.EX
+sriov\-mac\-sync \-\-status
+.EE
+.RE
+.SH LIMITS
+The unicast list is finite and its size cannot be queried; beyond it the driver
+drops addresses silently. Hardware that can represent virtual functions as real
+bridge ports \(em switchdev with bridge offload \(em should use that instead; this
+exists for the cards that cannot.
+.SH SEE ALSO
+.BR bridge (8),
+.BR ip\-link (8),
+.BR systemd.service (5)
+.PP
+.UR https://github.com/Jimbambuli/sriov\-mac\-sync
+The project page
+.UE ,
+which carries the reasoning behind all of this, the hardware it was reproduced
+on, and the prior art.
+.SH REPORTING BUGS
+Reports for other hardware are welcome, and the four steps under
+.B VERIFYING
+are the whole test. Issues at the project page above.
+.SH COPYRIGHT
+Copyright \(co 2026 Jimbambuli. MIT licensed.

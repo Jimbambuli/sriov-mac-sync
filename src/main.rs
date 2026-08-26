@@ -184,8 +184,9 @@ usage: sriov-mac-sync [options]
       --version   print the version
 
 Pairs are found automatically: every interface with virtual functions - or
-itself a virtual function - that ends up in a bridge, following bonds. {CONF} may set PAIRS, RESYNC,
-MAX_MACS, EXCLUDE and EXTRA.
+itself a virtual function - that ends up in a bridge, following bonds.
+{CONF} may set PAIRS, RESYNC, MAX_MACS, EXCLUDE and EXTRA.
+See sriov-mac-sync(8) for the whole of it.
 "
     )
 }
@@ -1632,6 +1633,38 @@ mod tests {
     /// facts the code owns. Each has drifted at least once - the help text
     /// claimed a default the code had left behind - and this is the same
     /// cure applied to the other three documents.
+    #[test]
+    fn the_man_page_names_every_option_the_help_offers() {
+        // A manual page is the one piece of documentation that is read offline,
+        // months later, by somebody who cannot check whether it still matches
+        // the program. It matches, or this fails.
+        let page = include_str!("../dist/sriov-mac-sync.8");
+        for opt in usage_text()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(|w| w.to_string()))
+            .filter(|w| w.starts_with("--"))
+        {
+            // roff wants its hyphens escaped, so that is how they appear there.
+            let escaped = opt.replace('-', "\\-");
+            assert!(
+                page.contains(&escaped),
+                "the manual page never mentions {opt}, which the help offers"
+            );
+        }
+    }
+
+    #[test]
+    fn the_man_page_carries_the_files_it_claims() {
+        let page = include_str!("../dist/sriov-mac-sync.8");
+        for path in [CONF, STATE_DIR] {
+            let escaped = path.replace('-', "\\-");
+            assert!(
+                page.contains(&escaped),
+                "the manual page never mentions {path}"
+            );
+        }
+    }
+
     #[test]
     fn the_readme_names_every_option_the_help_offers() {
         let readme = include_str!("../README.md");

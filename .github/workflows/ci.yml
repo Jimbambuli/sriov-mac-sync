@@ -99,6 +99,13 @@ jobs:
           /usr/sbin/sriov-mac-sync --version
           grep -q "^ExecStart=/usr/sbin/sriov-mac-sync$" \
             /usr/lib/systemd/system/sriov-mac-sync.service
+          # A manual page that does not render is worse than none: it is only
+          # ever read on a machine where nobody can check it against anything.
+          test -f /usr/share/man/man8/sriov-mac-sync.8.gz
+          zcat /usr/share/man/man8/sriov-mac-sync.8.gz > /tmp/page.8
+          test -z "$(groff -man -Tutf8 /tmp/page.8 2>&1 >/dev/null)" \
+            || (groff -man -Tutf8 /tmp/page.8 >/dev/null && exit 1)
+          man -l /tmp/page.8 | grep -q "keep an SR-IOV uplink"
           sudo dpkg --purge sriov-mac-sync
           ! test -e /usr/sbin/sriov-mac-sync
           ! test -e /etc/sriov-mac-sync.conf

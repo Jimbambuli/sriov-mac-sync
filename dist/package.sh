@@ -59,6 +59,11 @@ deb() {     # arch-suffix debian-arch
 	install -m 644 dist/sriov-mac-sync.conf.example "$root/etc/sriov-mac-sync.conf"
 	install -m 644 README.md "$root/usr/share/doc/sriov-mac-sync/README.md"
 	install -m 644 LICENSE "$root/usr/share/doc/sriov-mac-sync/copyright"
+	# Debian wants manual pages compressed, and -n so the timestamp inside the
+	# gzip stream does not make two builds of the same source differ.
+	mkdir -p "$root/usr/share/man/man8"
+	gzip -9nc dist/sriov-mac-sync.8 > "$root/usr/share/man/man8/sriov-mac-sync.8.gz"
+	chmod 644 "$root/usr/share/man/man8/sriov-mac-sync.8.gz"
 
 	echo /etc/sriov-mac-sync.conf > "$root/DEBIAN/conffiles"
 	cat > "$root/DEBIAN/control" <<EOF
