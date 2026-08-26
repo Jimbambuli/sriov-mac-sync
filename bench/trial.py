@@ -323,7 +323,11 @@ def learn_on(dev, mac, vlan=None):
     cmd = ["bridge", "fdb", "replace", mac_str(mac), "dev", dev, "master", "dynamic"]
     if vlan is not None:
         cmd += ["vlan", str(vlan)]
-    run(cmd)
+    # Whether the kernel took it. A port without carrier sits in the
+    # disabled state and refuses dynamic entries with EPERM - an uplink
+    # nothing is plugged into cannot have a wire imitated on it, and a
+    # scenario that failed the daemon over that blamed the wrong party.
+    return run(cmd).returncode == 0
 
 
 def unlearn_on(dev, mac, vlan=None):
@@ -681,7 +685,12 @@ class Trial:
         # everywhere would fail a daemon doing the right thing.
         uplink = self.uplinks[0]
         t0 = time.monotonic_ns()
-        learn_on(uplink, mac, self.args.vlan)
+        if not learn_on(uplink, mac, self.args.vlan):
+            self.verdict("wire reflection", True,
+                         f"skipped: {uplink} has no carrier, and a port in "
+                         "the disabled state refuses the dynamic entry that "
+                         "imitates the wire - nothing to reflect from")
+            return
         deadline = t0 + 5_000_000_000
         gone = False
         while time.monotonic_ns() < deadline and not gone:
