@@ -13,6 +13,7 @@
 //! pub(super), the lot of it: this is sync's inner organ, not an interface.
 
 use super::*;
+use crate::note;
 
 /// A note as it was last read, with what it takes to tell whether the file
 /// is still the same one, unchanged.
@@ -226,7 +227,7 @@ impl Syncer {
             }
         }
         if self.unreadable.borrow_mut().remove(dev) {
-            eprintln!(
+            note!(
                 "{}: readable again, {dev} is back in the reckoning",
                 self.state_path(dev).display()
             );

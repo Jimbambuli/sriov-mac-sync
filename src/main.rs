@@ -32,6 +32,29 @@ use sysfs::Topology;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONF: &str = "/etc/sriov-mac-sync.conf";
 const STATE_DIR: &str = "/run/sriov-mac-sync";
+
+/// Ordinary progress, on stdout.
+///
+/// Everything this daemon says used to go to stderr, which systemd timestamps
+/// exactly like stdout and nobody ever noticed. procd on OpenWrt does notice:
+/// it files stderr under the error level, so a service whose whole normal life
+/// (started, registered, reconciled) arrives as `daemon.err` teaches the
+/// operator that its log is noise. Trouble still goes to stderr, which is what
+/// makes the distinction worth anything.
+///
+/// Flushed on every line: stdout is block-buffered when it is a pipe, which is
+/// exactly what an init system hands a daemon, and a log that appears in
+/// four-kilobyte lumps hours later is not a log.
+#[macro_export]
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let out = std::io::stdout();
+        let mut out = out.lock();
+        let _ = writeln!(out, $($arg)*);
+        let _ = out.flush();
+    }};
+}
 /// How long to wait before trying again when the kernel would not describe the
 /// interfaces. Short, because until it answers the daemon is not doing its job
 /// at all; not zero, because a kernel that just refused will refuse again.
@@ -391,7 +414,7 @@ fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<V
         let (found, skipped) = topo.autodetect();
         if opts.verbose {
             for s in skipped {
-                eprintln!("{s}");
+                note!("{s}");
             }
         }
         if found.is_empty() && !allow_empty {
@@ -554,14 +577,15 @@ fn report_changes(
             );
         }
         if verbose && r.foreign > 0 {
-            eprintln!(
+            note!(
                 "{}: {} address(es) already present, left alone",
-                r.dev, r.foreign
+                r.dev,
+                r.foreign
             );
         }
         if r.added > 0 || r.removed > 0 {
             if dry_run {
-                eprintln!(
+                note!(
                     "{}: would be +{} -{}, {} address(es) in total [{trigger}]",
                     r.dev,
                     r.added,
@@ -569,7 +593,7 @@ fn report_changes(
                     r.wanted.len()
                 );
             } else {
-                eprintln!(
+                note!(
                     "{}: +{} -{}, {} address(es) registered [{trigger}]",
                     r.dev,
                     r.added,
@@ -763,7 +787,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                     .collect();
                 if pair_names(&found) != pair_names(&syncer.pairs) {
                     if !found.is_empty() {
-                        eprintln!("now watching {}", pair_names(&found).join(" "));
+                        note!("now watching {}", pair_names(&found).join(" "));
                         said_empty = false;
                     }
                     syncer.pairs = found;
@@ -771,7 +795,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
             }
 
             if syncer.pairs.is_empty() && !said_empty {
-                eprintln!("waiting for an SR-IOV interface to appear in a bridge");
+                note!("waiting for an SR-IOV interface to appear in a bridge");
                 said_empty = true;
             }
             {
@@ -1041,7 +1065,7 @@ fn run() -> Result<bool, String> {
         }
         Mode::Daemon => {
             let listed = pair_names(&pairs);
-            eprintln!(
+            note!(
                 "sriov-mac-sync {VERSION}: watching {}, full reconciliation every {}s",
                 if listed.is_empty() {
                     "nothing yet".to_string()
@@ -1070,7 +1094,7 @@ fn run() -> Result<bool, String> {
             // behind - and so `--flush` is an obvious next step for anyone
             // who wants the card cleared.
             let held: usize = syncer.registered();
-            eprintln!(
+            note!(
                 "sriov-mac-sync: stopping; {held} address(es) left registered on purpose \
                  (--flush removes them)"
             );
@@ -1085,7 +1109,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("sriov-mac-sync: {e}");
+            note!("sriov-mac-sync: {e}");
             ExitCode::FAILURE
         }
     }

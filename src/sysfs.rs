@@ -690,6 +690,7 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::fixture::{mac, Builder};
+    use crate::note;
 
     use super::Topology;
 
@@ -915,7 +916,7 @@ mod tests {
         let mut sock = match crate::netlink::Socket::new() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("skipped: no netlink socket here ({e})");
+                note!("skipped: no netlink socket here ({e})");
                 return;
             }
         };
@@ -924,14 +925,14 @@ mod tests {
             differences = match compare_readings(&mut sock) {
                 Some(d) => d,
                 None => {
-                    eprintln!("skipped: the kernel would not list interfaces");
+                    note!("skipped: the kernel would not list interfaces");
                     return;
                 }
             };
             if differences.is_empty() {
                 return;
             }
-            eprintln!(
+            note!(
                 "attempt {}: {} difference(s), reading again in case the host moved",
                 attempt + 1,
                 differences.len()

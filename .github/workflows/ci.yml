@@ -68,8 +68,18 @@ jobs:
       - uses: actions/checkout@v5
       - name: Cross targets
         run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - name: apk-tools, for the OpenWrt v3 package
+        # OpenWrt's own apk can only install; building a package needs the
+        # full apk-tools, and no distribution ships version 3 yet.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y meson ninja-build libssl-dev zlib1g-dev fakeroot
+          git clone -q --depth 1 https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
+          meson setup /tmp/apk-tools/build /tmp/apk-tools -Dprefix=/usr >/dev/null
+          ninja -C /tmp/apk-tools/build >/dev/null
+          /tmp/apk-tools/build/src/apk --version
       - name: Build the artefacts
-        run: ./dist/package.sh
+        run: APK=/tmp/apk-tools/build/src/apk ./dist/package.sh
       - name: Both binaries are static
         run: |
           for a in x86_64 aarch64; do
@@ -101,6 +111,17 @@ jobs:
             ar p "$f" data.tar.gz | tar tzf - | grep -q "./etc/init.d/sriov-mac-sync"
             ar p "$f" control.tar.gz | tar xzOf - ./control | grep -q "^Package: sriov-mac-sync$"
           done
+      - name: The .apk is one OpenWrt would take
+        run: |
+          for f in dist/out/*.apk; do
+            test -s "$f" || (echo "$f is empty" && exit 1)
+          done
+          # Ownership is the part that goes wrong silently: apk records what it
+          # finds on disk, and files owned by the builder install as nobody.
+          /tmp/apk-tools/build/src/apk extract --allow-untrusted \
+            --destination /tmp/apkcheck dist/out/sriov-mac-sync-*-x86_64.apk
+          test -x /tmp/apkcheck/usr/sbin/sriov-mac-sync
+          test -x /tmp/apkcheck/etc/init.d/sriov-mac-sync
       - uses: actions/upload-artifact@v5
         with:
           name: packages

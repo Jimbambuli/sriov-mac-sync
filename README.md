@@ -45,16 +45,28 @@ runtime, no libc, no configuration. Take whichever suits the machine.
 commented `/etc/sriov-mac-sync.conf`, and starts nothing:
 
 ```
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.4.0_amd64.deb
-dpkg -i sriov-mac-sync_1.4.0_amd64.deb
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.5.0_amd64.deb
+dpkg -i sriov-mac-sync_1.5.0_amd64.deb
 ```
 
-**OpenWrt** — the same, with a procd service instead of the unit:
+**OpenWrt** — the same, with a procd service instead of the unit. Which file
+depends on the release: 24.10 replaced opkg with apk, and that apk reads only
+its own v3 format, so there is one package for each era.
 
 ```
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.4.0_x86_64.ipk
-opkg install ./sriov-mac-sync_1.4.0_x86_64.ipk
+# 24.10 and newer (apk)
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync-1.5.0-r0-x86_64.apk
+apk add --allow-untrusted --force-non-repository ./sriov-mac-sync-1.5.0-r0-x86_64.apk
+
+# 23.05 and older (opkg)
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.5.0_x86_64.ipk
+opkg install ./sriov-mac-sync_1.5.0_x86_64.ipk
 ```
+
+Both flags on the `apk` line are the price of a package that is not in a
+repository: `--allow-untrusted` because it is not signed by OpenWrt, and
+`--force-non-repository` because apk otherwise refuses to install something it
+could not reinstall by itself after a reboot.
 
 **Anything else** — the bare binary, `x86_64` or `aarch64`:
 

@@ -2,6 +2,7 @@
 //! them there.
 
 use crate::hash::{Map, Set};
+use crate::note;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -360,7 +361,7 @@ impl Syncer {
             }
             let since = *self.absent_since.entry(dev.clone()).or_insert_with(|| {
                 if !self.orphan_grace.is_zero() {
-                    eprintln!(
+                    note!(
                         "{dev}: no longer among the uplinks; waiting {:?} before \
                          taking its addresses back out",
                         self.orphan_grace
@@ -380,7 +381,7 @@ impl Syncer {
             if !apply || self.dry_run {
                 let owned = self.load_owned(&dev);
                 if !owned.is_empty() {
-                    eprintln!(
+                    note!(
                         "{dev}: no longer an uplink, {} address(es) still registered",
                         owned.len()
                     );
@@ -416,14 +417,14 @@ impl Syncer {
                     None => (owned.len(), crate::hash::set()),
                 };
                 if kept.is_empty() && self.note_is_readable(&dev) {
-                    eprintln!("{dev}: no longer an uplink, removed {gone} address(es)");
+                    note!("{dev}: no longer an uplink, removed {gone} address(es)");
                     let _ = fs::remove_file(self.state_path(&dev));
                 } else {
                     // What could not be removed is still in the card;
                     // forgetting it here is how a registration becomes
                     // permanent. write_owned, because the lock is already
                     // held.
-                    eprintln!(
+                    note!(
                         "{dev}: no longer an uplink, removed {gone} address(es), \
                          {} could not be removed and stay on record",
                         kept.len()
@@ -1054,7 +1055,7 @@ impl Syncer {
                         changed = true;
                         urgency = Urgency::Now;
                         taken_back.push(*mac);
-                        eprintln!(
+                        note!(
                             "{}: {} moved out onto the wire, unregistered [reflection]",
                             fp.dev,
                             format_mac(mac)

@@ -153,12 +153,60 @@ EOF
 	rm -rf "$root"
 }
 
+apk() {    # arch-suffix apk-arch
+	if [ -z "${APK:-}" ]; then
+		echo "== .apk for $2 SKIPPED (no apk-tools with mkpkg; set APK=/path/to/apk)"
+		return 0
+	fi
+	echo "== .apk for $2"
+	root=$(mktemp -d)
+	chmod 755 "$root"
+	mkdir -p "$root/usr/sbin" "$root/etc/init.d"
+
+	install -m 755 "$OUT/sriov-mac-sync-$1" "$root/usr/sbin/sriov-mac-sync"
+	install -m 755 dist/openwrt/sriov-mac-sync.init "$root/etc/init.d/sriov-mac-sync"
+	install -m 644 dist/sriov-mac-sync.conf.example "$root/etc/sriov-mac-sync.conf"
+
+	# apk records the ownership it finds on disk, and a package whose files
+	# belong to whoever happened to build it installs them as nobody:nogroup.
+	# fakeroot is the only part of this script that is not tar and a compiler;
+	# without it the packages are still built, just say so rather than ship
+	# them wrong.
+	if command -v fakeroot >/dev/null 2>&1; then
+		fakeroot sh -c "chown -R 0:0 '$root' && '$APK' mkpkg \
+			--info name:sriov-mac-sync \
+			--info version:$VERSION-r0 \
+			--info description:'$DESC' \
+			--info arch:$2 \
+			--info license:MIT \
+			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
+			--files '$root' \
+			--output '$OUT/sriov-mac-sync-$VERSION-r0-$2.apk'"
+	else
+		echo "   WARNING: no fakeroot, files will not be owned by root"
+		"$APK" mkpkg \
+			--info name:sriov-mac-sync \
+			--info version:"$VERSION-r0" \
+			--info description:"$DESC" \
+			--info arch:"$2" \
+			--info license:MIT \
+			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
+			--files "$root" \
+			--output "$OUT/sriov-mac-sync-$VERSION-r0-$2.apk"
+	fi
+	rm -rf "$root"
+}
+
 build x86_64-unknown-linux-musl  x86_64
 build aarch64-unknown-linux-musl aarch64
 deb x86_64  amd64
 deb aarch64 arm64
 ipk x86_64  x86_64
 ipk aarch64 aarch64_generic
+# OpenWrt 24.10 dropped opkg for apk, and its apk reads only the v3 format.
+# The .ipk above stays for 23.05 and older, which is most of the installed base.
+apk x86_64  x86_64
+apk aarch64 aarch64_generic
 
 ( cd "$OUT" && sha256sum ./* > SHA256SUMS )
 echo
