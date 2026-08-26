@@ -1002,12 +1002,16 @@ impl Syncer {
         // to reuse the carried answer whenever the physical functions
         // matched, which is not the question: the addresses change without
         // the list of functions changing at all.
-        let vf_macs = match (&self.carried_vf, self.vf_stale) {
-            (Some((for_pfs, kept)), false) if *for_pfs == pfs => kept.clone(),
+        //
+        // Whether the answer is carried is kept, because a carried answer is
+        // only good enough to shrink on: growing consults the driver first,
+        // below.
+        let (vf_macs, vf_carried) = match (&self.carried_vf, self.vf_stale) {
+            (Some((for_pfs, kept)), false) if *for_pfs == pfs => (kept.clone(), true),
             _ => {
                 let fresh = sock.vf_macs_of(&pfs)?;
                 self.remember_vf(pfs.clone(), fresh.clone());
-                fresh
+                (fresh, false)
             }
         };
         let mut pairs: Vec<FastPair> = self
@@ -1116,12 +1120,60 @@ impl Syncer {
             }
         }
 
+        // A carried answer decides nothing that grows a filter. A virtual
+        // function's address changes without any link message when the PF is
+        // administratively down - netdev_state_change() on a down device
+        // announces nothing, seen on mlx4 - so no event marks the carried
+        // answer stale, and the only moment left to catch the change is
+        // before an addition. Decided first with the carried answer, and
+        // only a batch that would register something asks the driver afresh
+        // and decides again: reflection and deletions above still act on the
+        // carried answer, because shrinking on stale news is healed by the
+        // next pass, while growing on stale news sends a guest's traffic
+        // past it until the timed pass, up to the whole interval.
+        if vf_carried {
+            let mut would: Map<String, Vec<Mac>> = crate::hash::map();
+            for (kind, entry) in events {
+                if *kind != crate::netlink::RTM_NEWNEIGH {
+                    continue;
+                }
+                self.fast_add(sock, topo, entry, &pairs, &mut would, false);
+            }
+            if !would.is_empty() {
+                let fresh = sock.vf_macs_of(&pfs)?;
+                self.remember_vf(pfs.clone(), fresh.clone());
+                for fp in &mut pairs {
+                    fp.skip = self.exclusions(topo, fp.index, fp.port, &fresh);
+                    // Within this batch the wire keeps the last word.
+                    if let Some(macs) = reflected.get(&fp.dev) {
+                        fp.skip.extend(macs.iter().copied());
+                    }
+                }
+                // The catch this exists for is rare enough to be told about.
+                for (dev, macs) in &would {
+                    let Some(fp) = pairs.iter().find(|f| &f.dev == dev) else {
+                        continue;
+                    };
+                    for mac in macs {
+                        if fp.skip.contains(mac) {
+                            note!(
+                                "{}: {} is a virtual function's address by the \
+                                 driver's fresh answer, kept out [vf refresh]",
+                                dev,
+                                format_mac(mac)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let mut registered: Map<String, Vec<Mac>> = crate::hash::map();
         for (kind, entry) in events {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
             }
-            if self.fast_add(sock, topo, entry, &pairs, &mut registered) {
+            if self.fast_add(sock, topo, entry, &pairs, &mut registered, true) {
                 urgency = Urgency::Now;
             }
         }
@@ -1135,6 +1187,10 @@ impl Syncer {
     /// refused, or something the full pass will have to look at. An entry
     /// that concerns none of the pairs returns false, and a batch made
     /// entirely of those does not earn a pass.
+    ///
+    /// With `commit` false nothing is written: what would have been
+    /// registered lands in `registered` and the filter is left alone. That
+    /// is the decide half of fast_apply's grow-only driver refresh.
     fn fast_add(
         &self,
         sock: &mut dyn FdbWriter,
@@ -1142,6 +1198,7 @@ impl Syncer {
         entry: &FdbEntry,
         pairs: &[FastPair],
         registered: &mut Map<String, Vec<Mac>>,
+        commit: bool,
     ) -> bool {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
             return false;
@@ -1201,6 +1258,13 @@ impl Syncer {
                 continue;
             }
             ours = true;
+            if !commit {
+                registered
+                    .entry(fp.dev.clone())
+                    .or_default()
+                    .push(entry.mac);
+                continue;
+            }
             match sock.set_self_fdb(fp.index, &entry.mac, true) {
                 Ok(()) => {
                     registered

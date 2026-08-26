@@ -420,7 +420,14 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
     s.remember_vf(vec![2], vf.clone());
 
     for entry in fdb() {
-        let mut sock = FakeSock::default();
+        // The world answers the driver question the same way the carried
+        // answer was primed: a batch that would register asks afresh, and a
+        // fake that then reported nothing would talk the daemon out of the
+        // very exclusions this test is about.
+        let mut sock = FakeSock {
+            vf: vf.clone(),
+            ..Default::default()
+        };
         s.fast_apply(
             &mut sock,
             &topo,
@@ -438,6 +445,66 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
             crate::netlink::format_mac(&entry.mac)
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A batch that would grow the filter asks the driver afresh instead of
+/// believing the carried answer. A virtual function's address can change
+/// without any link message - setting it while the PF is administratively
+/// down announces nothing, seen on mlx4 - so the carried answer may be the
+/// only thing standing between a guest and its traffic being sent past it.
+/// Shrinking batches keep the carried answer: they cost at most a filter
+/// slot until the next pass.
+#[test]
+fn a_batch_that_would_register_asks_the_driver_afresh() {
+    let dir = scratch("grow-refresh");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    // The carried answer predates the address: as far as it knows, the
+    // functions have no addresses at all.
+    s.remember_vf(vec![2], Vec::new());
+    // The world has moved on: VF_ADMIN now belongs to a virtual function.
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+
+    // The address turns up behind the bridge. The carried answer would let
+    // it in; the fresh one keeps it out.
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+    )
+    .unwrap();
+    assert_eq!(sock.vf_asked, 1, "an addition consults the driver");
+    assert!(
+        sock.added.is_empty(),
+        "the fresh answer keeps the function's address out"
+    );
+
+    // An ordinary guest still registers - the refresh filters, it does not
+    // block.
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert!(
+        sock.added.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "an ordinary address still goes in"
+    );
+
+    // A shrinking batch does not pay the question.
+    let asked = sock.vf_asked;
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert_eq!(sock.vf_asked, asked, "a deletion-only batch stays cheap");
     let _ = fs::remove_dir_all(&dir);
 }
 
