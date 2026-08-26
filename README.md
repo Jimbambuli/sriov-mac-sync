@@ -45,8 +45,8 @@ runtime, no libc, no configuration. Take whichever suits the machine.
 commented `/etc/sriov-mac-sync.conf`, and starts nothing:
 
 ```
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.5.0_amd64.deb
-dpkg -i sriov-mac-sync_1.5.0_amd64.deb
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_amd64.deb
+dpkg -i sriov-mac-sync_amd64.deb
 ```
 
 **OpenWrt** — the same, with a procd service instead of the unit. Which file
@@ -55,12 +55,12 @@ its own v3 format, so there is one package for each era.
 
 ```
 # 24.10 and newer (apk)
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync-1.5.0-r0-x86_64.apk
-apk add --allow-untrusted --force-non-repository ./sriov-mac-sync-1.5.0-r0-x86_64.apk
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.apk
+apk add --allow-untrusted --force-non-repository ./sriov-mac-sync_x86_64.apk
 
 # 23.05 and older (opkg)
-curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_1.5.0_x86_64.ipk
-opkg install ./sriov-mac-sync_1.5.0_x86_64.ipk
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.ipk
+opkg install ./sriov-mac-sync_x86_64.ipk
 ```
 
 Both flags on the `apk` line are the price of a package that is not in a
@@ -74,6 +74,11 @@ could not reinstall by itself after a reboot.
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync-$(uname -m)
 install -m 755 sriov-mac-sync-$(uname -m) /usr/local/sbin/sriov-mac-sync
 ```
+
+No file name here carries a version: they are fetched through
+`/releases/latest/download/`, so these commands do not go stale. Which version
+you got is inside the package, where `dpkg -I`, `apk info` and `opkg info` will
+all tell you.
 
 **With a Rust toolchain** — `cargo install sriov-mac-sync` builds it from
 [crates.io](https://crates.io/crates/sriov-mac-sync) and puts it in

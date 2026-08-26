@@ -74,7 +74,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -qq -y meson ninja-build libssl-dev zlib1g-dev fakeroot groff
-          git clone -q --depth 1 https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
+          # The GitHub mirror, not gitlab.alpinelinux.org: the runner reaches
+          # the former reliably and the latter sometimes not at all (exit 128,
+          # twice). Retried anyway, because one clone is one thing that can go
+          # wrong in every run.
+          for i in 1 2 3; do
+            git clone -q --depth 1 https://github.com/alpinelinux/apk-tools.git /tmp/apk-tools && break
+            echo "clone attempt $i failed"; rm -rf /tmp/apk-tools; sleep 5
+          done
+          test -d /tmp/apk-tools/src
           meson setup /tmp/apk-tools/build /tmp/apk-tools -Dprefix=/usr >/dev/null
           ninja -C /tmp/apk-tools/build >/dev/null
           /tmp/apk-tools/build/src/apk --version
@@ -95,7 +103,7 @@ jobs:
       - name: The .deb installs, works and purges
         run: |
           set -x
-          sudo dpkg -i dist/out/sriov-mac-sync_*_amd64.deb
+          sudo dpkg -i dist/out/sriov-mac-sync_amd64.deb
           test -x /usr/sbin/sriov-mac-sync
           /usr/sbin/sriov-mac-sync --version
           grep -q "^ExecStart=/usr/sbin/sriov-mac-sync$" \
@@ -126,7 +134,7 @@ jobs:
           APK=/tmp/apk-tools/build/src/apk
           mkdir -p /tmp/apkcheck
           $APK extract --allow-untrusted --destination /tmp/apkcheck \
-            dist/out/sriov-mac-sync-*-x86_64.apk
+            dist/out/sriov-mac-sync_x86_64.apk
           test -x /tmp/apkcheck/usr/sbin/sriov-mac-sync
           test -x /tmp/apkcheck/etc/init.d/sriov-mac-sync
           # Ownership is what goes wrong silently: apk records what it finds on

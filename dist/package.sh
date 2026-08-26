@@ -25,6 +25,10 @@ LONG=" A NIC in SR-IOV mode forwards between its functions with a table it is
  the frame leaves on the wire. This daemon watches the bridge's forwarding
  database over netlink and keeps the uplink's unicast filter in step with it."
 
+# The file names carry no version on purpose: they are downloaded through
+# /releases/latest/download/, so the command in the README stays the same
+# forever. Which version a file is stays inside it, where dpkg -I, apk info and
+# opkg info can all say so.
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -110,7 +114,7 @@ EOF
 	chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/prerm" "$root/DEBIAN/postrm"
 
 	dpkg-deb --root-owner-group --build "$root" \
-		"$OUT/sriov-mac-sync_${VERSION}_$2.deb" >/dev/null
+		"$OUT/sriov-mac-sync_$2.deb" >/dev/null
 	rm -rf "$root"
 }
 
@@ -152,9 +156,9 @@ EOF
 	( cd "$root/control" && tar --owner=root --group=root -czf ../control.tar.gz ./* )
 	echo "2.0" > "$root/debian-binary"
 	# opkg reads the members in order, so debian-binary has to come first.
-	( cd "$root" && ar rc "sriov-mac-sync_${VERSION}_$2.ipk" \
+	( cd "$root" && ar rc "sriov-mac-sync_$2.ipk" \
 		debian-binary control.tar.gz data.tar.gz )
-	mv "$root/sriov-mac-sync_${VERSION}_$2.ipk" "$OUT/"
+	mv "$root/sriov-mac-sync_$2.ipk" "$OUT/"
 	rm -rf "$root"
 }
 
@@ -186,7 +190,7 @@ apk() {    # arch-suffix apk-arch
 			--info license:MIT \
 			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
 			--files '$root' \
-			--output '$OUT/sriov-mac-sync-$VERSION-r0-$2.apk'"
+			--output '$OUT/sriov-mac-sync_$2.apk'"
 	else
 		echo "   WARNING: no fakeroot, files will not be owned by root"
 		"$APK" mkpkg \
@@ -197,7 +201,7 @@ apk() {    # arch-suffix apk-arch
 			--info license:MIT \
 			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
 			--files "$root" \
-			--output "$OUT/sriov-mac-sync-$VERSION-r0-$2.apk"
+			--output "$OUT/sriov-mac-sync_$2.apk"
 	fi
 	rm -rf "$root"
 }
