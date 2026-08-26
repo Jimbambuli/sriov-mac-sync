@@ -818,7 +818,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                             trigger,
                         );
                         if opts.timings {
-                            eprint!("pass [{trigger}]\n{}", syncer.timings.report());
+                            note!("pass [{trigger}]\n{}", syncer.timings.report().trim_end());
                         }
                     }
                     // One failed pass is no reason to give up: the next
@@ -1057,7 +1057,7 @@ fn run() -> Result<bool, String> {
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
             if opts.timings {
-                eprint!("{}", syncer.timings.report());
+                note!("{}", syncer.timings.report().trim_end());
             }
             // A oneshot that could not do what it was asked has to say so in
             // its exit code - the warnings above scroll away, the code stays.
