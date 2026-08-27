@@ -95,7 +95,13 @@ if [ "$1" = configure ]; then
 	fi
 	if [ -d /run/systemd/system ]; then
 		systemctl daemon-reload || true
-		if [ -x /usr/bin/deb-systemd-invoke ]; then
+		# On an upgrade $2 carries the old version, the daemon is already
+		# running the old binary, and `start` on a running unit is a no-op -
+		# the fix the upgrade brings would wait for a reboot.
+		if [ -n "$2" ]; then
+			deb-systemd-invoke restart sriov-mac-sync.service >/dev/null 2>&1 \
+				|| systemctl restart sriov-mac-sync.service || true
+		elif [ -x /usr/bin/deb-systemd-invoke ]; then
 			deb-systemd-invoke start sriov-mac-sync.service || true
 		else
 			systemctl enable --now sriov-mac-sync.service || true
@@ -157,7 +163,6 @@ ipk() {     # arch-suffix opkg-arch
 	cat > "$root/control/control" <<EOF
 Package: sriov-mac-sync
 Version: $VERSION
-Depends:
 Section: net
 Architecture: $2
 Maintainer: $MAINT
@@ -179,6 +184,18 @@ echo "sriov-mac-sync is running. What it decided:  sriov-mac-sync --status"
 exit 0
 EOF
 	chmod 755 "$root/control/postinst"
+	# Stop first, then flush, then disable - same reasoning as the .deb:
+	# removing the package undoes its effect on the hardware, and a running
+	# daemon would put back what --flush removes.
+	cat > "$root/control/prerm" <<'EOF'
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+/etc/init.d/sriov-mac-sync stop 2>/dev/null
+/etc/init.d/sriov-mac-sync disable 2>/dev/null
+[ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
+exit 0
+EOF
+	chmod 755 "$root/control/prerm"
 
 	( cd "$root/data" && tar --owner=root --group=root -czf ../data.tar.gz ./* )
 	( cd "$root/control" && tar --owner=root --group=root -czf ../control.tar.gz ./* )
@@ -204,6 +221,24 @@ apk() {    # arch-suffix apk-arch
 	install -m 755 dist/openwrt/sriov-mac-sync.init "$root/etc/init.d/sriov-mac-sync"
 	install -m 644 dist/sriov-mac-sync.conf.example "$root/etc/sriov-mac-sync.conf"
 
+	# The same behaviour as .deb and .ipk: enabled and started on install,
+	# stopped and flushed on removal. mkpkg embeds these; they live outside
+	# $root so they do not become package files.
+	cat > "$root.post-install" <<'EOF'
+#!/bin/sh
+/etc/init.d/sriov-mac-sync enable 2>/dev/null
+/etc/init.d/sriov-mac-sync start 2>/dev/null
+echo "sriov-mac-sync is running. What it decided:  sriov-mac-sync --status"
+exit 0
+EOF
+	cat > "$root.pre-deinstall" <<'EOF'
+#!/bin/sh
+/etc/init.d/sriov-mac-sync stop 2>/dev/null
+/etc/init.d/sriov-mac-sync disable 2>/dev/null
+[ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
+exit 0
+EOF
+
 	# apk records the ownership it finds on disk, and a package whose files
 	# belong to whoever happened to build it installs them as nobody:nogroup.
 	# fakeroot is the only part of this script that is not tar and a compiler;
@@ -217,6 +252,8 @@ apk() {    # arch-suffix apk-arch
 			--info arch:$2 \
 			--info license:MIT \
 			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
+			--script post-install:'$root.post-install' \
+			--script pre-deinstall:'$root.pre-deinstall' \
 			--files '$root' \
 			--output '$OUT/sriov-mac-sync_$2.apk'"
 	else
@@ -228,10 +265,12 @@ apk() {    # arch-suffix apk-arch
 			--info arch:"$2" \
 			--info license:MIT \
 			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
+			--script post-install:"$root.post-install" \
+			--script pre-deinstall:"$root.pre-deinstall" \
 			--files "$root" \
 			--output "$OUT/sriov-mac-sync_$2.apk"
 	fi
-	rm -rf "$root"
+	rm -rf "$root" "$root.post-install" "$root.pre-deinstall"
 }
 
 build x86_64-unknown-linux-musl  x86_64

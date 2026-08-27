@@ -63,7 +63,7 @@ NDA_LLADDR = 2
 SO_RCVBUFFORCE = 33
 
 FILTER_CAPACITY = 128  # ConnectX-4 Lx vport list; the README's measured limit
-TEST_MACS_TOTAL = 8 + 8 + 16
+TEST_MACS_TOTAL = 8 + 8 + 16 + 2  # S1 + S2 + S3, and one each for S5 and S6
 CAPACITY_MARGIN = 16
 
 
@@ -132,8 +132,15 @@ class Governor:
                 with open(path, "w") as fh:
                     fh.write(wanted)
         except OSError as e:
-            # Not root, or a kernel that will not have it. Say so and measure
-            # anyway - a number with a caveat beats no number.
+            # Not root, or a kernel that will not have it. Whatever was
+            # already switched goes back first - a half-pinned host would
+            # outlive the trial - then say so and measure as found.
+            for path, gov in self.previous.items():
+                try:
+                    with open(path, "w") as fh:
+                        fh.write(gov)
+                except OSError:
+                    pass
             print(f"(cannot set the governor: {e}; measuring as found)")
             self.previous.clear()
             return
@@ -186,6 +193,11 @@ class Cleanup:
             pf, idx, mac = self.vf_address
             subprocess.run(["ip", "link", "set", pf, "vf", str(idx), "mac", mac],
                            capture_output=True)
+            left = admin_vf_address(pf, idx)
+            if left != mac:
+                print(f"CLEANUP: {pf} vf {idx} is left at {left} instead of "
+                      f"{mac} - put it back with `ip link set {pf} vf {idx} "
+                      f"mac {mac}`", file=sys.stderr)
         purge_learned_residue()
         # No note surgery, ever: the daemon's ENOENT path heals the notes on
         # the next pass once the entries are gone from the card.
@@ -392,8 +404,11 @@ def free_virtual_function(uplink):
             base = f"/sys/class/net/{name}"
             if os.path.exists(f"{base}/master"):
                 continue  # in a bridge
-            if "UP" in read(f"{base}/flags_str") if os.path.exists(f"{base}/flags_str") else False:
-                continue
+            try:
+                if int(read(f"{base}/flags"), 16) & 1:
+                    continue  # administratively up - somebody prepared it
+            except (TypeError, ValueError):
+                pass
             if read(f"{base}/operstate") == "up":
                 continue  # carrying traffic for somebody
             if any(e.startswith("upper_") for e in os.listdir(base)):
@@ -424,6 +439,13 @@ def preflight(args, binary):
         fail("the daemon runs with explicit --pair flags; a fresh --status "
              "cannot see them, so the trial would guard the wrong uplinks")
 
+    if not os.path.isfile(binary):
+        fail(f"{binary} does not exist - say --binary /path/to/sriov-mac-sync")
+    m = re.search(r"path=(\S+)", execstart)
+    if m and os.path.realpath(m.group(1)) != os.path.realpath(binary):
+        print(f"(note: the service runs {m.group(1)}; --status, S4 and --check "
+              f"below use {binary})")
+
     pairs = watched_pairs(binary)
     uplinks = [dev for (dev, br) in pairs if br == args.bridge]
     if not uplinks:
@@ -440,11 +462,19 @@ def preflight(args, binary):
     if args.vlan is not None:
         for up in uplinks:
             vl = run(["bridge", "vlan", "show", "dev", up]).stdout
-            # iproute2 prints ranges ("2-4094", the PVE default); a substring
-            # match would refuse the very host this was written for.
+            # iproute2 prints ranges ("2-4094", the PVE default) - and the
+            # port name in the first column, whose digits ("nic1") must not
+            # count as VLANs. Only a whole token that is a number or a range
+            # is one.
+            ids = [
+                m
+                for line in vl.splitlines()
+                for tok in line.split()
+                if (m := re.fullmatch(r"(\d+)(?:-(\d+))?", tok))
+            ]
             member = any(
-                int(lo) <= args.vlan <= int(hi or lo)
-                for lo, hi in re.findall(r"(\d+)(?:-(\d+))?", vl)
+                int(m.group(1)) <= args.vlan <= int(m.group(2) or m.group(1))
+                for m in ids
             )
             if not member:
                 fail(f"VLAN {args.vlan} is not configured on {up}")
@@ -686,10 +716,22 @@ class Trial:
         uplink = self.uplinks[0]
         t0 = time.monotonic_ns()
         if not learn_on(uplink, mac, self.args.vlan):
-            self.verdict("wire reflection", True,
-                         f"skipped: {uplink} has no carrier, and a port in "
-                         "the disabled state refuses the dynamic entry that "
-                         "imitates the wire - nothing to reflect from")
+            # The kernel refused the entry that imitates the wire. Only a
+            # port out of the forwarding state - no carrier, or taken down -
+            # is a reason to skip; anything else is this trial failing to
+            # build its own precondition, and claiming "no carrier" without
+            # looking would hide that.
+            if read(f"/sys/class/net/{uplink}/carrier") != "1":
+                self.verdict("wire reflection", True,
+                             f"skipped: {uplink} has no carrier, and a port in "
+                             "the disabled state refuses the dynamic entry "
+                             "that imitates the wire - nothing to reflect from")
+            else:
+                self.verdict("wire reflection", True,
+                             f"skipped: the kernel refused the wire-imitating "
+                             f"entry on {uplink} although carrier is present - "
+                             "a harness precondition failed (check the VLAN), "
+                             "the daemon was not put on trial here")
             return
         deadline = t0 + 5_000_000_000
         gone = False
@@ -697,7 +739,15 @@ class Trial:
             mon.pump(time.monotonic_ns() + 100_000_000)
             gone = mac_str(mac) not in self_macs(uplink)
         took = (time.monotonic_ns() - t0) / 1e6
-        noted_gone = mac_str(mac).encode() not in note_bytes(uplink)
+        # The kernel event fires inside the removal; the note is rewritten
+        # after the whole loop - a single read can race it, same as noted().
+        noted_gone = False
+        if gone:
+            end = time.monotonic() + 1.0
+            while not noted_gone and time.monotonic() < end:
+                noted_gone = mac_str(mac).encode() not in note_bytes(uplink)
+                if not noted_gone:
+                    time.sleep(0.05)
         unlearn_on(uplink, mac, self.args.vlan)
         self.verdict(
             "wire reflection", gone and noted_gone,
@@ -763,6 +813,8 @@ class Trial:
         run(["ip", "link", "set", pf, "vf", str(index), "mac", original])
         restored = admin_vf_address(pf, index)
         self.cleanup.vf_address = None
+        if registered:
+            run(["bridge", "fdb", "del", mac_str(mac), "dev", uplink, "self", "permanent"])
         if restored != original:
             self.verdict(
                 "virtual function address", False,
@@ -771,8 +823,6 @@ class Trial:
                 f"{original}`")
             purge_learned_residue()
             return
-        if registered:
-            run(["bridge", "fdb", "del", mac_str(mac), "dev", uplink, "self", "permanent"])
         purge_learned_residue()
         self.verdict(
             "virtual function address", not registered,
