@@ -40,6 +40,13 @@ pub(crate) struct FakeSock {
     /// the most expensive question a pass asks, and exactly the one the
     /// vf_stale machinery exists to avoid asking twice.
     pub(crate) vf_asked: usize,
+    /// raw OS error the next vf_macs_of answers with, taken once - the
+    /// transient failure the refresh path has to stay distrustful through.
+    pub(crate) fail_vf: Option<i32>,
+    /// Like `meanwhile`, but firing on the first successful removal: the
+    /// reflection path stands in an rtnl window too, and a parallel writer
+    /// in that window is what its merged write-back exists for.
+    pub(crate) meanwhile_del: Option<(PathBuf, Mac)>,
 }
 
 impl FdbWriter for FakeSock {
@@ -51,6 +58,9 @@ impl FdbWriter for FakeSock {
     }
     fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
         self.vf_asked += 1;
+        if let Some(code) = self.fail_vf.take() {
+            return Err(io::Error::from_raw_os_error(code));
+        }
         Ok(self.vf.clone())
     }
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
@@ -69,6 +79,12 @@ impl FdbWriter for FakeSock {
         } else {
             if self.del_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.del_delay_ms));
+            }
+            if let Some((path, other)) = self.meanwhile_del.take() {
+                let mut text = fs::read_to_string(&path).unwrap_or_default();
+                text.push_str(&format_mac(&other));
+                text.push('\n');
+                fs::write(&path, text).unwrap();
             }
             self.removed.push((ifindex, *mac));
         }

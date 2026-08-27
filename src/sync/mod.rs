@@ -1066,7 +1066,11 @@ impl Syncer {
             if !self.with_owned(&fp.dev, |o| macs.iter().any(|m| o.contains(m))) {
                 continue;
             }
-            let mut owned = self.load_owned(&fp.dev);
+            // The snapshot is taken before a window that can stand on rtnl
+            // for seconds; written back as a difference, not as the whole
+            // set, or a parallel writer's additions in that window are lost.
+            let owned_before = self.load_owned(&fp.dev);
+            let mut owned = owned_before.clone();
             let mut changed = false;
             let mut taken_back: Vec<Mac> = Vec::new();
             for mac in macs {
@@ -1093,16 +1097,22 @@ impl Syncer {
                         changed = true;
                     }
                     // Keep the note: an entry still in the card that nothing
-                    // owns is the orphan the notes exist to prevent.
-                    Err(e) => eprintln!(
-                        "warning: {}: cannot unregister {}: {e}",
-                        fp.dev,
-                        format_mac(mac)
-                    ),
+                    // owns is the orphan the notes exist to prevent. And buy
+                    // a pass: the guest's traffic is being misdirected right
+                    // now, and a batch made only of this failure would
+                    // otherwise end quiet and retry nothing.
+                    Err(e) => {
+                        urgency = Urgency::Now;
+                        eprintln!(
+                            "warning: {}: cannot unregister {}: {e}",
+                            fp.dev,
+                            format_mac(mac)
+                        );
+                    }
                 }
             }
             if changed {
-                self.save_owned(&fp.dev, &owned);
+                self.save_owned_merged(&fp.dev, &owned_before, &owned);
             }
             // Beyond the batch, only the ones actually taken out of the
             // filter are remembered, so that the next batch does not put back
@@ -1120,26 +1130,25 @@ impl Syncer {
             }
         }
 
-        // A carried answer decides nothing that grows a filter - unless every
-        // physical function it covers can be heard from. A virtual function's
-        // address changes without any link message when its PF is
-        // administratively down - netdev_state_change() on a down device
-        // announces nothing, seen on mlx4 - so no event marks the carried
-        // answer stale, and the only moment left to catch the change is
-        // before an addition. An up PF does announce (measured on mlx5, from
-        // the host and from inside a guest alike), the announcement marks the
-        // answer stale, and the carried answer is then as good as a fresh
-        // one. So the question lands exactly where it is cheap: asked on the
-        // mute cards (mlx4, ~0.01 ms), skipped on the ones whose firmware
-        // makes it expensive (mlx5, ~0.6 ms) - those announce. Decided first
-        // with the carried answer, and only a batch that would register
-        // something asks the driver afresh and decides again: reflection and
-        // deletions above still act on the carried answer, because shrinking
-        // on stale news is healed by the next pass, while growing on stale
-        // news sends a guest's traffic past it until the timed pass, up to
-        // the whole interval. A PF this picture cannot see counts as mute.
-        let a_pf_is_mute = pfs.iter().any(|&pf| !topo.at(pf).is_some_and(|l| l.up));
-        if vf_carried && a_pf_is_mute {
+        // A carried answer decides nothing that grows a filter. A virtual
+        // function's address can change without any link message: a PF that
+        // is administratively down announces nothing (netdev_state_change()
+        // on a down device is a no-op, seen on mlx4) - and even an up PF is
+        // silent when the GUEST changes its address, because on ixgbe and
+        // i40e that runs over the driver mailbox and the PF handler updates
+        // vfinfo without telling rtnetlink. There was an "up PFs announce"
+        // gate here once; the kernel source refuted it. So no event can be
+        // relied on to mark the carried answer stale, and the only moment
+        // left to catch the change is before an addition. Decided first with
+        // the carried answer, and only a batch that would register something
+        // asks the driver afresh and decides again: reflection and deletions
+        // above still act on the carried answer, because shrinking on stale
+        // news is healed by the next pass, while growing on stale news sends
+        // a guest's traffic past it until the timed pass, up to the whole
+        // interval. The price is one driver question per filter-growing
+        // batch - ~0.9 ms on mlx5, whose firmware answers it, ~0.01 ms on
+        // the Intel drivers and mlx4.
+        if vf_carried {
             let mut would: Map<String, Vec<Mac>> = crate::hash::map();
             for (kind, entry) in events {
                 if *kind != crate::netlink::RTM_NEWNEIGH {
@@ -1148,6 +1157,12 @@ impl Syncer {
                 self.fast_add(sock, topo, entry, &pairs, &mut would, false);
             }
             if !would.is_empty() {
+                // If the question fails, whoever comes next must not believe
+                // the carried answer either: main answers the error with a
+                // prompt full pass, and that pass would otherwise take the
+                // very answer this refresh distrusted. remember_vf clears
+                // the mark again on success.
+                self.vf_stale = true;
                 let fresh = sock.vf_macs_of(&pfs)?;
                 self.remember_vf(pfs.clone(), fresh.clone());
                 for fp in &mut pairs {

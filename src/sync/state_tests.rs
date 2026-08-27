@@ -449,14 +449,13 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
 }
 
 /// A batch that would grow the filter asks the driver afresh instead of
-/// believing the carried answer - when a physical function is mute. A
-/// virtual function's address can change without any link message when its
-/// PF is administratively down (netdev_state_change() on a down device
-/// announces nothing, seen on mlx4), so the carried answer may be the only
-/// thing standing between a guest and its traffic being sent past it. The
-/// fixture's PFs are down - the builder's default, and the careful side.
-/// Shrinking batches keep the carried answer: they cost at most a filter
-/// slot until the next pass.
+/// believing the carried answer - always. A virtual function's address can
+/// change without any link message: a down PF announces nothing, and even
+/// an up one is silent when the guest changes it over the ixgbe/i40e
+/// mailbox - so no event reliably marks the carried answer stale, and the
+/// carried answer may be the only thing standing between a guest and its
+/// traffic being sent past it. Shrinking batches keep the carried answer:
+/// they cost at most a filter slot until the next pass.
 #[test]
 fn a_batch_that_would_register_asks_the_driver_afresh() {
     let dir = scratch("grow-refresh");
@@ -510,52 +509,81 @@ fn a_batch_that_would_register_asks_the_driver_afresh() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The counterpart: an up physical function announces its VF-address
-/// changes, every announcement marks the carried answer stale, and the
-/// carried answer is then as good as a fresh one - so additions do not pay
-/// the driver question. On the cards where that question is expensive
-/// (mlx5 answers out of firmware, ~0.6 ms) the PFs are up, which is what
-/// keeps the fast path fast there; the mute-PF case above is the mlx4
-/// shape, where the question costs next to nothing.
+/// The refresh a growing batch pays must not fail open: when the driver
+/// cannot be asked, the carried answer is marked stale, so the prompt full
+/// pass that answers the error asks afresh instead of taking the very
+/// answer the refresh distrusted - which would register the function's
+/// address after all.
 #[test]
-fn an_up_pf_lets_additions_trust_the_carried_answer() {
-    let dir = scratch("grow-trust");
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("vmbr1")
-        .vfs(1)
-        .up()
-        .add("nic2", 3, Some(mac(2)))
-        .master("vmbr1")
-        .add("vmbr1", 10, Some(mac(1)))
-        .bridge()
-        .lower("nic1")
-        .lower("nic2")
-        .build();
+fn a_failed_refresh_leaves_the_carried_answer_distrusted() {
+    let dir = scratch("refresh-fail");
+    let topo = host(mac(1));
     let mut s = ready_syncer(&dir);
+    // Carried, and stale in truth: the world has an address it lacks.
     s.remember_vf(vec![2], Vec::new());
-    // The fake world holds an address the carried answer does not - in the
-    // real world an up PF would have announced it, the answer would be
-    // stale, and this batch would ask. Here nothing announced, so the
-    // trust shows plainly: no question, and the address goes in.
     let mut sock = FakeSock {
         vf: vec![(2, VF_ADMIN)],
+        fail_vf: Some(libc::ENOBUFS),
         ..Default::default()
     };
+    let r = s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+    );
+    assert!(r.is_err(), "the failed question reaches the caller");
+    assert!(s.vf_stale, "and the carried answer is no longer believed");
+    assert!(sock.added.is_empty(), "nothing went in on the failed batch");
+
+    // Whoever comes next - main schedules a prompt pass - now asks afresh
+    // and the address stays out.
     s.fast_apply(
         &mut sock,
         &topo,
         &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
     )
     .unwrap();
-    assert_eq!(
-        sock.vf_asked, 0,
-        "an up PF announces, so additions keep the carried answer"
-    );
     assert!(
-        sock.added.iter().any(|(_, m)| *m == VF_ADMIN),
-        "the carried answer is believed - that is the deal, and why the \
-         announcement channel must exist"
+        sock.added.is_empty(),
+        "asked afresh, the function's address stays out"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The reflection path stands in an rtnl window that can last seconds, and
+/// its write-back is a difference, not the whole set: what a parallel
+/// writer noted in that window survives. Written back whole, the parallel
+/// entry vanished from the note while staying in the card - an orphan on
+/// exactly the path the notes exist to prevent.
+#[test]
+fn reflection_keeps_what_a_parallel_writer_noted() {
+    let dir = scratch("reflect-merge");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.remember_vf(vec![2], Vec::new());
+    // WIRE is ours, registered and noted; while the reflection removes it,
+    // a parallel --once appends BEHIND_GUEST to the same note.
+    s.append_owned("nic1", &[WIRE]);
+    let mut sock = FakeSock {
+        meanwhile_del: Some((dir.join("nic1.owned"), BEHIND_GUEST)),
+        ..Default::default()
+    };
+    // WIRE turns up on the uplink port itself: the wire has the last word.
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))],
+    )
+    .unwrap();
+    assert!(
+        sock.removed.iter().any(|(_, m)| *m == WIRE),
+        "the reflected address came out of the filter"
+    );
+    let note = fs::read_to_string(dir.join("nic1.owned")).unwrap_or_default();
+    assert!(!note.contains(&format_mac(&WIRE)), "and out of the note");
+    assert!(
+        note.contains(&format_mac(&BEHIND_GUEST)),
+        "the parallel writer's entry survives the write-back"
     );
     let _ = fs::remove_dir_all(&dir);
 }
