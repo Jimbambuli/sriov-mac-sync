@@ -359,6 +359,12 @@ fn parse_args(opts: &mut Options) -> Result<(), String> {
 
 fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> Result<(), String> {
     let mut args = args;
+    // Whether a --pair has been seen on this command line. The first one
+    // replaces whatever PAIRS= in the configuration put here - a command
+    // line names the whole pair list or none of it, else the harmless
+    // `--pair nic1:vmbr1` on a host whose conf says the same is refused
+    // as a duplicate and a differing bridge cannot win at all.
+    let mut pairs_from_cli = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => set_mode(opts, Mode::Once, &arg)?,
@@ -368,9 +374,14 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
             "--dry-run" => opts.dry_run = true,
             "--timings" => opts.timings = true,
             "-v" | "--verbose" => opts.verbose = true,
-            "--pair" => opts
-                .pairs
-                .push(args.next().ok_or("--pair needs DEV:BRIDGE")?),
+            "--pair" => {
+                if !pairs_from_cli {
+                    opts.pairs.clear();
+                    pairs_from_cli = true;
+                }
+                opts.pairs
+                    .push(args.next().ok_or("--pair needs DEV:BRIDGE")?);
+            }
             "--interval" => {
                 opts.interval = clamp_interval(
                     args.next()
@@ -409,7 +420,12 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
     Ok(())
 }
 
-fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<Vec<Pair>, String> {
+fn resolve_pairs(
+    topo: &Topology,
+    opts: &Options,
+    allow_empty: bool,
+    strict: bool,
+) -> Result<Vec<Pair>, String> {
     let mut pairs = Vec::new();
     if opts.pairs.is_empty() {
         let (found, skipped) = topo.autodetect();
@@ -429,25 +445,40 @@ fn resolve_pairs(topo: &Topology, opts: &Options, allow_empty: bool) -> Result<V
             let (dev, bridge) = spec
                 .split_once(':')
                 .ok_or_else(|| format!("malformed pair: {spec} (expected DEV:BRIDGE)"))?;
-            let Some(dev_index) = topo.index_of(dev) else {
-                return Err(format!("no such interface: {dev}"));
-            };
-            let bridge_index = topo.index_of(bridge).unwrap_or(0);
-            if !topo.is_bridge(bridge_index) {
-                return Err(format!("not a bridge: {bridge}"));
+            // Nonsense stays nonsense in every mode.
+            if dev == bridge {
+                return Err(format!("{spec}: a bridge cannot be its own uplink"));
             }
             // A pair whose device does not actually sit under that bridge
             // disables the one protection that matters: nothing the bridge
             // learnt counts as wire-side any more, so everything it learnt -
             // the peers out on the cable included - would be written into
-            // the device's filter. A typo must fail here, not there.
-            if dev == bridge {
-                return Err(format!("{spec}: a bridge cannot be its own uplink"));
-            }
-            if topo.bridge_above(dev_index).map(|(b, _)| b) != Some(bridge_index) {
-                return Err(format!(
-                    "{spec}: {dev} is not enslaved to {bridge}, directly or through a bond"
-                ));
+            // the device's filter. A typo must fail here, not there - but
+            // only where a person is watching. --flush works from the notes
+            // and never reads a pair; --status reports whatever is there;
+            // and a daemon whose named interface is not up yet at boot must
+            // wait for it, not crash-loop until it appears. Those warn and
+            // keep the pair; the reconciler skips missing devices anyway.
+            let topology_says = (|| -> Result<(), String> {
+                let Some(dev_index) = topo.index_of(dev) else {
+                    return Err(format!("no such interface: {dev}"));
+                };
+                let bridge_index = topo.index_of(bridge).unwrap_or(0);
+                if !topo.is_bridge(bridge_index) {
+                    return Err(format!("not a bridge: {bridge}"));
+                }
+                if topo.bridge_above(dev_index).map(|(b, _)| b) != Some(bridge_index) {
+                    return Err(format!(
+                        "{spec}: {dev} is not enslaved to {bridge}, directly or through a bond"
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(msg) = topology_says {
+                if strict {
+                    return Err(msg);
+                }
+                eprintln!("warning: {msg} - kept, in case it appears");
             }
             // Two pairs on one device would share one ownership note and
             // spend every pass undoing each other's work.
@@ -824,8 +855,17 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                     }
                     // One failed pass is no reason to give up: the next
                     // is seconds away and starts from the kernel's
-                    // state again.
-                    Err(e) => eprintln!("warning: reconciliation failed: {e}"),
+                    // state again - the same treatment the refused
+                    // topology gets above. It used to fall through to
+                    // the full interval, which on a quiet host was five
+                    // minutes of not looking after a transient rtnl
+                    // failure.
+                    Err(e) => {
+                        eprintln!("warning: reconciliation failed: {e}");
+                        next_full = world.now() + RETRY_AFTER;
+                        trigger = "timed";
+                        continue;
+                    }
                 }
             }
             last_pass = world.now();
@@ -998,6 +1038,8 @@ fn run() -> Result<bool, String> {
         &topo,
         &opts,
         matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status),
+        // Strict only where a person is at the keyboard to fix the typo.
+        matches!(opts.mode, Mode::Once | Mode::Check),
     )?;
 
     if opts.mode == Mode::Check {
@@ -1739,8 +1781,20 @@ mod tests {
                 pairs: pairs.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             };
-            resolve_pairs(&topo, &o, false)
+            resolve_pairs(&topo, &o, false, true)
         };
+        // A named pair whose interface is missing refuses where a person
+        // is watching, and is kept with a warning where availability wins:
+        // the daemon at boot, and flush/status, which do not read it.
+        {
+            let o = Options {
+                pairs: vec!["ghost:br0".into()],
+                ..Default::default()
+            };
+            assert!(resolve_pairs(&topo, &o, true, true).is_err());
+            let kept = resolve_pairs(&topo, &o, true, false).expect("lenient keeps it");
+            assert_eq!(kept.len(), 1, "the pair waits for its interface");
+        }
         for (spec, names) in [
             ("nic1", "malformed"),
             ("ghost:br0", "no such interface"),
@@ -1824,5 +1878,42 @@ mod tests {
         // An unbalanced quote swallows the rest rather than guessing where
         // the value was meant to stop.
         assert_eq!(strip_comment("\"unclosed # here"), "\"unclosed # here");
+    }
+}
+
+#[cfg(test)]
+mod pair_override_tests {
+    use super::*;
+
+    /// The command line names the whole pair list or none of it: the first
+    /// --pair replaces what PAIRS= put there, so repeating the conf's pair
+    /// is not a duplicate and a differing bridge wins.
+    #[test]
+    fn a_cli_pair_replaces_the_configurations() {
+        let mut opts = Options {
+            pairs: vec!["nic1:vmbr1".into()],
+            ..Default::default()
+        };
+        parse_args_from(
+            &mut opts,
+            ["--pair".to_string(), "nic1:vmbr1".to_string()].into_iter(),
+        )
+        .expect("the conf's own pair on the command line is not a duplicate");
+        assert_eq!(opts.pairs, vec!["nic1:vmbr1".to_string()]);
+
+        let mut opts = Options {
+            pairs: vec!["nic1:vmbr1".into()],
+            ..Default::default()
+        };
+        parse_args_from(
+            &mut opts,
+            ["--pair".to_string(), "nic1:vmbr9".to_string()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            opts.pairs,
+            vec!["nic1:vmbr9".to_string()],
+            "a differing command line wins over the configuration"
+        );
     }
 }

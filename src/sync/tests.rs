@@ -430,3 +430,20 @@ fn a_bond_counts_as_the_wire_side_in_full() {
         "a bond member's address is the host's own"
     );
 }
+
+/// A PF whose numvfs went from 0 to N inside one batch is invisible to the
+/// old picture; the old answer must not win over the new one, or the very
+/// first VF address set right after enabling SR-IOV slips past the
+/// exclusions until the timed refresh.
+#[test]
+fn a_pf_that_just_grew_vfs_counts_as_vf_relevant() {
+    let before = Builder::new().add("nic1", 2, Some(mac(1))).build();
+    let after = Builder::new().add("nic1", 2, Some(mac(1))).vfs(4).build();
+    assert!(vf_may_have_changed(Some(&before), Some(&after), &[2]));
+    // And the reverse: gone from the new picture, known to the old.
+    assert!(vf_may_have_changed(Some(&after), Some(&before), &[2]));
+    // Neither picture knows the interface: caution.
+    assert!(vf_may_have_changed(Some(&before), Some(&before), &[99]));
+    // Both know it, neither sees virtual functions: no reason to ask.
+    assert!(!vf_may_have_changed(Some(&before), Some(&before), &[2]));
+}

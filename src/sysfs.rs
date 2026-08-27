@@ -596,11 +596,15 @@ impl Topology {
                         if let Some((_, _, taken)) =
                             taken_for.iter().find(|(p, b, _)| *p == pf && *b == br)
                         {
-                            eprintln!(
-                                "warning: skip {name}: {taken} of the same {pf_name} already \
-                                 carries {br_name} - two vports of one eSwitch cannot both \
-                                 claim the same addresses"
-                            );
+                            // Into `skipped` like every other declined
+                            // candidate: autodetection runs on every pass,
+                            // and a direct eprintln here was the same line
+                            // thousands of times a day.
+                            skipped.push(format!(
+                                "skip {name}: {taken} of the same {pf_name} already \
+                                 carries {br_name} - two vports of one eSwitch cannot \
+                                 both claim the same addresses"
+                            ));
                             continue;
                         }
                         taken_for.push((pf, br, name.clone()));
@@ -708,11 +712,10 @@ pub(crate) mod fixture {
 
         /// Every PF netdev of a virtual function's PCI function, for the
         /// multiport-shared-function case where `physfn/net` lists more than
-        /// one. Sets `physfn` to the first as the kernel walk would.
+        /// one. Resolved the way production does: sorted by index, with
+        /// `physfn` the lowest - build() takes care of both.
         pub fn pf_netdevs(mut self, pfs: &[&str]) -> Self {
-            let n = self.last_names();
-            n.pf_netdevs = pfs.iter().map(|p| p.to_string()).collect();
-            n.physfn = n.pf_netdevs.first().cloned();
+            self.last_names().pf_netdevs = pfs.iter().map(|p| p.to_string()).collect();
             self
         }
 
@@ -739,6 +742,14 @@ pub(crate) mod fixture {
                         n.pf_netdevs.clone()
                     };
                     l.pf_netdevs = pf_names.iter().filter_map(idx).collect();
+                    // The same resolution production applies: sorted, and
+                    // physfn names the lowest-numbered netdev of the
+                    // function - a fixture state production cannot produce
+                    // is a state not worth testing against.
+                    l.pf_netdevs.sort_unstable();
+                    if let Some(&first) = l.pf_netdevs.first() {
+                        l.physfn = Some(first);
+                    }
                     l
                 })
                 .collect();
@@ -1068,6 +1079,8 @@ mod tests {
             let mut bv = b.vf_netdevs.clone();
             av.sort();
             bv.sort();
+            let ap = a.pf_netdevs.clone();
+            let bp = b.pf_netdevs.clone();
             for (what, x, y) in [
                 ("name", a.name.clone(), b.name.clone()),
                 ("mac", format!("{:?}", a.mac), format!("{:?}", b.mac)),
@@ -1094,6 +1107,7 @@ mod tests {
                     format!("{:?}", b.physfn),
                 ),
                 ("vf_netdevs", format!("{av:?}"), format!("{bv:?}")),
+                ("pf_netdevs", format!("{ap:?}"), format!("{bp:?}")),
             ] {
                 if x != y {
                     differences.push(format!("{}: {what}: kernel {x}, sysfs {y}", a.name));

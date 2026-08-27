@@ -283,10 +283,17 @@ pub fn vf_may_have_changed(
     changed: &[u32],
 ) -> bool {
     changed.iter().any(|i| {
-        before
-            .and_then(|t| touches_virtual_functions(t, *i))
-            .or_else(|| after.and_then(|t| touches_virtual_functions(t, *i)))
-            .unwrap_or(true)
+        // Either picture saying yes is a yes: a PF whose numvfs went from 0
+        // to N inside this very batch is invisible to the old picture, and
+        // letting the old answer win was how exactly that change slipped
+        // past the exclusions. Only when neither picture knows the
+        // interface is caution the answer.
+        let b = before.and_then(|t| touches_virtual_functions(t, *i));
+        let a = after.and_then(|t| touches_virtual_functions(t, *i));
+        match (b, a) {
+            (None, None) => true,
+            _ => b.unwrap_or(false) || a.unwrap_or(false),
+        }
     })
 }
 
