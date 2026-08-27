@@ -351,6 +351,11 @@ impl Syncer {
         });
     }
 
+    /// Seed a note with exactly this set. No production path writes a
+    /// whole set any more - the pass and the reflection both write
+    /// differences, so a parallel writer's lines survive - but the tests
+    /// build their starting states this way.
+    #[cfg(test)]
     pub(super) fn save_owned(&self, dev: &str, set: &Set<Mac>) {
         if self.dry_run {
             return;

@@ -39,9 +39,6 @@ pub struct Link {
     /// what is enslaved to, or stacked under, this interface
     pub lowers: Vec<u32>,
     pub is_bridge: bool,
-    /// administratively up (IFF_UP). A down physical function announces
-    /// nothing when a virtual function's address changes - see fast_apply.
-    pub up: bool,
     pub numvfs: u32,
     pub driver: Option<String>,
     /// the PF, when this interface is a virtual function. On a card where one
@@ -139,10 +136,6 @@ impl Topology {
             let link = Link {
                 name: name.clone(),
                 index,
-                // /sys/class/net/X/flags is hexadecimal, "0x1003" and such.
-                up: read_trim(base.join("flags"))
-                    .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                    .is_some_and(|f| f & 1 != 0),
                 mac: read_trim(base.join("address"))
                     .as_deref()
                     .and_then(parse_mac),
@@ -301,7 +294,6 @@ impl Topology {
             let mut link = Link {
                 name: l.name.clone(),
                 index: l.index,
-                up: l.up,
                 mac: l.mac,
                 master: l.master,
                 lowers,
@@ -706,13 +698,6 @@ pub(crate) mod fixture {
 
         pub fn vfs(mut self, n: u32) -> Self {
             self.last().numvfs = n;
-            self
-        }
-
-        /// Administratively up. The fixtures default to down, which is the
-        /// careful side: a down PF makes additions consult the driver.
-        pub fn up(mut self) -> Self {
-            self.last().up = true;
             self
         }
 
