@@ -524,6 +524,29 @@ impl Syncer {
         skip
     }
 
+    /// The probe entry --check writes is owned from the moment it exists:
+    /// noted BEFORE it is written, forgotten after it is taken back out. A
+    /// check killed between the two then leaves an entry the daemon's next
+    /// pass removes and heals - without this it left a foreign entry
+    /// nothing would ever touch, until a reboot. The tiny cost: a pass
+    /// racing a live check can take the probe out early and fail the check
+    /// with "accepted but not listed" - a diagnostic re-run, not a harm.
+    pub fn note_check_probe(&self, dev: &str, mac: &Mac) {
+        self.append_owned(dev, &[*mac]);
+    }
+
+    pub fn forget_check_probe(&self, dev: &str, mac: &Mac) {
+        let before = self.load_owned(dev);
+        if !before.contains(mac) {
+            return;
+        }
+        let mut after = before.clone();
+        after.remove(mac);
+        // As a difference, so whatever a parallel writer noted meanwhile
+        // survives - same rule as every other write-back.
+        self.save_owned_merged(dev, &before, &after);
+    }
+
     /// Say so when a virtual function's address cannot be known.
     ///
     /// The exclusion set can recognise a virtual function two ways: an

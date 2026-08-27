@@ -664,6 +664,30 @@ fn the_grow_refresh_asks_only_the_growing_pairs_functions() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The check probe is noted before it exists and forgotten after it is
+/// gone, and the forgetting is a difference: a parallel writer's line in
+/// the same window survives. This is what turns a killed --check from a
+/// permanent foreign entry into one the next pass heals.
+#[test]
+fn a_check_probe_is_noted_first_and_forgotten_as_a_difference() {
+    let dir = scratch("check-probe");
+    let s = ready_syncer(&dir);
+    const PROBE: Mac = [0x02, 0xe3, 0, 0, 0, 0x59];
+    s.note_check_probe("nic1", &PROBE);
+    let noted = fs::read_to_string(dir.join("nic1.owned")).unwrap();
+    assert!(noted.contains(&format_mac(&PROBE)), "noted before written");
+    // A parallel --once registers something while the probe is out.
+    s.append_owned("nic1", &[BEHIND_GUEST]);
+    s.forget_check_probe("nic1", &PROBE);
+    let after = fs::read_to_string(dir.join("nic1.owned")).unwrap();
+    assert!(!after.contains(&format_mac(&PROBE)), "forgotten");
+    assert!(
+        after.contains(&format_mac(&BEHIND_GUEST)),
+        "the parallel writer's line survives the forgetting"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn eexist_is_not_claimed_as_ours() {
     let dir = scratch("eexist");

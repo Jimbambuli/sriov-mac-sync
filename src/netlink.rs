@@ -188,6 +188,11 @@ pub struct Events {
 }
 
 pub struct Socket {
+    /// Whether the drop of a spoofed datagram has been said out loud this
+    /// run. Once: draining them is unavoidable - left queued they would
+    /// crowd out real notifications until ENOBUFS - but doing it silently
+    /// hides that a local process is aiming unicast netlink at this socket.
+    spoof_warned: std::cell::Cell<bool>,
     /// The receive buffer, kept rather than allocated per call. Every read
     /// here wants tens or hundreds of kilobytes, and `vec![0u8; n]` is both
     /// an allocation and a walk over n bytes to zero them - paid on every
@@ -347,6 +352,7 @@ impl Socket {
             fd,
             seq: 1,
             buf: Vec::new(),
+            spoof_warned: std::cell::Cell::new(false),
         })
     }
 
@@ -428,6 +434,13 @@ impl Socket {
                 return Err(e);
             }
             if from.nl_pid != 0 {
+                if !self.spoof_warned.replace(true) {
+                    eprintln!(
+                        "warning: a local process (netlink port {}) is sending this \
+                         socket unicast messages; they are dropped, said once",
+                        from.nl_pid
+                    );
+                }
                 dropped += 1;
                 if dropped >= 64 {
                     return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -503,8 +516,7 @@ impl Socket {
                     // body are taken at their word, as before.
                     NLMSG_DONE => {
                         if msg.payload.len() >= 4 {
-                            let code =
-                                i32::from_ne_bytes(msg.payload[..4].try_into().unwrap_or_default());
+                            let code = i32::from_ne_bytes(msg.payload[..4].try_into().unwrap());
                             if code != 0 {
                                 return Err(io::Error::from_raw_os_error(-code));
                             }
@@ -642,8 +654,7 @@ impl Socket {
                     // path checks this code; this path must too.
                     NLMSG_DONE => {
                         if msg.payload.len() >= 4 {
-                            let code =
-                                i32::from_ne_bytes(msg.payload[..4].try_into().unwrap_or_default());
+                            let code = i32::from_ne_bytes(msg.payload[..4].try_into().unwrap());
                             if code < 0 {
                                 return Err(io::Error::from_raw_os_error(-code));
                             }
@@ -1472,6 +1483,7 @@ mod tests {
                 fd: ours,
                 seq: 1,
                 buf: Vec::new(),
+                spoof_warned: std::cell::Cell::new(false),
             },
             theirs,
         )

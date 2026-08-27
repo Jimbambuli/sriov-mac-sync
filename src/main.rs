@@ -505,7 +505,13 @@ fn pair_names(pairs: &[Pair]) -> Vec<String> {
 
 /// Can this driver take entries at all? Only half an answer: it proves the
 /// kernel accepted the address, not that the hardware acts on it.
-fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> bool {
+fn check(
+    sock: &mut Socket,
+    topo: &Topology,
+    pairs: &[Pair],
+    syncer: &Syncer,
+    dry_run: bool,
+) -> bool {
     let mut ok = true;
     for pair in pairs {
         let Some(link) = topo.get(&pair.dev) else {
@@ -535,12 +541,18 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> b
             continue;
         }
 
+        // Noted before it is written: a check killed between the write and
+        // the take-back then leaves an OWNED entry, which the daemon's next
+        // pass removes and heals - unnoted it was foreign, and foreign
+        // entries are deliberately never touched.
+        syncer.note_check_probe(&pair.dev, &probe);
         match sock.set_self_fdb(link.index, &probe, true) {
             Ok(()) => {}
             // Left over from an earlier check that could not clean up. The
             // driver plainly accepts entries - that is the question here.
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
             Err(e) => {
+                syncer.forget_check_probe(&pair.dev, &probe);
                 println!(
                     "{} ({driver}): FAILED - the driver refuses unicast filter entries: {e}",
                     pair.dev
@@ -562,7 +574,9 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> b
                     pair.dev
                 );
                 ok = false;
-                let _ = sock.set_self_fdb(link.index, &probe, false);
+                if sock.set_self_fdb(link.index, &probe, false).is_ok() {
+                    syncer.forget_check_probe(&pair.dev, &probe);
+                }
                 continue;
             }
         };
@@ -579,12 +593,14 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], dry_run: bool) -> b
             );
             ok = false;
         }
-        if let Err(e) = sock.set_self_fdb(link.index, &probe, false) {
-            eprintln!(
-                "warning: {}: the probe entry {} could not be taken back out: {e}",
+        match sock.set_self_fdb(link.index, &probe, false) {
+            Ok(()) => syncer.forget_check_probe(&pair.dev, &probe),
+            Err(e) => eprintln!(
+                "warning: {}: the probe entry {} could not be taken back out: {e} - \
+                 it stays noted, and the daemon's next pass takes it back",
                 pair.dev,
                 format_mac(&probe)
-            );
+            ),
         }
     }
     ok
@@ -1058,7 +1074,10 @@ fn run() -> Result<bool, String> {
                         rules out - run it without --dry-run"
                 .into());
         }
-        return Ok(check(&mut sock, &topo, &pairs, false));
+        // The probe bookkeeping wants the same notes the daemon keeps -
+        // that is what makes a killed check healable at all.
+        let syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
+        return Ok(check(&mut sock, &topo, &pairs, &syncer, false));
     }
 
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
