@@ -187,6 +187,15 @@ check "exit 0" "[ $? -eq 0 ]"
 check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 check "shows registered>=1" "grep -qE 'registered by us *: *[1-9]' /tmp/sms-it-s7.log"
 
+say "S7b: --check probes the uplink and leaves no trace"
+NOTE_BEFORE=$(cat $STATE/veth-up.owned)
+SELF_BEFORE=$($NS bridge fdb show dev veth-up self | sort)
+$NS "$BIN" --check --pair veth-up:br0 >/tmp/sms-it-s7b.log 2>&1
+check "exit 0" "[ $? -eq 0 ]"
+check "says ok" "grep -q 'ok - accepts unicast filter entries' /tmp/sms-it-s7b.log"
+check "probe entry gone again" "[ \"$SELF_BEFORE\" = \"$($NS bridge fdb show dev veth-up self | sort)\" ]"
+check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
+
 say "S8: --flush takes everything back out"
 $NS "$BIN" --flush >/tmp/sms-it-s8.log 2>&1
 RC=$?
