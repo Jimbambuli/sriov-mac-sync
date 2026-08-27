@@ -985,6 +985,17 @@ impl Syncer {
         } else {
             Urgency::Nothing
         };
+        // Everything below - reflection, decide, commit - acts only on
+        // RTM_NEWNEIGH. A deletions-only batch has bought its pass above and
+        // has no use for skip sets, and in a vf_stale window it would pay a
+        // driver question (0.6-0.9 ms on mlx5) for answers nothing reads;
+        // ageing bursts right after an interface change are exactly that.
+        if !events
+            .iter()
+            .any(|(kind, _)| *kind == crate::netlink::RTM_NEWNEIGH)
+        {
+            return Ok(urgency);
+        }
         // Where each uplink sits in its bridge, and which addresses may never
         // be registered for it, are properties of the topology - the same for
         // every entry in the batch. Worked out once instead of once per entry
@@ -1163,6 +1174,16 @@ impl Syncer {
                 }
                 self.fast_add(sock, topo, entry, &pairs, &mut would, false);
             }
+            // An address already registered and ours was vetted by the
+            // fresh answer that let it in; re-learning it grows nothing.
+            // Without this, the tail of a burst - the prompt pass has long
+            // registered everything, the queued learns arrive one by one -
+            // bought one driver question per re-learn, invisible to every
+            // latency figure because the addresses were already in.
+            for (dev, macs) in would.iter_mut() {
+                self.with_owned(dev, |o| macs.retain(|m| !o.contains(m)));
+            }
+            would.retain(|_, macs| !macs.is_empty());
             if !would.is_empty() {
                 // If the question fails, whoever comes next must not believe
                 // the carried answer either: main answers the error with a
@@ -1170,7 +1191,29 @@ impl Syncer {
                 // very answer this refresh distrusted. remember_vf clears
                 // the mark again on success.
                 self.vf_stale = true;
-                let fresh = sock.vf_macs_of(&pfs)?;
+                // Only the functions of the pairs that would grow are asked:
+                // the question is per-function firmware work (~0.35 ms each
+                // on mlx5), and a pair that grows nothing reads no fresh
+                // answer. The unasked functions keep their carried entries,
+                // merged back under the full function list, so the carry
+                // contract the next pass compares against still holds.
+                let mut ask: Vec<u32> = Vec::new();
+                for dev in would.keys() {
+                    let Some(idx) = topo.index_of(dev) else {
+                        continue;
+                    };
+                    for pf in physical_functions(topo, idx) {
+                        if topo.at(pf).is_some() && !ask.contains(&pf) {
+                            ask.push(pf);
+                        }
+                    }
+                }
+                let mut fresh: Vec<(u32, Mac)> = vf_macs
+                    .iter()
+                    .filter(|(pf, _)| !ask.contains(pf))
+                    .cloned()
+                    .collect();
+                fresh.extend(sock.vf_macs_of(&ask)?);
                 self.remember_vf(pfs.clone(), fresh.clone());
                 for fp in &mut pairs {
                     fp.skip = self.exclusions(topo, fp.index, fp.port, &fresh);

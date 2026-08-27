@@ -70,6 +70,10 @@ pub struct Topology {
     /// Indices by name, for the few places that start from one: a --pair on
     /// the command line, a bridge named in the configuration.
     by_name: Map<String, u32>,
+    /// The bridges in name order, worked out once when the topology is
+    /// built: `bridges()` is asked once per pair per pass, and collecting
+    /// and sorting the same answer that often bought nothing.
+    bridge_order: Vec<u32>,
 }
 
 /// What an interface's relations look like in /sys before they are resolved:
@@ -409,9 +413,16 @@ impl Topology {
                 }
             }
         }
+        let mut bridge_order: Vec<(String, u32)> = map
+            .values()
+            .filter(|l| l.is_bridge)
+            .map(|l| (l.name.clone(), l.index))
+            .collect();
+        bridge_order.sort();
         Topology {
             links: map,
             by_name,
+            bridge_order: bridge_order.into_iter().map(|(_, i)| i).collect(),
         }
     }
 
@@ -456,9 +467,10 @@ impl Topology {
     }
 
     pub fn bridges(&self) -> Vec<&Link> {
-        let mut v: Vec<&Link> = self.links.values().filter(|l| l.is_bridge).collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
+        self.bridge_order
+            .iter()
+            .filter_map(|i| self.links.get(i))
+            .collect()
     }
 
     /// Does `dev` sit on top of `target`, directly or through any number of

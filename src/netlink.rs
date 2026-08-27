@@ -358,6 +358,17 @@ impl Socket {
     /// an empty forwarding table, which ends with every entry removed. The
     /// sender's port id says who it was: zero is the kernel.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_flags(buf, 0)
+    }
+
+    /// `recv` that never blocks: an empty queue answers WouldBlock. The
+    /// event drain lives on this - it takes what is queued and must not
+    /// wait for more.
+    fn recv_nowait(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_flags(buf, libc::MSG_DONTWAIT)
+    }
+
+    fn recv_flags(&self, buf: &mut [u8], extra: libc::c_int) -> io::Result<usize> {
         // Dropping a datagram that is not the kernel's is the anti-spoofing
         // rule; dropping them for ever is a way to be wedged. Unicast to a
         // netlink pid needs no privilege, so any local process can keep this
@@ -375,9 +386,9 @@ impl Socket {
             // a time. Drain what is there without waiting; EAGAIN reaches
             // the event reader as an empty batch and the next poll wakes it.
             let flags = if dropped > 0 {
-                libc::MSG_TRUNC | libc::MSG_DONTWAIT
+                libc::MSG_TRUNC | libc::MSG_DONTWAIT | extra
             } else {
-                libc::MSG_TRUNC
+                libc::MSG_TRUNC | extra
             };
             let n = unsafe {
                 libc::recvfrom(
@@ -910,25 +921,42 @@ impl Socket {
         out
     }
 
+    /// One wake takes the whole queue. The kernel hands notifications over
+    /// one datagram at a time - measured, never coalesced - so "a batch"
+    /// used to mean "one message", and a burst of N learns became N
+    /// batches, each paying its own driver question and, for link messages,
+    /// its own topology re-read. What is already queued is the same moment;
+    /// taking it all is strictly fresher and waits for nothing. Capped so a
+    /// firehose cannot starve the loop's own clock checks - the leftover
+    /// wakes the next poll.
+    const DRAIN_CAP: usize = 256;
+
     fn events_from(&self, buf: &mut [u8]) -> io::Result<Events> {
-        // A notification that did not fit is a loss like ENOBUFS: what was in
-        // it is unknowable, so the caller has to stop trusting what it holds
-        // and read the real state - saying so is the difference between that
-        // and quietly working from half a batch.
-        let n = match self.recv(buf) {
-            Ok(n) => n,
-            // The caller polls before asking, so this means the batch was
-            // taken by something else or never was - not that anything was
-            // lost. Saying "lost" here would send the daemon into a recovery
-            // pass over nothing.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Events::default()),
-            Err(e) => return Err(e),
-        };
-        if n > buf.len() {
-            return Err(io::Error::other("a notification batch outgrew the buffer"));
-        }
         let mut out = Events::default();
-        for msg in messages(&buf[..n]) {
+        for _ in 0..Self::DRAIN_CAP {
+            // A notification that did not fit is a loss like ENOBUFS: what
+            // was in it is unknowable, so the caller has to stop trusting
+            // what it holds and read the real state - saying so is the
+            // difference between that and quietly working from half a batch.
+            let n = match self.recv_nowait(buf) {
+                Ok(n) => n,
+                // The queue is empty - on the first round because the batch
+                // was taken by something else or never was (the caller
+                // polls before asking), later because the drain is done.
+                // Neither is a loss.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            };
+            if n > buf.len() {
+                return Err(io::Error::other("a notification batch outgrew the buffer"));
+            }
+            Self::collect_events(&mut out, &buf[..n]);
+        }
+        Ok(out)
+    }
+
+    fn collect_events(out: &mut Events, datagram: &[u8]) {
+        for msg in messages(datagram) {
             if msg.kind == RTM_NEWLINK || msg.kind == RTM_DELLINK {
                 out.links_changed = true;
                 if msg.payload.len() >= IFINFOMSG_LEN {
@@ -957,7 +985,6 @@ impl Socket {
                 out.fdb.push((msg.kind, e));
             }
         }
-        Ok(out)
     }
 
     /// Wait for a notification, giving up after `millis`. False on timeout.

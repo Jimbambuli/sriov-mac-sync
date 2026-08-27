@@ -810,7 +810,11 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                 }
             }
             let loaded = held.as_ref().map(|t| (t, topo_load));
-            if let (true, Some((topo, _))) = (auto, loaded) {
+            // Autodetection is a pure function of the picture: on a pass
+            // that carried the picture unchanged, its answer cannot have
+            // changed either. A new NIC or bridge arrives as a link
+            // message, which is exactly what sets `reloaded`.
+            if let (true, true, Some((topo, _))) = (auto, reloaded, loaded) {
                 let found: Vec<Pair> = topo
                     .autodetect()
                     .0
@@ -1010,8 +1014,11 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
         // Unless the filter is filling up: entries that should be
         // gone are then taking room from entries that should be
         // there, and the list is finite in a way nothing can query.
-        let filling = syncer.registered() * 10 >= opts.max_macs * 9;
-        let wait = if urgency == sync::Urgency::Now || filling {
+        // Asked lazily: at Urgency::Now the wait is already decided, and
+        // registered() lists the state directory and reads every note - work
+        // the hottest path has no reason to pay.
+        let wait = if urgency == sync::Urgency::Now || syncer.registered() * 10 >= opts.max_macs * 9
+        {
             Duration::from_millis(200)
         } else {
             AGEING_SETTLE

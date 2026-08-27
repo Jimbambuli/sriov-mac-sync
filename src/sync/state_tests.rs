@@ -588,6 +588,82 @@ fn reflection_keeps_what_a_parallel_writer_noted() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Re-learning an address we already own buys no driver question: it was
+/// vetted by the fresh answer that let it in, and re-registering is an
+/// EEXIST no-op. Without this, the tail of a burst asked once per queued
+/// re-learn.
+#[test]
+fn relearning_an_owned_address_buys_no_question() {
+    let dir = scratch("owned-relearn");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.append_owned("nic1", &[BEHIND_NIC]);
+    s.remember_vf(vec![2], Vec::new());
+    let mut sock = FakeSock::default();
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert_eq!(sock.vf_asked, 0, "nothing grew, nothing was asked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The grow-refresh asks only the functions of the pairs that would grow;
+/// the unasked functions keep their carried entries, merged back under the
+/// full function list so the next pass still matches the carry.
+#[test]
+fn the_grow_refresh_asks_only_the_growing_pairs_functions() {
+    const OTHER: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 9];
+    let dir = scratch("grow-scope");
+    let topo = host(mac(1));
+    let mut s = Syncer::new(
+        vec![
+            pair(),
+            Pair {
+                dev: "nic0".into(),
+                bridge: "vmbr0".into(),
+            },
+        ],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    // Carried for both functions; the world also knows an address on nic1.
+    s.remember_vf(vec![2, 21], vec![(21, OTHER)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    // Growth behind vmbr1 only.
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert_eq!(
+        sock.asked.last().unwrap(),
+        &vec![2u32],
+        "only the growing pair's function is asked"
+    );
+    let (for_pfs, kept) = s.carried_vf.clone().expect("an answer is carried");
+    assert_eq!(
+        for_pfs,
+        vec![2, 21],
+        "the carry still covers every function"
+    );
+    assert!(
+        kept.contains(&(21, OTHER)),
+        "the unasked function's carried entries survive the merge"
+    );
+    assert!(
+        kept.contains(&(2, VF_ADMIN)),
+        "the asked function's entries are the fresh ones"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn eexist_is_not_claimed_as_ours() {
     let dir = scratch("eexist");

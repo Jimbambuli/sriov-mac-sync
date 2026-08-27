@@ -43,6 +43,9 @@ pub(crate) struct FakeSock {
     /// raw OS error the next vf_macs_of answers with, taken once - the
     /// transient failure the refresh path has to stay distrustful through.
     pub(crate) fail_vf: Option<i32>,
+    /// Which indices each vf_macs_of call named - the grow-refresh must
+    /// ask only the growing pairs' functions.
+    pub(crate) asked: Vec<Vec<u32>>,
     /// Like `meanwhile`, but firing on the first successful removal: the
     /// reflection path stands in an rtnl window too, and a parallel writer
     /// in that window is what its merged write-back exists for.
@@ -56,12 +59,19 @@ impl FdbWriter for FakeSock {
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
         Ok(self.links.clone())
     }
-    fn vf_macs_of(&mut self, _indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
+    fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
         self.vf_asked += 1;
+        self.asked.push(indices.to_vec());
         if let Some(code) = self.fail_vf.take() {
             return Err(io::Error::from_raw_os_error(code));
         }
-        Ok(self.vf.clone())
+        // Like the kernel: an interface answers only when it was asked.
+        Ok(self
+            .vf
+            .iter()
+            .filter(|(pf, _)| indices.contains(pf))
+            .cloned()
+            .collect())
     }
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
         let table = if add { &self.fail_add } else { &self.fail_del };

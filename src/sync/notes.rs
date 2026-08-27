@@ -552,7 +552,7 @@ impl Syncer {
     pub fn registered(&self) -> usize {
         self.noted_devices_or_none()
             .iter()
-            .map(|dev| self.load_owned(dev).len())
+            .map(|dev| self.with_owned(dev, |o| o.len()))
             .sum()
     }
 
