@@ -62,6 +62,7 @@ const IFLA_LINK: u16 = 5;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_PARENT_DEV_NAME: u16 = 56;
+const IFLA_LINK_NETNSID: u16 = 37;
 const IFLA_EXT_MASK: u16 = 29;
 const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_VF_INFO: u16 = 1;
@@ -368,12 +369,22 @@ impl Socket {
         loop {
             let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            // After a spoofed datagram was skipped, the queue may well be
+            // empty - and blocking then would hand any local process a
+            // five-second brake on the daemon loop, one unicast datagram at
+            // a time. Drain what is there without waiting; EAGAIN reaches
+            // the event reader as an empty batch and the next poll wakes it.
+            let flags = if dropped > 0 {
+                libc::MSG_TRUNC | libc::MSG_DONTWAIT
+            } else {
+                libc::MSG_TRUNC
+            };
             let n = unsafe {
                 libc::recvfrom(
                     self.fd.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
-                    libc::MSG_TRUNC,
+                    flags,
                     &mut from as *mut _ as *mut libc::sockaddr,
                     &mut from_len,
                 )
@@ -593,8 +604,21 @@ impl Socket {
                     // leaves the caller waiting out the whole five-second
                     // deadline for an answer that has already been given.
                     // "Nothing to report" is the answer: sink is not called
-                    // and the caller sees an empty result.
-                    NLMSG_DONE => return Ok(OneEnd::Answered),
+                    // and the caller sees an empty result. Unless the DONE
+                    // carries a negative code - then the kernel is saying
+                    // the question FAILED, and reading that as "empty" is
+                    // how a VF list quietly loses its exclusions. The dump
+                    // path checks this code; this path must too.
+                    NLMSG_DONE => {
+                        if msg.payload.len() >= 4 {
+                            let code =
+                                i32::from_ne_bytes(msg.payload[..4].try_into().unwrap_or_default());
+                            if code < 0 {
+                                return Err(io::Error::from_raw_os_error(-code));
+                            }
+                        }
+                        return Ok(OneEnd::Answered);
+                    }
                     NLMSG_NOOP => continue,
                     k if k == want => {
                         sink(msg.payload);
@@ -722,12 +746,15 @@ impl Socket {
                     libc::MSG_DONTWAIT | libc::MSG_TRUNC,
                 )
             };
-            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
+            if n < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return; // EAGAIN: the queue is empty
             }
-            if n <= 0 {
-                return;
-            }
+            // A zero-length datagram is still a datagram; only an error
+            // ends the queue. Treating it as the end left the rest of an
+            // abandoned dump queued, and the next request answered EBUSY.
         }
     }
 
@@ -856,6 +883,16 @@ impl Socket {
                     continue;
                 }
                 if msg.kind == NLMSG_ERROR {
+                    // Too short to carry a code is not an acknowledgement -
+                    // the dump path refuses that shape, and booking a
+                    // registration that never happened as done would leave
+                    // the guest's traffic falling off the uplink until the
+                    // next pass notices the gap.
+                    if msg.payload.len() < 4 {
+                        return Err(io::Error::other(
+                            "a malformed acknowledgement, too short to carry a code",
+                        ));
+                    }
                     return match nlmsg_error(msg.payload) {
                         Some(e) => Err(e),
                         None => Ok(()), // the acknowledgement: an error of code zero
@@ -1022,6 +1059,7 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
         index: index as u32,
         ..Default::default()
     };
+    let mut foreign_parent = false;
     for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
         match kind {
             IFLA_IFNAME => {
@@ -1040,6 +1078,12 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                     out.link = Some(i);
                 }
             }
+            // The parent lives in another namespace, and IFLA_LINK is then
+            // an index THERE: believing it here would draw a lower edge to
+            // whatever local interface happens to wear that number.
+            IFLA_LINK_NETNSID => {
+                foreign_parent = true;
+            }
             IFLA_PARENT_DEV_NAME => {
                 let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
                 out.parent_dev = Some(String::from_utf8_lossy(&value[..end]).into_owned());
@@ -1054,6 +1098,9 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
             }
             _ => {}
         }
+    }
+    if foreign_parent {
+        out.link = None;
     }
     if out.name.is_empty() {
         return None;
@@ -1181,6 +1228,12 @@ fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
     })
 }
 
+/// Known limit: rtattr lengths are u16 on the wire. A VFINFO list beyond
+/// 64 KiB - roughly three hundred virtual functions on one PF with
+/// SKIP_STATS - arrives with its length silently wrapped by the kernel, and
+/// no parser on this side can tell a wrapped length from a true one. Hosts
+/// of that size need the kernel's own fix (split dumps); none of the driver
+/// families this has run on hands out that many per PF.
 fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
     if payload.len() < IFINFOMSG_LEN {
         return;
@@ -1524,6 +1577,18 @@ mod tests {
         let l = parse_link(&body).expect("a well-formed link message parses");
         assert_eq!(l.index, 7);
         assert_eq!(l.name, "nic1", "the kernel's trailing NUL stays out");
+
+        // A parent in another namespace: IFLA_LINK is an index THERE and
+        // must not become a local lower edge.
+        let mut foreign = ifinfomsg(7);
+        put_attr(&mut foreign, IFLA_IFNAME, b"veth0\0");
+        put_attr(&mut foreign, IFLA_LINK, &4u32.to_ne_bytes());
+        put_attr(&mut foreign, IFLA_LINK_NETNSID, &0u32.to_ne_bytes());
+        assert_eq!(
+            parse_link(&foreign).expect("parses").link,
+            None,
+            "a foreign parent's index is not ours to follow"
+        );
         assert_eq!(l.mac, Some([2, 0, 0, 0, 0, 9]));
         assert_eq!(l.master, Some(10));
         assert_eq!(l.link, Some(4));
