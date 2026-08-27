@@ -46,7 +46,8 @@ pub struct Link {
     pub driver: Option<String>,
     /// the PF, when this interface is a virtual function. On a card where one
     /// PCI function backs several ports, `physfn/net` lists a netdev per port
-    /// and this is whichever came first; `pf_netdevs` holds them all.
+    /// and this is the lowest-numbered of them - readdir order is not
+    /// promised, and this is a key elsewhere; `pf_netdevs` holds them all.
     pub physfn: Option<u32>,
     /// every PF netdev of this virtual function's PCI function - more than one
     /// when a multiport card shares a single function across its ports, where
@@ -221,8 +222,9 @@ impl Topology {
             let idx = |n: &String| by_name.get(n).copied();
             link.master = names.master.as_ref().and_then(idx);
             link.lowers = names.lowers.iter().filter_map(idx).collect();
-            link.physfn = names.physfn.as_ref().and_then(idx);
             link.pf_netdevs = names.pf_netdevs.iter().filter_map(idx).collect();
+            link.pf_netdevs.sort_unstable();
+            link.physfn = link.pf_netdevs.first().copied();
             link.vf_netdevs = names.vf_netdevs.iter().filter_map(idx).collect();
             links.push(link);
         }
@@ -335,6 +337,10 @@ impl Topology {
                             link.pf_netdevs.push(*i);
                         }
                     }
+                    // Sorted, so "the function's first netdev" means the same
+                    // thing on every reading: readdir order is not promised,
+                    // and physfn is a key elsewhere.
+                    link.pf_netdevs.sort_unstable();
                     link.physfn = link.pf_netdevs.first().copied();
                 }
                 if link.numvfs > 0 {
@@ -571,9 +577,28 @@ impl Topology {
                     // is about the eSwitch, not about who is a PF.
                     if let Some(pf) = link.physfn {
                         let pf_name = self.name_of(pf).unwrap_or_default();
-                        if self.bridge_above(pf).map(|(b, _)| b) == Some(br) {
-                            skipped
-                                .push(format!("skip {name}: {pf_name} already carries {br_name}"));
+                        // Every netdev of this function, not just the first:
+                        // a card whose ports share one PCI function shows one
+                        // netdev per port, and which of them `physfn` names is
+                        // arbitrary. Asking only that one answers about the
+                        // right port by luck - one time in two on a dual-port
+                        // card, one in four on a quad - and the rest of the
+                        // time a VF is taken for a bridge its own port already
+                        // holds, which is what this rule exists to prevent.
+                        // A sister port carrying the bridge is a different
+                        // eSwitch and no conflict in theory; declining there
+                        // too costs an autodetection that `--pair` can still
+                        // make, and is the answer that cannot be wrong.
+                        if let Some(holder) = link
+                            .pf_netdevs
+                            .iter()
+                            .copied()
+                            .find(|&p| self.bridge_above(p).map(|(b, _)| b) == Some(br))
+                        {
+                            let holder_name = self.name_of(holder).unwrap_or_default();
+                            skipped.push(format!(
+                                "skip {name}: {holder_name} already carries {br_name}"
+                            ));
                             continue;
                         }
                         if let Some((_, _, taken)) =
@@ -915,6 +940,45 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("nic1v0") && s.contains("already carries")),
             "two vports must not claim the same addresses"
+        );
+    }
+
+    /// The same rule on a card whose four ports share one PCI function, where
+    /// `physfn` names an arbitrary one of them. The port holding the bridge
+    /// is deliberately the last, so a check that asks only the first is
+    /// answered "no conflict" and takes the VF - the failure this guards.
+    #[test]
+    fn autodetect_asks_every_port_of_a_shared_function() {
+        let t = Builder::new()
+            .add("pf0", 2, Some(mac(1)))
+            .vfs(4)
+            .add("pf1", 3, Some(mac(2)))
+            .vfs(4)
+            .add("pf2", 4, Some(mac(3)))
+            .vfs(4)
+            .add("pf3", 5, Some(mac(4)))
+            .vfs(4)
+            .master("br0")
+            .add("pf3v0", 6, Some(mac(5)))
+            .pf_netdevs(&["pf0", "pf1", "pf2", "pf3"])
+            .master("br0")
+            .add("br0", 10, Some(mac(4)))
+            .bridge()
+            .lower("pf3")
+            .lower("pf3v0")
+            .build();
+        let (pairs, skipped) = t.autodetect();
+        assert_eq!(
+            pairs,
+            vec![("pf3".to_string(), "br0".to_string())],
+            "the physical function keeps the bridge"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("pf3v0") && s.contains("already carries")),
+            "the VF must be declined: a netdev of its own function - the \
+             fourth, not the first - already carries that bridge"
         );
     }
 

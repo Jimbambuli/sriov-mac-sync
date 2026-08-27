@@ -328,6 +328,51 @@ fn a_sibling_vf_on_the_shared_functions_other_port_is_excluded() {
     );
 }
 
+/// Two ports was the example, not the rule: the same shared function may
+/// carry four. The sibling's address is reported under the LAST port here,
+/// so anything that asks fewer than all of them lets it through.
+#[test]
+fn a_sibling_vf_is_excluded_across_all_four_ports_of_a_function() {
+    const SIBLING: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x77];
+    let topo = Builder::new()
+        .add("pf0", 100, Some(mac(0x50)))
+        .vfs(4)
+        .add("pf1", 101, Some(mac(0x51)))
+        .vfs(4)
+        .add("pf2", 102, Some(mac(0x52)))
+        .vfs(4)
+        .add("pf3", 103, Some(mac(0x53)))
+        .vfs(4)
+        .add("pf0v0", 110, Some(mac(0x60)))
+        .master("br0")
+        .pf_netdevs(&["pf0", "pf1", "pf2", "pf3"])
+        .add("br0", 120, Some(mac(0xaa)))
+        .bridge()
+        .lower("pf0v0")
+        .lower("tap0")
+        .add("tap0", 121, Some(mac(0xa0)))
+        .master("br0")
+        .build();
+    let p = Pair {
+        dev: "pf0v0".into(),
+        bridge: "br0".into(),
+    };
+    let entries = vec![learned(121, 120, SIBLING), learned(121, 120, BEHIND_GUEST)];
+    let (want, _, _) = desired_named(
+        &syncer(),
+        &topo,
+        &p,
+        "pf0v0",
+        &entries,
+        &[(103, SIBLING)], // keyed to pf3, the fourth port
+    );
+    assert!(
+        !want.contains(&SIBLING),
+        "a sibling on the fourth port of the function must be excluded too"
+    );
+    assert!(want.contains(&BEHIND_GUEST));
+}
+
 /// With a bond in between, the wire side is the whole bond: entries learnt
 /// on it belong out there, and every member's address is the host's own.
 #[test]
