@@ -310,6 +310,26 @@ impl Socket {
         // can hold. A struct that ever held something that cannot be zero -
         // a reference, a `NonNull` - would need a different treatment, and
         // libc cannot add one to this without breaking every caller.
+        // The subscription hears the whole neighbour table, and most of
+        // what arrives is ARP and ND churn that concerns nobody here. The
+        // userspace check in events_from already drops it - but each of
+        // those datagrams still queued, still woke this process, and an ARP
+        // storm could still fill the receive buffer and buy a full recovery
+        // pass for losses that were all irrelevant. This classic BPF filter
+        // drops the noise in the kernel instead, before it costs anything.
+        // Built to fail open: dropped is only a datagram that provably
+        // holds a single RTM_NEWNEIGH/RTM_DELNEIGH whose family is not
+        // AF_BRIDGE - anything multi-message, overlong or otherwise odd is
+        // accepted and left to the userspace check. Attached before bind,
+        // so no unfiltered datagram slips in first; a kernel that refuses
+        // it gets a warning and the unfiltered behaviour, like the receive
+        // buffer above.
+        if groups != 0 {
+            if let Err(e) = attach_noise_filter(fd.as_raw_fd()) {
+                eprintln!("warning: cannot filter neighbour noise in the kernel: {e}");
+            }
+        }
+
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as u16;
         addr.nl_groups = groups;
@@ -1321,6 +1341,90 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     }
 }
 
+/// The kernel-side noise filter for the subscription socket.
+///
+/// Classic BPF, 25 instructions, no dependency and no toolchain. It reads
+/// the netlink header byte-wise because cBPF's 16/32-bit loads are
+/// big-endian and the header is host-order - the classic trap. The logic,
+/// in order: a message longer than 64 KiB is accepted unseen (its length
+/// cannot be judged in 16 bits); a datagram with room for a second header
+/// behind align4(nlmsg_len) is accepted unseen (multi-message); a type
+/// other than RTM_NEWNEIGH/RTM_DELNEIGH is accepted; and only then, with
+/// the datagram proven to be a single neighbour message, is ndm_family
+/// compared against AF_BRIDGE - the one case that is dropped. Verified
+/// end to end in a network namespace: all bridge events delivered, all
+/// ARP and ND noise gone.
+fn attach_noise_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
+    const fn stmt(code: u16, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+    // Spelt out because libc exports the structs but not the opcodes.
+    const LD_B_ABS: u16 = 0x30; // BPF_LD  | BPF_B | BPF_ABS
+    const LD_W_LEN: u16 = 0x80; // BPF_LD  | BPF_W | BPF_LEN
+    const JEQ_K: u16 = 0x15; //    BPF_JMP | BPF_JEQ | BPF_K
+    const JGE_K: u16 = 0x35; //    BPF_JMP | BPF_JGE | BPF_K
+    const LSH_K: u16 = 0x64; //    BPF_ALU | BPF_LSH | BPF_K
+    const OR_X: u16 = 0x4c; //     BPF_ALU | BPF_OR  | BPF_X
+    const ADD_K: u16 = 0x04; //    BPF_ALU | BPF_ADD | BPF_K
+    const AND_K: u16 = 0x54; //    BPF_ALU | BPF_AND | BPF_K
+    const SUB_X: u16 = 0x1c; //    BPF_ALU | BPF_SUB | BPF_X
+    const TAX: u16 = 0x07; //      BPF_MISC | BPF_TAX
+    const RET_K: u16 = 0x06; //    BPF_RET | BPF_K
+    const ACCEPT: u32 = u32::MAX;
+    let prog = [
+        stmt(LD_B_ABS, 2),     //          nlmsg_len, third byte
+        jump(JEQ_K, 0, 0, 18), //      != 0: >= 64 KiB, accept
+        stmt(LD_B_ABS, 3),     //          nlmsg_len, fourth byte
+        jump(JEQ_K, 0, 0, 16), //      != 0: accept
+        stmt(LD_B_ABS, 1),     //          nlmsg_len, reconstructed from bytes
+        stmt(LSH_K, 8),        //             (little-endian on the wire, and cBPF
+        stmt(TAX, 0),          //               loads big-endian - hence byte-wise)
+        stmt(LD_B_ABS, 0),
+        stmt(OR_X, 0), //              A = nlmsg_len
+        stmt(ADD_K, 3),
+        stmt(AND_K, !3u32), //         A = align4(nlmsg_len)
+        stmt(TAX, 0),
+        stmt(LD_W_LEN, 0),     //          A = datagram length
+        stmt(SUB_X, 0),        //             A = room behind the first message
+        jump(JGE_K, 16, 5, 0), //      a second header fits: accept
+        stmt(LD_B_ABS, 5),     //          nlmsg_type, high byte
+        jump(JEQ_K, 0, 0, 3),  //       >= 256: accept
+        stmt(LD_B_ABS, 4),     //          nlmsg_type, low byte
+        jump(JEQ_K, RTM_NEWNEIGH as u32, 2, 0),
+        jump(JEQ_K, RTM_DELNEIGH as u32, 1, 0),
+        stmt(RET_K, ACCEPT), //        everything not proven single-neigh
+        stmt(LD_B_ABS, 16),  //         ndm_family
+        jump(JEQ_K, libc::AF_BRIDGE as u32, 0, 1),
+        stmt(RET_K, ACCEPT), //        the bridge talking: deliver
+        stmt(RET_K, 0),      //             ARP/ND churn: drop in the kernel
+    ];
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &fprog as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,6 +1731,16 @@ mod tests {
         assert!(parse_link(&ifinfomsg(-3)).is_none());
         assert!(parse_link(&ifinfomsg(7)).is_none(), "nameless");
         assert!(parse_link(&[0u8; 8]).is_none(), "shorter than an ifinfomsg");
+    }
+
+    /// The kernel validates a classic BPF program at attach time, on any
+    /// socket - so a malformed opcode or an out-of-range jump fails right
+    /// here instead of on the first packet of a production host.
+    #[test]
+    fn the_noise_filter_is_a_program_the_kernel_accepts() {
+        use std::os::fd::AsRawFd;
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket to attach to");
+        attach_noise_filter(s.as_raw_fd()).expect("the kernel accepts the filter");
     }
 
     /// collect_vf_macs walks three nesting levels, and nothing asserted any
