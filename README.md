@@ -135,9 +135,10 @@ hardware are welcome; those four steps are the whole test.
 
 ## Limits
 
-- **The filter list is finite and its size cannot be queried.** 128 entries on a
-  ConnectX-4 Lx; past that the driver drops addresses silently. Count what is
-  behind your bridge before relying on this.
+- **The filter list is finite, and past its end the driver drops addresses
+  silently.** Where the card reports its capacity through devlink the daemon
+  asks and warns against that; where it does not, it assumes 128, which is what
+  a ConnectX-4 Lx holds. `--max` overrides both.
 - **It knows nothing about VLANs.** One entry covers a MAC in every VLAN. So
   registering is all-or-nothing, and an address learnt on the uplink in *any*
   VLAN is left out entirely.

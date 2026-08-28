@@ -71,7 +71,10 @@ the mechanism: addresses are registered the moment the kernel reports them.
 .TP
 .BI \-\-max " NUM"
 Warn above this many addresses on one uplink (default 128). The vport list on a
-ConnectX\-4 Lx holds 128; other hardware differs and the size cannot be queried.
+ConnectX\-4 Lx holds 128; other hardware differs. Where the card reports its
+capacity through the devlink parameter
+.B max_macs
+the daemon uses that instead, and this option overrides both.
 .TP
 .BI \-\-exclude " MACS"
 Addresses never to register, separated by commas or whitespace.
@@ -185,7 +188,7 @@ sriov\-mac\-sync \-\-status
 .EE
 .RE
 .SH LIMITS
-The unicast list is finite and its size cannot be queried; beyond it the driver
+The unicast list is finite; beyond it the driver
 drops addresses silently. Hardware that can represent virtual functions as real
 bridge ports \(em switchdev with bridge offload \(em should use that instead; this
 exists for the cards that cannot.

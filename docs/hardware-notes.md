@@ -3,12 +3,23 @@
 What the cards actually do. All of it was measured on the hardware named, not
 read out of a datasheet.
 
-## The filter list is finite, and its size cannot be queried
+## The filter list is finite, and past its end addresses vanish
 
 On ConnectX-4 Lx it holds 128 entries. Beyond that the driver drops addresses
 silently, and *which* is not predictable — with 257 entries a given address
-still worked, with 513 it did not. `MAX_MACS` only decides when you get a
-warning.
+still worked, with 513 it did not.
+
+That 128 was arrived at by experiment, and this file used to say the size could
+not be queried. It can, on the drivers that register the generic devlink
+parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
+function and its VFs, which is exactly the experimental figure. The daemon asks
+over devlink when it starts and warns against what the card says; `--max` or
+`MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
+place. `-v` reports which of the three happened.
+
+devlink is not otherwise used and cannot be: it has no forwarding database, no
+unicast filter and no neighbour notifications. This one number is the whole of
+what it has to offer here.
 
 ## A VF's own address must never be registered
 

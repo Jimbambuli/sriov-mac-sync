@@ -14,6 +14,7 @@
 //! hit and delivers to the uplink, where the bridge takes over. This daemon
 //! keeps that list in step with what the bridges learn.
 
+mod devlink;
 mod hash;
 mod netlink;
 mod sync;
@@ -78,6 +79,9 @@ struct Options {
     pairs: Vec<String>,
     interval: u64,
     max_macs: usize,
+    /// Whether the threshold above came from the operator. If it did, nothing
+    /// may quietly move it - not even a card that reports its own capacity.
+    max_macs_set: bool,
     exclude: Vec<String>,
     extra: Vec<String>,
     dry_run: bool,
@@ -92,6 +96,7 @@ impl Default for Options {
             pairs: Vec::new(),
             interval: 300,
             max_macs: 128,
+            max_macs_set: false,
             exclude: Vec::new(),
             extra: Vec::new(),
             dry_run: false,
@@ -303,7 +308,10 @@ fn read_conf(opts: &mut Options, text: &str) {
                 .map_err(|_| ())
                 .and_then(|v| clamp_max_macs(v).map_err(|_| ()))
             {
-                Ok(v) => opts.max_macs = v,
+                Ok(v) => {
+                    opts.max_macs = v;
+                    opts.max_macs_set = true;
+                }
                 Err(()) => {
                     eprintln!("warning: {CONF}: MAX_MACS is not a usable count, ignored: {value}")
                 }
@@ -391,6 +399,7 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                 )?
             }
             "--max" => {
+                opts.max_macs_set = true;
                 opts.max_macs = clamp_max_macs(
                     args.next()
                         .ok_or("--max needs a number")?
@@ -1146,6 +1155,55 @@ fn handle_batch<W: World>(
     Some(((last_pass + wait).max(world.now()), trigger))
 }
 
+/// Take the smallest capacity the uplinks report as the threshold to warn at.
+///
+/// The smallest, because one number governs every uplink and the filter that
+/// fills first is the one that drops addresses. A card that says nothing
+/// leaves the default where it is; so does a number this program would refuse
+/// from a person, because a driver is not more trustworthy than an operator.
+fn adopt_reported_capacity(opts: &mut Options, pairs: &[Pair]) {
+    let mut answers = Vec::new();
+    for p in pairs {
+        match devlink::filter_capacity(&p.dev) {
+            Ok(Some(v)) => answers.push((p.dev.clone(), v)),
+            Ok(None) => {
+                if opts.verbose {
+                    note!(
+                        "{}: no filter capacity reported; keeping the assumed {}",
+                        p.dev,
+                        opts.max_macs
+                    );
+                }
+            }
+            Err(e) => {
+                if opts.verbose {
+                    note!("{}: could not ask for the filter capacity: {e}", p.dev);
+                }
+            }
+        }
+    }
+    let reported = answers.into_iter().min_by_key(|(_, v)| *v);
+    let Some((dev, value)) = reported else { return };
+    let Ok(value) = clamp_max_macs(value as usize) else {
+        return;
+    };
+    if value == opts.max_macs {
+        // Worth saying only to somebody who asked what was skipped: the
+        // number moved nowhere, but that it was *asked for* is the
+        // difference between a card that agrees and a card that is silent.
+        if opts.verbose {
+            note!("{dev} says its filter holds {value} addresses, which is what was assumed");
+        }
+        return;
+    }
+    note!(
+        "{dev} says its filter holds {value} addresses; warning above that \
+         instead of the assumed {}",
+        opts.max_macs
+    );
+    opts.max_macs = value;
+}
+
 fn run() -> Result<bool, String> {
     let mut opts = Options::default();
     load_conf(&mut opts);
@@ -1166,6 +1224,13 @@ fn run() -> Result<bool, String> {
         // Strict only where a person is at the keyboard to fix the typo.
         matches!(opts.mode, Mode::Once | Mode::Check),
     )?;
+
+    // What the cards say their filters hold. Only when the operator has not
+    // said: a number from the hardware is better than this program's constant,
+    // and worse than an instruction.
+    if !opts.max_macs_set && matches!(opts.mode, Mode::Daemon | Mode::Once | Mode::Status) {
+        adopt_reported_capacity(&mut opts, &pairs);
+    }
 
     if opts.mode == Mode::Check {
         // The check works by writing a probe entry and taking it back; there

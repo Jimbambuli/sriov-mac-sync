@@ -31,7 +31,7 @@ const NLMSG_NOOP: u16 = 1;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 
-const NLM_F_REQUEST: u16 = 0x001;
+pub(crate) const NLM_F_REQUEST: u16 = 0x001;
 const NLM_F_ACK: u16 = 0x004;
 const NLM_F_ROOT: u16 = 0x100;
 // The same bits mean different things on GET and on NEW requests: MATCH
@@ -41,7 +41,7 @@ const NLM_F_ROOT: u16 = 0x100;
 const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
-const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
+pub(crate) const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// The kernel sets this on a dump whose result changed underneath it: what
 /// came back is a mixture of two states and must not be acted on.
 const NLM_F_DUMP_INTR: u16 = 0x10;
@@ -79,10 +79,10 @@ const RTNLGRP_NEIGH: u32 = 3;
 /// read that would hang comes back by itself.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-const NLMSG_HDR: usize = 16;
+pub(crate) const NLMSG_HDR: usize = 16;
 const NDMSG_LEN: usize = 12;
 const IFINFOMSG_LEN: usize = 16;
-const RTATTR_HDR: usize = 4;
+pub(crate) const RTATTR_HDR: usize = 4;
 
 const fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -237,12 +237,24 @@ impl Socket {
         Self::open((1 << (RTNLGRP_NEIGH - 1)) | (1 << (RTNLGRP_LINK - 1)))
     }
 
+    /// A socket on the generic netlink family, which is where devlink lives.
+    /// Everything below this line - sequence numbers, the grow-and-retry, the
+    /// acknowledgement handling - is protocol-independent, and duplicating it
+    /// for one question would have been the worst of both.
+    pub(crate) fn generic() -> io::Result<Self> {
+        Self::open_on(0, libc::NETLINK_GENERIC)
+    }
+
     fn open(groups: u32) -> io::Result<Self> {
+        Self::open_on(groups, libc::NETLINK_ROUTE)
+    }
+
+    fn open_on(groups: u32, protocol: libc::c_int) -> io::Result<Self> {
         let raw = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if raw < 0 {
@@ -547,7 +559,7 @@ impl Socket {
     /// describes every interface in the system. Without the flag the index is
     /// honoured and one message comes back - no `NLMSG_DONE` to wait for, so
     /// the first matching answer ends it.
-    fn request_one(
+    pub(crate) fn request_one(
         &mut self,
         request: &[u8],
         want: u16,
@@ -688,7 +700,7 @@ impl Socket {
     /// kernel's business, not a promise to us, and the failure it left was a
     /// bad one: the same too-small buffer offered six times over, and then an
     /// error blaming interruptions that never happened.
-    fn dump<T>(
+    pub(crate) fn dump<T>(
         &mut self,
         request: &[u8],
         want: u16,
@@ -1068,7 +1080,7 @@ fn vf_request(index: u32, seq: u32) -> Vec<u8> {
     req
 }
 
-fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, seq: u32) {
+pub(crate) fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, seq: u32) {
     buf.extend_from_slice(&len.to_ne_bytes());
     buf.extend_from_slice(&kind.to_ne_bytes());
     buf.extend_from_slice(&flags.to_ne_bytes());
@@ -1076,7 +1088,7 @@ fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, seq: u32) {
     buf.extend_from_slice(&0u32.to_ne_bytes()); // pid: let the kernel fill it in
 }
 
-fn put_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
+pub(crate) fn put_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
     let len = RTATTR_HDR + value.len();
     // A netlink attribute's length field is 16 bits. Nothing here writes an
     // attribute anywhere near that - the largest is a six-byte address - but
@@ -1223,7 +1235,7 @@ fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
 
 /// Walks the attributes of a message body, without collecting them: this runs
 /// once per forwarding entry, and there can be thousands.
-struct Attrs<'a> {
+pub(crate) struct Attrs<'a> {
     buf: &'a [u8],
     off: usize,
 }
@@ -1245,7 +1257,7 @@ impl<'a> Iterator for Attrs<'a> {
     }
 }
 
-fn attrs(buf: &[u8]) -> Attrs<'_> {
+pub(crate) fn attrs(buf: &[u8]) -> Attrs<'_> {
     Attrs { buf, off: 0 }
 }
 
@@ -1753,6 +1765,76 @@ mod tests {
         use std::os::fd::AsRawFd;
         let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket to attach to");
         attach_noise_filter(s.as_raw_fd()).expect("the kernel accepts the filter");
+    }
+
+    /// A netlink attribute states its own length in sixteen bits, and
+    /// `nla_nest_end()` in the kernel writes that length without checking it
+    /// fits: a nest grown past 65535 bytes - IFLA_VFINFO_LIST on a card with
+    /// some hundreds of virtual functions - has its length silently truncated
+    /// to the low sixteen. Nothing here can repair such a message. What it
+    /// must do is refuse to be led out of the buffer by it, and come out
+    /// *short* rather than plausible, because a short answer is what
+    /// warn_about_unknowable_vfs compares against sriov_numvfs and warns
+    /// about. This daemon asks one interface at a time and never for the
+    /// host-wide list, so the ceiling is one function's own VFs - but the
+    /// decoder is not allowed to depend on that.
+    #[test]
+    fn a_nest_that_lies_about_its_length_is_read_short_not_dangerously() {
+        let vf_mac = |mac: [u8; 6]| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&0u32.to_ne_bytes());
+            v.extend_from_slice(&mac);
+            v.extend_from_slice(&[0u8; 26]);
+            v
+        };
+        let one_vf = |mac: [u8; 6]| {
+            let mut info = Vec::new();
+            put_attr(&mut info, IFLA_VF_MAC, &vf_mac(mac));
+            info
+        };
+        let mut list = Vec::new();
+        let first = one_vf([2, 0, 0, 0, 0, 1]);
+        put_attr(&mut list, IFLA_VF_INFO, &first);
+        let first_entry = list.len();
+        put_attr(&mut list, IFLA_VF_INFO, &one_vf([2, 0, 0, 0, 0, 2]));
+        put_attr(&mut list, IFLA_VF_INFO, &one_vf([2, 0, 0, 0, 0, 3]));
+
+        // Honest first, so the truncation below is the only difference.
+        let mut body = ifinfomsg(5);
+        put_attr(&mut body, IFLA_VFINFO_LIST, &list);
+        let mut all = Vec::new();
+        collect_vf_macs(&body, &mut all);
+        assert_eq!(all.len(), 3, "the undamaged list holds three");
+
+        // What a wrapped length looks like from here: every byte still
+        // present, the nest claiming to hold only the first entry.
+        let mut cut = body.clone();
+        let nest = IFINFOMSG_LEN;
+        let stated = (RTATTR_HDR + first_entry) as u16;
+        cut[nest..nest + 2].copy_from_slice(&stated.to_ne_bytes());
+        let mut short = Vec::new();
+        collect_vf_macs(&cut, &mut short);
+        assert_eq!(
+            short,
+            vec![(5, [2, 0, 0, 0, 0, 1])],
+            "a nest cut short must yield what it claims and stop, not walk on \
+             into the bytes behind it"
+        );
+        assert!(
+            short.len() < all.len(),
+            "coming out short is the signal the unknowable-VF check needs"
+        );
+
+        // The other direction: a length longer than the message. Nothing may
+        // be read past the end - not one address, not a panic.
+        let mut over = body.clone();
+        over[nest..nest + 2].copy_from_slice(&u16::MAX.to_ne_bytes());
+        let mut none = Vec::new();
+        collect_vf_macs(&over, &mut none);
+        assert!(
+            none.is_empty(),
+            "an attribute claiming more than the buffer holds must be refused"
+        );
     }
 
     /// collect_vf_macs walks three nesting levels, and nothing asserted any
