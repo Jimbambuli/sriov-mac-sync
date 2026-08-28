@@ -27,12 +27,8 @@
 //! between an attack anybody can copy from a blog post and one that needs the
 //! contents of this process's memory.
 //!
-//! The pool is asked without waiting, because a daemon that waits here waits
-//! in the middle of the boot it was ordered into - and at that point in a
-//! boot the pool is the one thing that may not be ready yet. So a refusal
-//! falls through to what the kernel handed this process at exec and to what
-//! this start differs in, rather than to a constant: weaker than the pool,
-//! and still not the same number on every host in the fleet.
+//! The pool is asked without waiting, and a refusal falls through to weaker
+//! per-start sources rather than to a constant - `fresh_seed` tells why.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -319,9 +315,9 @@ mod tests {
         );
     }
 
-    /// Whatever the seed came from, a hasher built from it has to hash - the
-    /// odd bit matters, since an even multiplier throws away a bit of the
-    /// state on every step and a zero one throws away all of it.
+    /// Whatever the seed came from, the `| 1` has to hold: an even seed is
+    /// legal for the hash, but a zero one is the sentinel `SEED` reads as
+    /// "not chosen yet" - and odd is the cheapest way to never be zero.
     #[test]
     fn the_seed_is_odd_whichever_source_gave_it() {
         assert_eq!(super::fresh_seed() & 1, 1);

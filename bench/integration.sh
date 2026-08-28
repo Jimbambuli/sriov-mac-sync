@@ -42,7 +42,19 @@ cleanup() {
   # Only the PID this script started. A pattern kill would match any
   # process whose command line mentions the path - including whatever
   # terminal or supervisor ran this script from the repository.
-  [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
+  #
+  # Waited for, and escalated: the rm -rf below racing a daemon that is
+  # still writing recreates the state directory, and every later run then
+  # refuses with "state directory exists" until a hand cleans up.
+  if [ -n "$DPID" ]; then
+    kill "$DPID" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$DPID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -9 "$DPID" 2>/dev/null
+    wait "$DPID" 2>/dev/null
+  fi
   ip netns del sms-it 2>/dev/null
   rm -rf "$STATE" "$SNAP"
 }
@@ -172,13 +184,37 @@ check "reflection line in the log" "grep -q 'reflection' /tmp/sms-it-s4.log"
 say "S6: SIGTERM stops the daemon promptly and the notes survive"
 kill -TERM $DPID
 T0=$(date +%s%N)
-wait $DPID 2>/dev/null
-DPID=""
+# Bounded: an unbounded wait on the very property under test would hang
+# the suite on a regression instead of failing it.
+DEAD=""
+for _ in $(seq 1 30); do
+  kill -0 $DPID 2>/dev/null || { DEAD=1; break; }
+  sleep 0.1
+done
 T1=$(date +%s%N)
 MS=$(((T1 - T0) / 1000000))
-check "exit within 3 s (took ${MS}ms)" "[ $MS -lt 3000 ]"
+if [ -z "$DEAD" ]; then kill -9 $DPID 2>/dev/null; fi
+wait $DPID 2>/dev/null
+DPID=""
+check "exit within 3 s (took ${MS}ms)" "[ -n \"$DEAD\" ] && [ $MS -lt 3000 ]"
 check "note survives" "[ -s $STATE/veth-up.owned ]"
 check "parting line" "grep -qi 'left registered' /tmp/sms-it-s4.log"
+
+say "S6b: a short-interval daemon repairs what happened behind its back"
+$NS "$BIN" --pair veth-up:br0 --interval 1 --timings >/tmp/sms-it-s6b.log 2>&1 &
+DPID=$!
+sleep 1
+check "the restart pass calls itself [start]" "grep -q 'pass \[start\]' /tmp/sms-it-s6b.log"
+# Removed by hand, behind the daemon's back. The deletion notification may
+# buy a prompt pass, the 1-second refresh certainly follows - either way
+# the entry has to come back without anyone asking.
+$NS bridge fdb del $M1 dev veth-up self permanent
+sleep 2.5
+check "M1 restored" "has_self $M1"
+check "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
+kill -TERM $DPID
+wait $DPID 2>/dev/null
+DPID=""
 
 say "S7: --status reads without writing"
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)

@@ -8,7 +8,7 @@
 
 use crate::hash::{Map, Set};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use crate::netlink::parse_mac;
@@ -67,8 +67,6 @@ pub struct Link {
 #[derive(Debug, Default)]
 pub struct Topology {
     pub links: Map<u32, Link>,
-    /// Indices by name, for the few places that start from one: a --pair on
-    /// the command line, a bridge named in the configuration.
     by_name: Map<String, u32>,
     /// The bridges in name order, worked out once when the topology is
     /// built: `bridges()` is asked once per pair per pass, and collecting
@@ -83,7 +81,6 @@ pub struct Topology {
 struct Names {
     master: Option<String>,
     lowers: Vec<String>,
-    physfn: Option<String>,
     pf_netdevs: Vec<String>,
     vf_netdevs: Vec<String>,
 }
@@ -182,7 +179,6 @@ impl Topology {
                             .pf_netdevs
                             .push(e.file_name().to_string_lossy().into_owned());
                     }
-                    names.physfn = names.pf_netdevs.first().cloned();
                 }
             }
 
@@ -241,7 +237,7 @@ impl Topology {
     /// the physical function behind a VF, and the netdevs of a PF's VFs.
     /// Those come from /sys, for the interfaces that have a bus device behind
     /// them and no others - two or three on a normal host.
-    pub fn from_links(links: &[crate::netlink::LinkInfo]) -> Self {
+    pub fn from_links(links: Vec<crate::netlink::LinkInfo>) -> Self {
         // Whether the kernel names bus devices for us at all. It has done
         // since 5.13; where it does not, the presence of the directory has to
         // be asked for one interface at a time.
@@ -262,16 +258,24 @@ impl Topology {
 
         let mut by_name: Map<String, u32> =
             Map::with_capacity_and_hasher(links.len(), Default::default());
-        for l in links {
+        for l in &links {
             by_name.insert(l.name.clone(), l.index);
         }
         let mut out: Vec<Link> = Vec::with_capacity(links.len());
         for l in links {
-            let base = Path::new(NET).join(&l.name);
-            let has_device = if names_parents {
+            let probed = if names_parents {
                 l.parent_dev.is_some()
             } else {
-                could_have_device(l) && base.join("device").is_dir()
+                could_have_device(&l) && Path::new(NET).join(&l.name).join("device").is_dir()
+            };
+            // Built only for interfaces with a device behind them: on the
+            // 406-interface measuring host this was ~400 allocations per
+            // reading spent on veths that never touch it, and the reading
+            // sits on the batch path. The empty PathBuf does not allocate.
+            let base = if probed {
+                Path::new(NET).join(&l.name)
+            } else {
+                PathBuf::new()
             };
             // The dump and the reads below are two moments, and a rename in
             // between - udev renames NICs at boot, which is when this daemon
@@ -281,7 +285,7 @@ impl Topology {
             // One file says whether the directory still answers for this
             // interface; on any disagreement the device-backed extras are
             // skipped for this pass, and the next pass reads afresh.
-            let has_device = has_device
+            let has_device = probed
                 && read_trim(base.join("ifindex")).and_then(|s| s.parse::<u32>().ok())
                     == Some(l.index);
 
@@ -296,7 +300,7 @@ impl Topology {
             };
 
             let mut link = Link {
-                name: l.name.clone(),
+                name: l.name,
                 index: l.index,
                 mac: l.mac,
                 master: l.master,
@@ -333,9 +337,6 @@ impl Topology {
                             link.pf_netdevs.push(*i);
                         }
                     }
-                    // Sorted, so "the function's first netdev" means the same
-                    // thing on every reading: readdir order is not promised,
-                    // and physfn is a key elsewhere.
                     link.pf_netdevs.sort_unstable();
                     link.physfn = link.pf_netdevs.first().copied();
                 }
@@ -536,11 +537,16 @@ impl Topology {
     }
 
     /// The interface of `bridge` under which `dev` sits; `dev` itself when it
-    /// is enslaved directly.
-    pub fn uplink_port(&self, dev: u32, bridge: u32) -> u32 {
+    /// is enslaved directly. `None` when the master chain does not reach that
+    /// bridge at all. It used to fall back to `dev` in that case, and the
+    /// fallback was a hole in invariant 1: a pass working with a detached
+    /// device as the port classifies nothing as wire - `e.ifindex == port`
+    /// never matches - and registers the cable's own peers into the filter.
+    /// A bond-member flap or an `ifreload -a` opens exactly that window.
+    pub fn uplink_port(&self, dev: u32, bridge: u32) -> Option<u32> {
         match self.bridge_above(dev) {
-            Some((br, port)) if br == bridge => port,
-            _ => dev,
+            Some((br, port)) if br == bridge => Some(port),
+            _ => None,
         }
     }
 
@@ -745,7 +751,6 @@ pub(crate) mod fixture {
                 .map(|(mut l, n)| {
                     l.master = n.master.as_ref().and_then(idx);
                     l.lowers = n.lowers.iter().filter_map(idx).collect();
-                    l.physfn = n.physfn.as_ref().and_then(idx);
                     // A VF described with only `physfn` has that one PF as its
                     // whole function; the multiport case names them explicitly.
                     let pf_names = if n.pf_netdevs.is_empty() {
@@ -779,7 +784,7 @@ mod tests {
 
     /// The topology answers in indices, because that is what the kernel
     /// talks in. These tests are about interfaces, so they say names and let
-    /// these three do the looking up.
+    /// these helpers do the looking up.
     fn leads(t: &Topology, dev: &str, target: &str) -> bool {
         let (Some(d), Some(g)) = (t.index_of(dev), t.index_of(target)) else {
             return false;
@@ -792,10 +797,12 @@ mod tests {
         Some((t.name_of(br)?.to_string(), t.name_of(port)?.to_string()))
     }
 
-    fn port_of(t: &Topology, dev: &str, bridge: &str) -> String {
+    fn port_of(t: &Topology, dev: &str, bridge: &str) -> Option<String> {
         let d = t.index_of(dev).expect("no such device");
         let b = t.index_of(bridge).unwrap_or(0);
-        t.name_of(t.uplink_port(d, b)).unwrap_or(dev).to_string()
+        t.uplink_port(d, b)
+            .and_then(|p| t.name_of(p))
+            .map(str::to_string)
     }
 
     fn below(t: &Topology, dev: &str) -> Vec<[u8; 6]> {
@@ -844,7 +851,7 @@ mod tests {
     fn a_port_enslaved_directly_is_its_own_uplink() {
         let t = stacked();
         assert_eq!(above(&t, "nic1"), Some(("vmbr1".into(), "nic1".into())));
-        assert_eq!(port_of(&t, "nic1", "vmbr1"), "nic1");
+        assert_eq!(port_of(&t, "nic1", "vmbr1").as_deref(), Some("nic1"));
     }
 
     #[test]
@@ -864,7 +871,11 @@ mod tests {
             .lower("bond0")
             .build();
         assert_eq!(above(&t, "nic1"), Some(("br0".into(), "bond0".into())));
-        assert_eq!(port_of(&t, "nic1", "br0"), "bond0", "the bond is the port");
+        assert_eq!(
+            port_of(&t, "nic1", "br0").as_deref(),
+            Some("bond0"),
+            "the bond is the port"
+        );
 
         // every member faces the wire, so every member's address is the host's
         let mut macs = below(&t, "bond0");
@@ -873,9 +884,12 @@ mod tests {
     }
 
     #[test]
-    fn uplink_port_falls_back_when_the_bridge_does_not_match() {
+    fn uplink_port_refuses_a_bridge_the_device_is_not_under() {
         let t = stacked();
-        assert_eq!(port_of(&t, "nic1", "IOT"), "nic1");
+        // It used to answer `dev` here, and a pass took that for the wire
+        // port - whereupon nothing was wire and the cable's peers were
+        // registered. The honest answer is that there is no port.
+        assert_eq!(port_of(&t, "nic1", "IOT"), None);
     }
 
     #[test]
@@ -1073,7 +1087,7 @@ mod tests {
     /// answer at all.
     fn compare_readings(sock: &mut crate::netlink::Socket) -> Option<Vec<String>> {
         let links = sock.dump_links().ok()?;
-        let from_kernel = super::Topology::from_links(&links);
+        let from_kernel = super::Topology::from_links(links.clone());
         let from_sysfs = super::Topology::load().expect("/sys/class/net is readable");
 
         let mut differences = Vec::new();

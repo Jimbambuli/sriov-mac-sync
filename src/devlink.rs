@@ -40,8 +40,6 @@ const DEVLINK_ATTR_PARAM_VALUE: u16 = 85;
 const DEVLINK_ATTR_PARAM_VALUE_DATA: u16 = 86;
 const DEVLINK_ATTR_PARAM_VALUE_CMODE: u16 = 87;
 
-/// The generic parameter that says it. Anything else in the dump is somebody
-/// else's business.
 const MAX_MACS: &str = "max_macs";
 
 /// A capacity as one device reported it, with the mode it applies in. A
@@ -200,22 +198,25 @@ fn cstr(value: &[u8]) -> Option<String> {
     std::str::from_utf8(&value[..end]).ok().map(str::to_string)
 }
 
-/// What the driver says this interface's unicast filter holds.
-///
-/// `Ok(None)` is the ordinary answer on most hosts: the driver registers no
-/// such parameter, or there is no devlink at all. An `Err` is the same
-/// outcome for the caller - the documented default stands - but it says why,
-/// because "the card did not answer" and "this program asked wrongly" look
-/// identical from the threshold and are not the same bug.
-pub fn filter_capacity(netdev: &str) -> Result<Option<u32>, String> {
-    let wanted = pci_addresses(netdev);
-    if wanted.is_empty() {
-        return Ok(None);
-    }
+/// Everything the dump reported about `max_macs`, read once and asked per
+/// netdev - the answer is device-independent, and re-running the dump per
+/// uplink was identical, discarded work from the second pair on.
+pub struct Capacities {
+    reported: Vec<Reported>,
+}
+
+/// One devlink reading. `Ok(None)` is a kernel without devlink - the
+/// controller answers the family question with ENOENT, which is the
+/// ordinary state of most hosts, not an error. Everything else that goes
+/// wrong says why: "the card did not answer" and "this program asked
+/// wrongly" look identical from the threshold and are not the same bug.
+pub fn read() -> Result<Option<Capacities>, String> {
     let mut sock = Socket::generic().map_err(|e| format!("no generic netlink socket: {e}"))?;
-    let Some(family) = resolve_family(&mut sock, 1).map_err(|e| format!("devlink family: {e}"))?
-    else {
-        return Ok(None); // no devlink on this kernel
+    let family = match resolve_family(&mut sock, 1) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(e) => return Err(format!("devlink family: {e}")),
     };
     let reported = sock
         .dump(
@@ -225,21 +226,35 @@ pub fn filter_capacity(netdev: &str) -> Result<Option<u32>, String> {
             collect_param,
         )
         .map_err(|e| format!("devlink parameters: {e}"))?;
+    Ok(Some(Capacities { reported }))
+}
 
-    // The device itself first, its physical function only if that said
-    // nothing: a virtual function that answers for itself is answering about
-    // the vport this daemon actually writes to.
-    for pci in &wanted {
-        let best = reported
-            .iter()
-            .filter(|r| r.bus == "pci" && &r.dev == pci)
-            .min_by_key(|r| (r.value, r.cmode))
-            .map(|r| r.value);
-        if best.is_some() {
-            return Ok(best);
-        }
+impl Capacities {
+    /// What the driver says this netdev's unicast filter holds, or `None`
+    /// when it does not say.
+    pub fn for_netdev(&self, netdev: &str) -> Option<u32> {
+        self.for_pci(&pci_addresses(netdev))
     }
-    Ok(None)
+
+    /// The device itself first, its physical function only if that said
+    /// nothing: a virtual function that answers for itself is answering
+    /// about the vport this daemon actually writes to. Per device the
+    /// smallest of the offered modes binds - it is the one a filter can
+    /// actually be pushed past.
+    fn for_pci(&self, wanted: &[String]) -> Option<u32> {
+        for pci in wanted {
+            let best = self
+                .reported
+                .iter()
+                .filter(|r| r.bus == "pci" && &r.dev == pci)
+                .min_by_key(|r| (r.value, r.cmode))
+                .map(|r| r.value);
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +306,14 @@ mod tests {
         body
     }
 
+    fn capacities(messages: &[Vec<u8>]) -> Capacities {
+        let mut reported = Vec::new();
+        for m in messages {
+            collect_param(m, &mut reported);
+        }
+        Capacities { reported }
+    }
+
     #[test]
     fn the_capacity_is_read_out_of_its_four_nestings() {
         let mut out = Vec::new();
@@ -318,18 +341,42 @@ mod tests {
         assert!(out.is_empty(), "io_eq_size is not a filter capacity");
     }
 
-    /// A parameter can be offered in several modes at once. Whichever number
-    /// is smallest is the one a filter can be pushed past, so that is the one
-    /// to warn against.
+    /// Through the production selection, not a re-implementation of it: this
+    /// test used to apply its own min_by_key and would have stayed green had
+    /// the real one changed.
     #[test]
     fn the_smallest_of_several_modes_is_the_one_that_binds() {
-        let mut out = Vec::new();
-        collect_param(
-            &param_message("pci", "0000:01:00.1", "max_macs", &[(0, 256), (1, 128)]),
-            &mut out,
+        let caps = capacities(&[param_message(
+            "pci",
+            "0000:01:00.1",
+            "max_macs",
+            &[(0, 256), (1, 128)],
+        )]);
+        assert_eq!(caps.for_pci(&["0000:01:00.1".into()]), Some(128));
+    }
+
+    /// The device itself answers before its physical function, and a bus
+    /// that is not pci does not answer at all.
+    #[test]
+    fn the_device_answers_before_its_physical_function() {
+        let caps = capacities(&[
+            param_message("pci", "0000:01:00.4", "max_macs", &[(1, 64)]),
+            param_message("pci", "0000:01:00.1", "max_macs", &[(1, 128)]),
+            param_message("auxiliary", "mlx5_core.eth.4", "max_macs", &[(1, 7)]),
+        ]);
+        let vf_then_pf = ["0000:01:00.4".to_string(), "0000:01:00.1".to_string()];
+        assert_eq!(
+            caps.for_pci(&vf_then_pf),
+            Some(64),
+            "the VF's own answer wins"
         );
-        let smallest = out.iter().min_by_key(|r| (r.value, r.cmode)).unwrap();
-        assert_eq!(smallest.value, 128);
+        let pf_only = ["0000:01:00.9".to_string(), "0000:01:00.1".to_string()];
+        assert_eq!(
+            caps.for_pci(&pf_only),
+            Some(128),
+            "a silent device falls through to its physical function"
+        );
+        assert_eq!(caps.for_pci(&["mlx5_core.eth.4".to_string()]), None);
     }
 
     /// Truncated messages arrive - a dump cut off, a kernel that stops

@@ -6,9 +6,11 @@
 
 # Seconds between full reconciliations. This is paranoia, not the mechanism.
 # Addresses are registered the moment the kernel reports them, removed when the
-# bridge ages them out, and interface changes - a new NIC, a new bridge, a VF
-# whose address was set from the host - arrive as link notifications. The timed
-# pass exists only in case one of those is ever missed.
+# bridge ages them out, and interface changes - a new NIC, a new bridge -
+# arrive as link notifications. A VF address changed silently (a down PF, a
+# guest-side change over the driver mailbox) is caught by the fresh driver
+# question that precedes any filter growth. The timed pass exists only in
+# case a notification is ever missed.
 #RESYNC=300
 
 # Warn above this many addresses per uplink. The vport list on ConnectX-4 Lx

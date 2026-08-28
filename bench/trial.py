@@ -922,6 +922,14 @@ def main():
     except (OSError, AttributeError):
         print("(running without SCHED_FIFO; timestamps carry scheduling noise)")
 
+    # Armed before the governor is pinned: Python does not run atexit on a
+    # default-disposition SIGTERM, and a TERM between pin() and arm() left
+    # every CPU of a production host on performance for good - the exact
+    # state the governor docstring calls the real risk. The handlers are
+    # idempotent; arming them over an empty cleanup is free.
+    cleanup = Cleanup()
+    cleanup.arm()
+
     governor = Governor()
     if args.governor != "leave":
         governor.pin(args.governor)
@@ -931,8 +939,6 @@ def main():
     since_epoch = f"{time.time():.6f}"
     pre_state = {u: (self_macs(u), note_bytes(u)) for u in uplinks}
 
-    cleanup = Cleanup()
-    cleanup.arm()
     mon = Monitor()
 
     t = Trial(args, args.binary, uplinks, cleanup)

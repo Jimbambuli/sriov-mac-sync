@@ -109,9 +109,6 @@ impl Syncer {
     /// so *checking* the copy costs one stat instead of an open, a read and a
     /// close. Any writer changes at least one of the three: this daemon and
     /// --flush both replace the file through rename, which changes the inode.
-    /// A note whose timestamp is not strictly older than the moment it was
-    /// read is never believed either, since a write in the same clock tick as
-    /// the read cannot be told from one before it.
     pub(super) fn load_owned(&self, dev: &str) -> Set<Mac> {
         self.with_owned(dev, |s| s.clone())
     }
@@ -330,9 +327,9 @@ impl Syncer {
 
     /// Write the note as the difference this caller made, not as the set it
     /// started from: whatever else has been added meanwhile stays.
-    pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) {
+    pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) -> bool {
         if self.dry_run {
-            return;
+            return true;
         }
         self.locked(dev, || {
             let current = self.read_owned(dev);
@@ -347,8 +344,8 @@ impl Syncer {
                     merged.remove(mac);
                 }
             }
-            self.write_owned(dev, &merged);
-        });
+            self.write_owned(dev, &merged)
+        })
     }
 
     /// Seed a note with exactly this set. No production path writes a
@@ -363,14 +360,17 @@ impl Syncer {
         self.locked(dev, || self.write_owned(dev, set));
     }
 
-    /// The write itself. Every caller holds the lock.
-    pub(super) fn write_owned(&self, dev: &str, set: &Set<Mac>) {
+    /// The write itself. Every caller holds the lock. Whether the note now
+    /// records the set - a caller that registered something on the strength
+    /// of this write has to know, because an entry in the card that no note
+    /// names would never be removed again.
+    pub(super) fn write_owned(&self, dev: &str, set: &Set<Mac>) -> bool {
         if !self.note_is_readable(dev) {
             eprintln!(
                 "warning: not writing the ownership note for {dev}: it could not \
                  be read, and replacing it would abandon whatever it names"
             );
-            return;
+            return false;
         }
         // Most passes change nothing, and rewriting the note every time would
         // be pointless work on a host that is simply idle. The remembered
@@ -378,7 +378,7 @@ impl Syncer {
         // believed, load_owned reads it and the comparison is against what is
         // really there either way.
         if self.load_owned(dev) == *set {
-            return;
+            return true;
         }
         let mut lines: Vec<String> = set.iter().map(format_mac).collect();
         lines.sort();
@@ -433,15 +433,16 @@ impl Syncer {
             })
         };
         match write() {
-            Ok(()) => self.remember(dev, set),
+            Ok(()) => {
+                self.remember(dev, set);
+                true
+            }
             Err(e) => {
                 // The file and the copy have to agree, and neither is now
                 // known to hold what was asked for.
                 self.notes.borrow_mut().remove(dev);
-                eprintln!(
-                    "warning: cannot write the ownership note for {dev}: {e} - \
-                     what was just registered has no owner on record"
-                );
+                eprintln!("warning: cannot write the ownership note for {dev}: {e}");
+                false
             }
         }
     }
@@ -462,9 +463,9 @@ impl Syncer {
     /// somebody tidies up afterwards. What matters is that a line, once
     /// written, is in the file before the entry it names is anybody's to
     /// remove.
-    pub(super) fn append_owned(&self, dev: &str, added: &[Mac]) {
+    pub(super) fn append_owned(&self, dev: &str, added: &[Mac]) -> bool {
         if self.dry_run || added.is_empty() {
-            return;
+            return true;
         }
         // Only what the note does not already name. A line that is already
         // there would never be taken out again: a full pass rewrites the file
@@ -472,10 +473,10 @@ impl Syncer {
         // change the set - so the file would grow by a line every time an
         // address was registered afresh, for ever. Read and write under one
         // lock, or two writers each decide "not there yet" and both add it.
-        self.locked(dev, || self.append_owned_locked(dev, added));
+        self.locked(dev, || self.append_owned_locked(dev, added))
     }
 
-    pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) {
+    pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> bool {
         use std::io::Write;
         let mut set = self.load_owned(dev);
         let fresh: Vec<Mac> = added
@@ -484,7 +485,7 @@ impl Syncer {
             .copied()
             .collect();
         if fresh.is_empty() {
-            return;
+            return true;
         }
         let mut text = String::with_capacity(fresh.len() * 18);
         for mac in &fresh {
@@ -531,20 +532,16 @@ impl Syncer {
                     // stop thinking it - the next read goes to the file.
                     self.notes.borrow_mut().remove(dev);
                 }
+                true
             }
             Err(e) => {
                 self.notes.borrow_mut().remove(dev);
-                eprintln!(
-                    "warning: cannot add to the ownership note for {dev}: {e} - \
-                     what was just registered has no owner on record"
-                );
+                eprintln!("warning: cannot add to the ownership note for {dev}: {e}");
+                false
             }
         }
     }
 
-    /// Devices this daemon has a note for. A note outlives the pair it was
-    /// made for on purpose: when a bridge is taken apart, what we put in that
-    /// device's filter still has to come back out.
     /// How many addresses this daemon currently has on record as its own,
     /// across every device it has a note for. Read from the notes rather than
     /// from memory, for the same reason everything else here is: a --flush

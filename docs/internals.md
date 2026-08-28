@@ -4,9 +4,14 @@
 
 Plain rtnetlink, by hand, on top of `libc`. Three operations on `AF_BRIDGE`
 neighbour messages: dump the forwarding database, add or remove an `NTF_SELF`
-entry, and subscribe to `RTNLGRP_NEIGH` for changes. No shelling out to
-`bridge`, no output parsing, no async runtime — and real error codes, which is
-what makes `EEXIST` and `ENOSPC` distinguishable instead of guessed at.
+entry, and subscribe to `RTNLGRP_NEIGH` *and* `RTNLGRP_LINK` for changes —
+interfaces matter as much as addresses, and the picture-rebuilding below hangs
+on the link subscription. No shelling out to `bridge`, no output parsing, no
+async runtime — and real error codes, which is what makes `EEXIST` and
+`ENOSPC` distinguishable instead of guessed at. The one thing outside
+rtnetlink is a single generic-netlink question at startup — the devlink
+parameter `max_macs`, the card's real filter capacity; hardware-notes has the
+details.
 
 Topology comes from one `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
 the interface kind for stacking (a veth reports a peer there and a tunnel its
@@ -22,8 +27,14 @@ bridge" is one walk rather than one per interface.
 The daemon works from notifications. An address is registered as soon as the
 kernel says a bridge learnt it, dropped when the bridge ages it out, and the
 whole picture rebuilt whenever an interface appears, disappears or is
-reconfigured — including a VF whose address was set from the host, which changes
-what must be excluded without moving a single forwarding entry.
+reconfigured. What notifications do *not* cover is a VF's address changing
+silently: a PF that is administratively down announces nothing, and a
+guest-side change runs over the ixgbe/i40e driver mailbox without ever
+reaching rtnetlink — an "up PFs announce" gate built on the opposite
+assumption was refuted from the kernel source and removed. Invariant 2 is
+carried on the event path by the grow-only driver refresh instead: any batch
+or pass that would *grow* a filter asks the driver afresh before registering;
+only shrinking trusts a carried answer.
 
 **A guest that moves hosts is followed within the batch that says so.** When a
 VM migrates away the bridge starts learning its address on the uplink's own
@@ -80,7 +91,8 @@ pass total 19.45 ms          syscall time 19.11 ms  (98.2%)
 Everything this program does with that data — parsing 9826 entries, building the
 graph, putting 4200 addresses through several sets — is the 0.35 ms that is
 *not* syscall time. The cost of a pass is the kernel serialising its tables. On
-a normal host a whole pass is about 2 ms.
+a normal host a whole cold pass was about 2 ms before the optimisations
+below; with `RTEXT_FILTER_SKIP_STATS` it is ~0.7 ms on a ConnectX-4.
 
 Five things were tried against that profile, recorded so they are not tried
 again on the strength of how sensible they sound:
@@ -127,7 +139,8 @@ kernel's forwarding-database notification — the driver programs the NIC
 asynchronously just afterwards — and absolute times swing with CPU frequency
 scaling, so two software states are compared only by interleaving their trials.
 
-If a failed run leaves test entries behind (prefix `02:be:5c`), remove them with
+If a failed run leaves test entries behind (prefixes `02:be:5c` and
+`fe:be:5c`), remove them with
 `bridge fdb del <mac> dev <uplink> self permanent` and leave the note files
 alone: the daemon heals its own notes through the ENOENT path on the next pass.
 After a hard kill the bridge entries age out within 300 s and the daemon takes

@@ -1025,6 +1025,56 @@ fn the_note_lock_actually_excludes_a_second_holder() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A device that is not under its bridge in this reading - a bond-member
+/// flap, an `ifreload -a` rebuilding the enslavement - must not be taken
+/// for the wire port. uplink_port used to fall back to the device itself
+/// then, whereupon nothing in the forwarding table classified as wire and
+/// the cable's own peers were registered into the filter: invariant 1,
+/// violated in exactly the reload window the daemon reacts to fastest.
+#[test]
+fn a_detached_device_is_left_alone_rather_than_mistaken_for_the_port() {
+    let dir = scratch("detached");
+    // nic1 carries the VFs but is enslaved nowhere; the bridge lives on,
+    // with the bond as its real port and the cable's peer learnt there.
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .vfs(1)
+        .add("bond0", 4, Some(mac(4)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(3)))
+        .bridge()
+        .lower("bond0")
+        .build();
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, WIRE)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let mut s = ready_syncer(&dir);
+    let reports = s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock.added.is_empty(),
+        "a cable-side peer was registered on a detached device"
+    );
+    assert!(sock.removed.is_empty(), "a detached pair removed something");
+    assert!(reports.is_empty(), "a detached pair produced a report");
+
+    // The fast path refuses the same pair the same way.
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(4, 10, WIRE))],
+        )
+        .unwrap();
+    assert!(
+        sock.added.is_empty(),
+        "the fast path registered on a detached device"
+    );
+    assert_eq!(urgency, Urgency::Nothing);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The unknowable-VF warning is for when the situation arises - which is
 /// not necessarily the first pass. A VF that is fully named today and
 /// handed to a guest tomorrow (its admin address cleared) becomes
@@ -1364,6 +1414,110 @@ fn within_one_batch_the_wire_wins() {
         "the wire side of the same batch says this address is out there: {:?}",
         sock.added
     );
+
+    // The dangerous order: wire first, inner learn second - the kernel's
+    // end state is "behind the bridge". The refusal must buy the pass that
+    // registers it from the real dump; a batch that ends quiet here leaves
+    // the guest deaf until the timer, while ARP for it still resolves.
+    let mut sock = FakeSock::default();
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[
+                (crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST)),
+                (crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST)),
+            ],
+        )
+        .unwrap();
+    assert!(sock.added.is_empty(), "the wire still has the last word");
+    assert_ne!(
+        urgency,
+        Urgency::Nothing,
+        "a reflection refusal suppressed its own correction"
+    );
+
+    // And a batch that is wire and nothing else stays passless - the
+    // refusal above must not have bought this one a pass too.
+    let mut sock = FakeSock::default();
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))],
+        )
+        .unwrap();
+    assert_eq!(
+        urgency,
+        Urgency::Nothing,
+        "wire-only learning bought a pass; the wire-load optimisation is gone"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The full pass obeys the same rule as the fast path: a carried answer
+/// decides nothing that grows a filter. A VF's address can change without
+/// any link message - a down PF announces nothing, a guest-side change
+/// runs over the ixgbe/i40e mailbox - and a pass registers in several real
+/// flows the fast path never vetted. Growing on stale news sends a guest's
+/// traffic past it until the timed refresh.
+#[test]
+fn a_pass_that_would_register_asks_the_driver_afresh() {
+    let dir = scratch("pass-grow-refresh");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    // The carried answer predates the change: BEHIND_NIC is, by the
+    // driver's current truth, a virtual function's own address now.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock = FakeSock {
+        fdb: vec![learned(3, 10, BEHIND_NIC)],
+        vf: vec![(2, VF_ADMIN), (2, BEHIND_NIC)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(
+        sock.vf_asked, 1,
+        "a growing pass on a carried answer has to ask the driver first"
+    );
+    assert!(
+        !sock.added.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "the pass registered a VF's own address on the strength of stale news"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The mirror image: an address the carried answer still calls a VF's own
+/// may have been freed without any link message. With a carried answer
+/// such a refusal goes through the decide phase, the fresh question
+/// settles it, and the freed address is registered in the same batch
+/// instead of waiting out the interval.
+#[test]
+fn a_stale_vf_exclusion_is_settled_by_the_fresh_question() {
+    let dir = scratch("stale-vf-skip");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    // Carried: BEHIND_NIC still counted as a VF's address. Truth: freed.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN), (2, BEHIND_NIC)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        )
+        .unwrap();
+    assert_eq!(
+        sock.vf_asked, 1,
+        "the stale exclusion never asked the driver"
+    );
+    assert!(
+        sock.added.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "the freed address stayed blocked by the carried answer"
+    );
+    assert_eq!(urgency, Urgency::Now);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1854,7 +2008,7 @@ fn a_device_that_blinks_is_not_an_orphan() {
     // The bridge went; autodetection finds nothing this pass.
     s.pairs.clear();
     let mut sock = FakeSock::default();
-    s.drop_orphans(&mut sock, &topo, true);
+    s.drop_orphans(&mut sock, &topo, true, &mut Vec::new());
     assert!(
         sock.removed.is_empty(),
         "an interface that has been gone for an instant is not gone: {:?}",
@@ -1868,13 +2022,13 @@ fn a_device_that_blinks_is_not_an_orphan() {
 
     // It comes back, as it does after ifreload.
     s.pairs.push(pair());
-    s.drop_orphans(&mut sock, &topo, true);
+    s.drop_orphans(&mut sock, &topo, true, &mut Vec::new());
     assert!(sock.removed.is_empty(), "still nothing to remove");
 
     // A device that really is gone, with the grace period behind it.
     s.pairs.clear();
     s.orphan_grace = Dur::ZERO;
-    s.drop_orphans(&mut sock, &topo, true);
+    s.drop_orphans(&mut sock, &topo, true, &mut Vec::new());
     assert_eq!(
         sock.removed,
         vec![(2, BEHIND_NIC)],

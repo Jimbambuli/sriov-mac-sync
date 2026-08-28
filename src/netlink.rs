@@ -20,12 +20,12 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-pub const RTM_NEWNEIGH: u16 = 28;
-pub const RTM_DELNEIGH: u16 = 29;
-pub const RTM_GETNEIGH: u16 = 30;
-pub const RTM_NEWLINK: u16 = 16;
-pub const RTM_DELLINK: u16 = 17;
-pub const RTM_GETLINK: u16 = 18;
+pub(crate) const RTM_NEWNEIGH: u16 = 28;
+pub(crate) const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const RTM_GETLINK: u16 = 18;
 
 const NLMSG_NOOP: u16 = 1;
 const NLMSG_ERROR: u16 = 2;
@@ -46,14 +46,14 @@ pub(crate) const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// came back is a mixture of two states and must not be acted on.
 const NLM_F_DUMP_INTR: u16 = 0x10;
 
-pub const NDA_LLADDR: u16 = 2;
-pub const NDA_MASTER: u16 = 9;
+const NDA_LLADDR: u16 = 2;
+const NDA_MASTER: u16 = 9;
 
-pub const NTF_SELF: u8 = 0x02;
-pub const NTF_EXT_LEARNED: u8 = 0x10;
+const NTF_SELF: u8 = 0x02;
+const NTF_EXT_LEARNED: u8 = 0x10;
 
-pub const NUD_PERMANENT: u16 = 0x80;
-pub const NUD_NOARP: u16 = 0x40;
+const NUD_PERMANENT: u16 = 0x80;
+const NUD_NOARP: u16 = 0x40;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
@@ -150,8 +150,6 @@ pub struct LinkInfo {
     pub parent_dev: Option<String>,
 }
 
-/// A batch of notifications: forwarding entries that changed, and whether any
-/// interface changed at all.
 /// The most one datagram's answer may demand, so a nonsensical size cannot
 /// be turned into an allocation that ends the process; and how many times a
 /// growing buffer is offered before an answer is declared unreachable.
@@ -176,6 +174,8 @@ enum DumpEnd {
     TooBig(usize),
 }
 
+/// A batch of notifications: forwarding entries that changed, and whether any
+/// interface changed at all.
 #[derive(Debug, Default)]
 pub struct Events {
     pub fdb: Vec<(u16, FdbEntry)>,
@@ -421,8 +421,7 @@ impl Socket {
             // After a spoofed datagram was skipped, the queue may well be
             // empty - and blocking then would hand any local process a
             // five-second brake on the daemon loop, one unicast datagram at
-            // a time. Drain what is there without waiting; EAGAIN reaches
-            // the event reader as an empty batch and the next poll wakes it.
+            // a time. Drain what is there without waiting.
             let flags = if dropped > 0 {
                 libc::MSG_TRUNC | libc::MSG_DONTWAIT | extra
             } else {
@@ -693,13 +692,12 @@ impl Socket {
     /// sequence number, so whatever an abandoned attempt left queued cannot
     /// pass for the new answer.
     ///
-    /// The buffer starts at 256 KiB, which the kernel's own cap on a dump
-    /// datagram puts out of reach on every host seen so far, and grows to
-    /// whatever a datagram turns out to need. It used to be fixed, on the
-    /// reasoning that the cap made growing pointless - but the cap is the
-    /// kernel's business, not a promise to us, and the failure it left was a
-    /// bad one: the same too-small buffer offered six times over, and then an
-    /// error blaming interruptions that never happened.
+    /// The buffer grows to whatever a datagram turns out to need. It used to
+    /// be fixed, on the reasoning that the kernel's own cap on a dump
+    /// datagram made growing pointless - but the cap is the kernel's
+    /// business, not a promise to us, and the failure it left was a bad one:
+    /// the same too-small buffer offered six times over, and then an error
+    /// blaming interruptions that never happened.
     pub(crate) fn dump<T>(
         &mut self,
         request: &[u8],
@@ -727,9 +725,6 @@ impl Socket {
         what: &str,
         parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
-        // The buffer is taken out of the socket for the duration and put back
-        // however large it had to grow, so the next dump starts from there
-        // instead of allocating and zeroing hundreds of kilobytes again.
         let mut buf = self.take_buf(start);
         let out = self.dump_into(&mut buf, request, want, what, parse);
         self.buf = buf;
@@ -817,8 +812,9 @@ impl Socket {
     /// Without RTEXT_FILTER_VF: asking for virtual function details makes the
     /// driver answer out of its firmware for every interface that has any,
     /// which was measured at 1.35 ms per physical function. The count comes
-    /// from IFLA_NUM_VF, which is free, and the addresses are asked for
-    /// separately for the two or three interfaces that turn out to matter.
+    /// from sysfs instead - without the flag the kernel does not send
+    /// IFLA_NUM_VF at all - and the addresses are asked for separately for
+    /// the two or three interfaces that turn out to matter.
     pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
         let len = NLMSG_HDR + IFINFOMSG_LEN;
         let mut req = Vec::with_capacity(len);
@@ -929,7 +925,7 @@ impl Socket {
         // acknowledgement would stay queued, and every call after this one
         // would judge itself by its predecessor's answer.
         let mut buf = [0u8; 8192];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + READ_TIMEOUT;
         loop {
             let n = self.recv_deadline(&mut buf, deadline)?.min(buf.len());
             for msg in messages(&buf[..n]) {
@@ -1016,11 +1012,10 @@ impl Socket {
                 continue;
             }
             // RTNLGRP_NEIGH carries the whole neighbour table, not just the
-            // bridge's. On a normal host the ARP and ND cache churns several
-            // times a second - every failed lookup for a machine that is
-            // switched off is one - and none of it concerns us. Dropping it
-            // here is the difference between waking constantly and waking when
-            // a bridge actually learns something.
+            // bridge's; only AF_BRIDGE concerns us. The kernel-side filter in
+            // open_on drops the ARP and ND churn before it wakes anybody -
+            // this check is the backstop for what that filter deliberately
+            // lets through, and for kernels that refused it.
             if msg.payload.first() != Some(&(libc::AF_BRIDGE as u8)) {
                 continue;
             }
@@ -1108,7 +1103,7 @@ fn put_attr_u32(buf: &mut Vec<u8>, kind: u16, value: u32) {
     put_attr(buf, kind, &value.to_ne_bytes());
 }
 
-pub struct Message<'a> {
+struct Message<'a> {
     pub kind: u16,
     pub flags: u16,
     pub seq: u32,

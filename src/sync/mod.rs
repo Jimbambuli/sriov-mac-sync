@@ -22,6 +22,16 @@ pub struct Pair {
 
 /// One pair as the fast path needs it: the structural questions answered
 /// once for the whole batch, because a batch describes a single moment.
+/// The two halves of fast_apply's grow-only driver refresh. They never
+/// vary independently: deciding collects what would be registered - stale
+/// carried VF exclusions included - and writes nothing; committing writes
+/// and trusts the (by then fresh) skip sets.
+#[derive(Clone, Copy, PartialEq)]
+enum FastPhase {
+    Decide,
+    Commit,
+}
+
 struct FastPair {
     /// kept for the messages a person reads
     dev: String,
@@ -31,9 +41,19 @@ struct FastPair {
     /// the uplink's own interface index, which the filter is written to
     index: u32,
     /// addresses that may not be registered for this uplink: the host's own,
-    /// the virtual functions', the configured exclusions, and whatever this
-    /// batch has just seen out on the wire
+    /// the virtual functions', the configured exclusions
     skip: Set<Mac>,
+    /// what this very batch saw on the uplink's own port. Held apart from
+    /// `skip` because a refusal on its account has to count as ours: the
+    /// kernel's end state may be "behind the bridge" - wire first, inner
+    /// learn later in the same drained burst - and a refusal that bought no
+    /// pass would suppress its own correction.
+    reflected: Set<Mac>,
+    /// the share of `skip` that came from the carried driver answer. A
+    /// refusal owed only to that share may be stale news - a VF address
+    /// freed without any link message - so with a carried answer such a hit
+    /// goes through the decide phase and the fresh question settles it.
+    vf_own: Set<Mac>,
 }
 
 mod notes;
@@ -241,13 +261,6 @@ impl Timings {
     }
 }
 
-/// The physical function behind an uplink, or the uplink itself when it is
-/// not a virtual function.
-///
-/// Both the pass and the exclusion set have to arrive at the same answer: the
-/// pass asks the kernel about this interface's virtual functions, and the
-/// exclusion set looks the results up by its index. Two spellings of the same
-/// rule would silently stop excluding anything.
 /// Whether an address may appear in a unicast filter at all: unicast, and
 /// not the all-zero address a never-configured interface reports.
 fn is_registerable(mac: &Mac) -> bool {
@@ -297,6 +310,13 @@ pub fn vf_may_have_changed(
     })
 }
 
+/// The physical function behind an uplink, or the uplink itself when it is
+/// not a virtual function.
+///
+/// Both the pass and the exclusion set have to arrive at the same answer: the
+/// pass asks the kernel about this interface's virtual functions, and the
+/// exclusion set looks the results up by its index. Two spellings of the same
+/// rule would silently stop excluding anything.
 fn physical_function(topo: &Topology, dev: u32) -> u32 {
     topo.at(dev).and_then(|l| l.physfn).unwrap_or(dev)
 }
@@ -348,9 +368,6 @@ impl Syncer {
         self.vf_stale = false;
     }
 
-    /// Take back what was registered for a device that is no longer an uplink.
-    /// Left alone, the card goes on steering those addresses to a port that
-    /// leads nowhere, and nothing short of a reboot undoes it.
     /// Devices with a note that are no longer uplinks - and have not been for
     /// long enough to believe it.
     ///
@@ -397,7 +414,16 @@ impl Syncer {
         out
     }
 
-    fn drop_orphans(&mut self, sock: &mut dyn FdbWriter, topo: &Topology, apply: bool) {
+    /// Take back what was registered for a device that is no longer an uplink.
+    /// Left alone, the card goes on steering those addresses to a port that
+    /// leads nowhere, and nothing short of a reboot undoes it.
+    fn drop_orphans(
+        &mut self,
+        sock: &mut dyn FdbWriter,
+        topo: &Topology,
+        apply: bool,
+        failures: &mut Vec<String>,
+    ) {
         for dev in self.orphaned() {
             if !apply || self.dry_run {
                 let owned = self.load_owned(&dev);
@@ -450,7 +476,13 @@ impl Syncer {
                          {} could not be removed and stay on record",
                         kept.len()
                     );
-                    self.write_owned(&dev, &kept);
+                    // A oneshot asked to take orphans out and could not; its
+                    // exit code has to say so, not just its scrollback.
+                    failures.push(format!(
+                        "{dev}: {} orphaned address(es) could not be removed",
+                        kept.len()
+                    ));
+                    let _ = self.write_owned(&dev, &kept);
                 }
             });
         }
@@ -481,8 +513,6 @@ impl Syncer {
         (gone, kept)
     }
 
-    /// The addresses that belong in `pair`'s filter list, and the ones that
-    /// must stay out of it.
     /// The addresses that must never be registered for `pair`, no matter
     /// where they were learnt: the operator's exclusions, everything stacked
     /// on the uplink's wire side, the uplink's and its physical function's
@@ -615,7 +645,6 @@ impl Syncer {
         let Some(bridge_link) = topo.at(bridge) else {
             return (crate::hash::set(), Vec::new(), crate::hash::set());
         };
-        let port_index = port;
 
         // Which interfaces sit on top of the uplink bridge. One walk up from
         // the bridge, rather than asking every interface on the host whether
@@ -648,7 +677,7 @@ impl Syncer {
             }
             let Some(master) = e.master else { continue };
             if master == bridge_link.index {
-                if e.ifindex == port_index {
+                if e.ifindex == port {
                     // out on the wire: registering it would divert its traffic
                     // to the bridge, which cannot send it back out of the port
                     // it arrived on
@@ -696,6 +725,58 @@ impl Syncer {
 
     /// Bring the filter in line with the bridge.
     ///
+    /// The physical functions behind these uplinks, alive in this reading.
+    /// Only they contribute exclusions, so only they are asked about - a
+    /// dump would describe every interface on the host to reach them.
+    ///
+    /// One function on purpose: the exclusion set invariant 2 hangs on is
+    /// built from exactly this list, and it used to be spelled three times.
+    /// The pf_netdevs-union fix was the class of bug where one of several
+    /// copies of a rule goes stale.
+    fn live_pfs<'a>(topo: &Topology, devs: impl Iterator<Item = &'a str>) -> Vec<u32> {
+        let mut pfs: Vec<u32> = Vec::new();
+        for dev in devs {
+            let Some(idx) = topo.index_of(dev) else {
+                continue;
+            };
+            for pf in physical_functions(topo, idx) {
+                if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                    pfs.push(pf);
+                }
+            }
+        }
+        pfs
+    }
+
+    /// The addresses the driver reports for the virtual functions behind
+    /// this uplink - the share of the exclusion set that can go stale when
+    /// the answer is carried, which is why the fast path keeps it apart.
+    fn vf_reported(topo: &Topology, dev: u32, vf_macs: &[(u32, Mac)]) -> Set<Mac> {
+        let mut own = crate::hash::set();
+        for pf in physical_functions(topo, dev) {
+            if let Some(pf_link) = topo.at(pf) {
+                for (ifindex, mac) in vf_macs {
+                    if *ifindex == pf_link.index {
+                        own.insert(*mac);
+                    }
+                }
+            }
+        }
+        own
+    }
+
+    /// The carried answer, if it may be used for these very physical
+    /// functions - the staleness rule invariant 2 hangs on, written once
+    /// for the pass and the fast path alike. Carried answers count only
+    /// when they were collected for these very functions: a pass over a
+    /// different pair list must not inherit what was never about it.
+    fn carried_vf_for(&self, pfs: &[u32]) -> Option<Vec<(u32, Mac)>> {
+        match (&self.carried_vf, self.vf_stale) {
+            (Some((for_pfs, kept)), false) if *for_pfs == pfs => Some(kept.clone()),
+            _ => None,
+        }
+    }
+
     /// The topology is handed in rather than read here. The caller needs it
     /// anyway - autodetection runs off the same picture - and reading it twice
     /// for one pass is work nobody asked for. `topo_load` is how long the
@@ -719,7 +800,7 @@ impl Syncer {
         // the only place that ever takes those entries back out. The dumps
         // serve the pairs and are skipped.
         if self.pairs.is_empty() {
-            self.drop_orphans(sock, topo, apply);
+            self.drop_orphans(sock, topo, apply, &mut timings.failures);
             timings.total = topo_load + started.elapsed();
             self.timings = timings;
             return Ok(Vec::new());
@@ -735,41 +816,25 @@ impl Syncer {
         // address in the uplink's filter tells the switch that the guest
         // holding it lives behind the bridge - which sends its traffic past it.
         // A failed pass is harmless; a pass on incomplete information is not.
-        // Only each pair's physical function contributes exclusions, so ask
-        // about those. A dump would describe every interface on the host to
-        // reach them.
-        let mut pfs: Vec<u32> = Vec::new();
-        for pair in &self.pairs {
-            let Some(dev) = topo.index_of(&pair.dev) else {
-                continue;
-            };
-            for pf in physical_functions(topo, dev) {
-                if topo.at(pf).is_some() && !pfs.contains(&pf) {
-                    pfs.push(pf);
-                }
-            }
-        }
-        // Carried answers count only when they were collected for these very
-        // physical functions - a pass over a different pair list must not
-        // inherit what was never about it.
-        let vf_macs = match (&self.carried_vf, self.vf_stale) {
-            (Some((for_pfs, kept)), false) if *for_pfs == pfs => {
+        let pfs = Self::live_pfs(topo, self.pairs.iter().map(|p| p.dev.as_str()));
+        let (mut vf_macs, mut vf_carried) = match self.carried_vf_for(&pfs) {
+            Some(kept) => {
                 timings.vf_carried = true;
-                kept.clone()
+                (kept, true)
             }
-            _ => {
+            None => {
                 let mark = Instant::now();
                 let fresh = sock.vf_macs_of(&pfs)?;
                 timings.vf_macs = mark.elapsed();
                 self.remember_vf(pfs.clone(), fresh.clone());
-                fresh
+                (fresh, false)
             }
         };
         timings.vf_addresses = vf_macs.len();
 
         let mut reports = Vec::new();
         let mark = Instant::now();
-        self.drop_orphans(sock, topo, apply);
+        self.drop_orphans(sock, topo, apply, &mut timings.failures);
         timings.orphans = mark.elapsed();
 
         let mark = Instant::now();
@@ -797,11 +862,52 @@ impl Syncer {
                 Some(i) => i,
                 None => continue,
             };
-            let port = topo.uplink_port(dev_index, bridge_index);
+            // Fail closed for the same reason as the missing bridge: a
+            // detached device taken for the wire port makes every cable-side
+            // peer look registrable.
+            let Some(port) = topo.uplink_port(dev_index, bridge_index) else {
+                eprintln!(
+                    "warning: {}: not under bridge {} in this reading, leaving the filter alone",
+                    pair.dev, pair.bridge
+                );
+                continue;
+            };
             let port_name = topo.name_of(port).unwrap_or(&pair.dev).to_string();
-            self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
-            let (want, stacked, wire) =
+            let (mut want, mut stacked, mut wire) =
                 self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
+
+            let present: Set<Mac> = fdb
+                .iter()
+                .filter(|e| e.is_self() && e.ifindex == dev_index && e.is_unicast())
+                .map(|e| e.mac)
+                .collect();
+
+            // The same rule as the fast path, for the same reason: a carried
+            // answer decides nothing that grows a filter. A pass gets here
+            // with additions pending in several real flows - a returner the
+            // fast path refused on the carried wire set and bought this pass
+            // for, a retry after a failed registration - and a VF's address
+            // can have changed without any link message in the meantime. One
+            // fresh question per growth-bearing pass, exactly the fast
+            // path's price.
+            if vf_carried && want.iter().any(|m| !present.contains(m)) {
+                // If the question fails, the next pass must not trust the
+                // carried answer either; remember_vf clears this on success.
+                self.vf_stale = true;
+                let mark = Instant::now();
+                let fresh = sock.vf_macs_of(&pfs)?;
+                timings.vf_macs += mark.elapsed();
+                self.remember_vf(pfs.clone(), fresh.clone());
+                vf_macs = fresh;
+                vf_carried = false;
+                timings.vf_carried = false;
+                timings.vf_addresses = vf_macs.len();
+                let (w, st, wi) = self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
+                want = w;
+                stacked = st;
+                wire = wi;
+            }
+            self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
 
             // Pinned addresses that did not make it, said once per change.
             let unpinned: Set<Mac> = self
@@ -825,13 +931,15 @@ impl Syncer {
 
             self.carried_wire.insert(pair.dev.clone(), wire);
 
-            let present: Set<Mac> = fdb
-                .iter()
-                .filter(|e| e.is_self() && e.ifindex == dev_index && e.is_unicast())
-                .map(|e| e.mac)
-                .collect();
-
             let owned_before = self.load_owned(&pair.dev);
+            // While the note cannot be read, nothing new is registered for
+            // this device: write_owned will refuse the note afterwards, and
+            // an entry registered in that window would be permanently
+            // ownerless - read_owned promised "leaving that device alone
+            // until it can be read", and the register loop is part of that
+            // promise. Removals need no guard: owned reads empty.
+            let note_ok = self.note_is_readable(&pair.dev);
+            let mut suppressed = 0usize;
             let mut owned = owned_before.clone();
             let mut added = 0usize;
             let mut removed = 0usize;
@@ -846,6 +954,11 @@ impl Syncer {
                 }
                 added += 1;
                 if apply && !self.dry_run {
+                    if !note_ok {
+                        added -= 1;
+                        suppressed += 1;
+                        continue;
+                    }
                     match sock.set_self_fdb(dev_index, mac, true) {
                         Ok(()) => {
                             owned.insert(*mac);
@@ -916,11 +1029,46 @@ impl Syncer {
                 }
             }
 
-            if apply {
-                // What this pass claimed and released, applied to whatever
-                // the note holds now - not the picture it started from, which
-                // a --once running alongside may have added to since.
-                self.save_owned_merged(&pair.dev, &owned_before, &owned);
+            if suppressed > 0 {
+                eprintln!(
+                    "warning: {}: note unreadable, {suppressed} address(es) not \
+                     registered until it can be read",
+                    pair.dev
+                );
+                timings.failures.push(format!(
+                    "{}: note unreadable, {suppressed} registration(s) held back",
+                    pair.dev
+                ));
+            }
+
+            // Only when this pass changed something: the merge takes the
+            // note's lock and reads the file past the stat cache, which an
+            // idle pass has no reason to pay - and an empty difference can
+            // never change what is merged.
+            if apply
+                && owned != owned_before
+                && !self.save_owned_merged(&pair.dev, &owned_before, &owned)
+            {
+                // The note does not name what was just registered, and an
+                // entry no note names would never be removed again. Take the
+                // fresh ones back out; the next pass retries them once the
+                // note can be written.
+                let unnoted: Vec<Mac> = owned.difference(&owned_before).copied().collect();
+                for mac in &unnoted {
+                    let _ = sock.set_self_fdb(dev_index, mac, false);
+                }
+                added -= unnoted.len();
+                eprintln!(
+                    "warning: {}: note write failed, unregistered {} fresh \
+                     address(es) for retry",
+                    pair.dev,
+                    unnoted.len()
+                );
+                timings.failures.push(format!(
+                    "{}: note write failed, {} registration(s) rolled back",
+                    pair.dev,
+                    unnoted.len()
+                ));
             }
 
             // Unsorted on purpose: outside --status only its length is read,
@@ -943,8 +1091,6 @@ impl Syncer {
         timings.pairs = mark.elapsed();
         timings.added = reports.iter().map(|r| r.added).sum();
         timings.removed = reports.iter().map(|r| r.removed).sum();
-        // The caller's reading of /sys belongs to this pass even though it
-        // happened before the clock below started.
         timings.total = topo_load + started.elapsed();
         self.timings = timings;
         Ok(reports)
@@ -994,12 +1140,8 @@ impl Syncer {
         if self.dry_run {
             return Ok(Urgency::Now);
         }
-        // A deletion is not acted on here, but it is a reason to look: it may
-        // have been the last copy of an address that is now to come out, and
-        // only a full dump can tell. It is never a reason to hurry - an
-        // ageing table produces these in bursts of hundreds, and a
-        // registration that outlives its guest by a few seconds costs nothing
-        // but a filter slot.
+        // A deletion is a reason to look, never to hurry: a registration that
+        // outlives its guest by a few seconds costs nothing but a filter slot.
         let mut urgency = if events
             .iter()
             .any(|(kind, _)| *kind == crate::netlink::RTM_DELNEIGH)
@@ -1022,34 +1164,18 @@ impl Syncer {
         // Where each uplink sits in its bridge, and which addresses may never
         // be registered for it, are properties of the topology - the same for
         // every entry in the batch. Worked out once instead of once per entry
-        // per pair, and taken from the very rule the full pass uses: the fast
-        // path once carried its own abbreviation and registered a guest VF's
-        // own address, which sends that guest's traffic past it.
+        // per pair, and taken from the very rule the full pass uses - the
+        // doc on exclusions says why there may be no second spelling.
         //
         // The virtual functions' addresses come carried from the last pass
         // where they fit, else they are asked for now - never assumed empty.
-        let mut pfs: Vec<u32> = Vec::new();
-        for pair in &self.pairs {
-            let Some(dev) = topo.index_of(&pair.dev) else {
-                continue;
-            };
-            for pf in physical_functions(topo, dev) {
-                if topo.at(pf).is_some() && !pfs.contains(&pf) {
-                    pfs.push(pf);
-                }
-            }
-        }
-        // The same rule as the pass, from the same flag. The fast path used
-        // to reuse the carried answer whenever the physical functions
-        // matched, which is not the question: the addresses change without
-        // the list of functions changing at all.
-        //
+        let pfs = Self::live_pfs(topo, self.pairs.iter().map(|p| p.dev.as_str()));
         // Whether the answer is carried is kept, because a carried answer is
         // only good enough to shrink on: growing consults the driver first,
         // below.
-        let (vf_macs, vf_carried) = match (&self.carried_vf, self.vf_stale) {
-            (Some((for_pfs, kept)), false) if *for_pfs == pfs => (kept.clone(), true),
-            _ => {
+        let (vf_macs, vf_carried) = match self.carried_vf_for(&pfs) {
+            Some(kept) => (kept, true),
+            None => {
                 let fresh = sock.vf_macs_of(&pfs)?;
                 self.remember_vf(pfs.clone(), fresh.clone());
                 (fresh, false)
@@ -1061,7 +1187,10 @@ impl Syncer {
             .filter_map(|p| {
                 let dev = topo.index_of(&p.dev)?;
                 let bridge = topo.index_of(&p.bridge)?;
-                let port = topo.uplink_port(dev, bridge);
+                // A pair whose device is not under its bridge right now is
+                // skipped here too; the link event that detached it buys the
+                // full pass, which says so out loud.
+                let port = topo.uplink_port(dev, bridge)?;
                 let skip = self.exclusions(topo, dev, port, &vf_macs);
                 Some(FastPair {
                     dev: p.dev.clone(),
@@ -1069,6 +1198,8 @@ impl Syncer {
                     index: dev,
                     port,
                     skip,
+                    reflected: crate::hash::set(),
+                    vf_own: Self::vf_reported(topo, dev, &vf_macs),
                 })
             })
             .collect();
@@ -1095,7 +1226,7 @@ impl Syncer {
             };
             // For the rest of this batch these are wire addresses - the whole
             // batch is one moment, and in it the wire has the last word.
-            fp.skip.extend(macs.iter().copied());
+            fp.reflected.extend(macs.iter().copied());
             // Nothing of ours among them is the ordinary case on a busy
             // segment: every address the switch carries is learnt here
             // sooner or later. Establishing it without copying the record of
@@ -1195,7 +1326,7 @@ impl Syncer {
                 if *kind != crate::netlink::RTM_NEWNEIGH {
                     continue;
                 }
-                self.fast_add(sock, topo, entry, &pairs, &mut would, false);
+                self.fast_add(sock, topo, entry, &pairs, &mut would, FastPhase::Decide);
             }
             // An address already registered and ours was vetted by the
             // fresh answer that let it in; re-learning it grows nothing.
@@ -1220,17 +1351,7 @@ impl Syncer {
                 // answer. The unasked functions keep their carried entries,
                 // merged back under the full function list, so the carry
                 // contract the next pass compares against still holds.
-                let mut ask: Vec<u32> = Vec::new();
-                for dev in would.keys() {
-                    let Some(idx) = topo.index_of(dev) else {
-                        continue;
-                    };
-                    for pf in physical_functions(topo, idx) {
-                        if topo.at(pf).is_some() && !ask.contains(&pf) {
-                            ask.push(pf);
-                        }
-                    }
-                }
+                let ask = Self::live_pfs(topo, would.keys().map(String::as_str));
                 let mut fresh: Vec<(u32, Mac)> = vf_macs
                     .iter()
                     .filter(|(pf, _)| !ask.contains(pf))
@@ -1240,10 +1361,9 @@ impl Syncer {
                 self.remember_vf(pfs.clone(), fresh.clone());
                 for fp in &mut pairs {
                     fp.skip = self.exclusions(topo, fp.index, fp.port, &fresh);
-                    // Within this batch the wire keeps the last word.
-                    if let Some(macs) = reflected.get(&fp.dev) {
-                        fp.skip.extend(macs.iter().copied());
-                    }
+                    fp.vf_own = Self::vf_reported(topo, fp.index, &fresh);
+                    // fp.reflected stands: within this batch the wire keeps
+                    // the last word, fresh answer or not.
                 }
                 // The catch this exists for is rare enough to be told about.
                 for (dev, macs) in &would {
@@ -1269,12 +1389,34 @@ impl Syncer {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
             }
-            if self.fast_add(sock, topo, entry, &pairs, &mut registered, true) {
+            if self.fast_add(
+                sock,
+                topo,
+                entry,
+                &pairs,
+                &mut registered,
+                FastPhase::Commit,
+            ) {
                 urgency = Urgency::Now;
             }
         }
         for (dev, added) in registered {
-            self.append_owned(&dev, &added);
+            if !self.append_owned(&dev, &added) {
+                // The note does not name them, and an entry no note names
+                // would never be removed again. Take them back out; the pass
+                // this buys retries them once the note can be written.
+                if let Some(fp) = pairs.iter().find(|f| f.dev == dev) {
+                    for mac in &added {
+                        let _ = sock.set_self_fdb(fp.index, mac, false);
+                    }
+                }
+                eprintln!(
+                    "warning: {dev}: note write failed, unregistered {} fresh \
+                     address(es) for retry",
+                    added.len()
+                );
+                urgency = Urgency::Now;
+            }
         }
         Ok(urgency)
     }
@@ -1284,9 +1426,8 @@ impl Syncer {
     /// that concerns none of the pairs returns false, and a batch made
     /// entirely of those does not earn a pass.
     ///
-    /// With `commit` false nothing is written: what would have been
-    /// registered lands in `registered` and the filter is left alone. That
-    /// is the decide half of fast_apply's grow-only driver refresh.
+    /// In the decide phase nothing is written: what would have been
+    /// registered lands in `registered` and the filter is left alone.
     fn fast_add(
         &self,
         sock: &mut dyn FdbWriter,
@@ -1294,7 +1435,7 @@ impl Syncer {
         entry: &FdbEntry,
         pairs: &[FastPair],
         registered: &mut Map<String, Vec<Mac>>,
-        commit: bool,
+        phase: FastPhase,
     ) -> bool {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
             return false;
@@ -1308,8 +1449,21 @@ impl Syncer {
         let mut ours = false;
         for fp in pairs {
             if fp.skip.contains(&entry.mac) {
-                continue; // excluded, the host's own, a VF's, or out on the wire
+                // A hit owed only to the carried driver answer may be stale
+                // news - a VF address freed without any link message, on a
+                // down PF or over the ixgbe/i40e mailbox. In the decide
+                // phase such a hit becomes a candidate, so the fresh
+                // question settles it; every other refusal stays passless,
+                // which is what keeps the wire-load optimisation standing.
+                if phase == FastPhase::Decide && fp.vf_own.contains(&entry.mac) {
+                    registered
+                        .entry(fp.dev.clone())
+                        .or_default()
+                        .push(entry.mac);
+                }
+                continue; // excluded, the host's own, or a VF's
             }
+
             // What the last full pass saw out on the wire. An address on the
             // wire in one VLAN and behind the bridge in another must not flap
             // into the filter on every learning event.
@@ -1337,6 +1491,18 @@ impl Syncer {
             if entry.ifindex == fp.port {
                 continue; // on the wire; handled before any of this
             }
+            // An inner learn of an address this very batch saw on the wire:
+            // the wire has the last word, so it is not registered - but the
+            // batch counts as ours. The kernel's end state may be "behind
+            // the bridge" (wire first, inner learn later in the same drained
+            // burst), and a refusal that bought no pass would suppress its
+            // own correction - the same rule as the carried wire set above.
+            // The wire learn itself took the port exit a line up, so a batch
+            // that is wire and nothing else stays passless.
+            if fp.reflected.contains(&entry.mac) {
+                ours = true;
+                continue;
+            }
             if master != fp.bridge {
                 // only bridges stacked on the uplink bridge are of interest
                 let Some(master_link) = topo.at(master) else {
@@ -1354,7 +1520,7 @@ impl Syncer {
                 continue;
             }
             ours = true;
-            if !commit {
+            if phase == FastPhase::Decide {
                 registered
                     .entry(fp.dev.clone())
                     .or_default()
@@ -1387,7 +1553,7 @@ impl Syncer {
     /// every address this daemon registered, and some of them belong to
     /// devices that have since stopped being an uplink.
     pub fn flush(&mut self, sock: &mut dyn FdbWriter) -> io::Result<bool> {
-        let topo = Topology::from_links(&sock.dump_links()?);
+        let topo = Topology::from_links(sock.dump_links()?);
         let mut clean = true;
         // A directory that cannot be listed fails the flush outright: the
         // promise here is "everything comes back out", and claiming it for
@@ -1395,6 +1561,15 @@ impl Syncer {
         // acts on.
         for dev in self.noted_devices()? {
             if self.dry_run {
+                // The preview has to give the same answer the real flush
+                // would: an unreadable note reads as the empty set, and
+                // "would remove 0" with exit 0 is the opposite of the
+                // refusal the real run answers this state with.
+                if !self.note_is_readable(&dev) {
+                    println!("{dev}: note unreadable, a real flush would fail here");
+                    clean = false;
+                    continue;
+                }
                 let owned = self.load_owned(&dev);
                 println!("{dev}: would remove {} address(es)", owned.len());
                 continue;

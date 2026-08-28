@@ -318,8 +318,6 @@ fn read_conf(opts: &mut Options, text: &str) {
             },
             "EXTRA" => opts.extra.extend(addresses(value)),
             "EXCLUDE" => opts.exclude.extend(addresses(value)),
-            // Silently ignoring a misspelt key means the setting somebody
-            // wrote down never takes effect and nothing ever says so.
             other => eprintln!("warning: {CONF}: unknown setting, ignored: {other}"),
         }
     }
@@ -429,12 +427,14 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
     Ok(())
 }
 
-fn resolve_pairs(
-    topo: &Topology,
-    opts: &Options,
-    allow_empty: bool,
-    strict: bool,
-) -> Result<Vec<Pair>, String> {
+fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
+    // Flush and status must not require a pair to exist: the state they
+    // inspect - notes and filter entries - outlives the pair on purpose,
+    // and "the bridge is gone" is exactly when --flush is reached for. The
+    // daemon may start before its interfaces exist and waits for them.
+    let allow_empty = matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status);
+    // Strict only where a person is at the keyboard to fix the typo.
+    let strict = matches!(opts.mode, Mode::Once | Mode::Check);
     let mut pairs = Vec::new();
     if opts.pairs.is_empty() {
         let (found, skipped) = topo.autodetect();
@@ -514,13 +514,7 @@ fn pair_names(pairs: &[Pair]) -> Vec<String> {
 
 /// Can this driver take entries at all? Only half an answer: it proves the
 /// kernel accepted the address, not that the hardware acts on it.
-fn check(
-    sock: &mut Socket,
-    topo: &Topology,
-    pairs: &[Pair],
-    syncer: &Syncer,
-    dry_run: bool,
-) -> bool {
+fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) -> bool {
     let mut ok = true;
     for pair in pairs {
         let Some(link) = topo.get(&pair.dev) else {
@@ -537,18 +531,6 @@ fn check(
         probe[0] = 0x02;
         probe[5] ^= 0x5a;
         let driver = link.driver.clone().unwrap_or_default();
-
-        // The check *is* a write: it proves the driver accepts an entry by
-        // giving it one and taking it back. A dry run has nothing to probe
-        // with, and pretending otherwise would print an answer it never had.
-        if dry_run {
-            println!(
-                "{} ({driver}): skipped - the check works by writing a probe entry, \
-                 which --dry-run rules out",
-                pair.dev
-            );
-            continue;
-        }
 
         // Noted before it is written: a check killed between the write and
         // the take-back then leaves an OWNED entry, which the daemon's next
@@ -667,7 +649,7 @@ fn read_topology(sock: &mut Socket) -> Result<Topology, String> {
     let links = sock
         .dump_links()
         .map_err(|e| format!("cannot ask the kernel about the interfaces: {e}"))?;
-    Ok(Topology::from_links(&links))
+    Ok(Topology::from_links(links))
 }
 
 /// Everything the daemon loop reaches for outside itself: the clock, the
@@ -696,6 +678,9 @@ trait World: sync::FdbWriter {
     fn wait(&mut self, millis: i32) -> std::io::Result<bool>;
     fn recv_events(&mut self) -> std::io::Result<netlink::Events>;
     fn read_topology(&mut self) -> Result<Topology, String>;
+    /// What the cards report their unicast filters hold - one devlink
+    /// reading for the whole list, answered per uplink.
+    fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)>;
 }
 
 /// The world as it actually is: the command socket, the subscription, the
@@ -736,6 +721,9 @@ impl World for Live {
     fn read_topology(&mut self) -> Result<Topology, String> {
         read_topology(&mut self.sock)
     }
+    fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)> {
+        capacities_via_devlink(devs)
+    }
 }
 
 /// When the next pass is due, when the picture is read again regardless of
@@ -765,7 +753,12 @@ impl Schedule {
     fn new(now: Instant, interval: Duration) -> Self {
         Self {
             next_full: now,
-            next_refresh: now,
+            // A whole interval out, not now: the first pass is the catch-up
+            // after a restart and calls itself "start" - a refresh firing on
+            // the first iteration used to rename it "timed", and the
+            // canary's one job is that "timed" means the timer caught
+            // something.
+            next_refresh: now + interval,
             last_pass: now - interval,
             trigger: "start",
             interval,
@@ -776,11 +769,14 @@ impl Schedule {
     /// whose notification never arrived included. It believes nothing it was
     /// told, and brings the pass forward so that what it reads is acted on.
     /// The caller invalidates what it holds; saying so is not this type's job.
+    /// The trigger name is left alone: after a quiet interval it already
+    /// says "timed" (completed() set the default), and a pending batch
+    /// label must not be stolen - the pass does that batch's work too, and
+    /// a correction reported as `[timed]` is the canary's false alarm.
     fn refresh_due(&mut self, now: Instant) -> bool {
         if now < self.next_refresh {
             return false;
         }
-        self.trigger = "timed";
         self.next_full = self.next_full.min(now);
         self.next_refresh = now + self.interval;
         true
@@ -793,9 +789,11 @@ impl Schedule {
     /// A pass that could not run - no picture, or reconciliation refused. Come
     /// back soon rather than sitting out the whole interval: one refused dump
     /// used to cost five minutes of not looking at the host at all.
+    /// The retried pass keeps the name of the pass that failed - a
+    /// forwarding change whose pass hit a transient rtnl error is still a
+    /// forwarding change five seconds later.
     fn retry_soon(&mut self, now: Instant) {
         self.next_full = now + RETRY_AFTER;
-        self.trigger = "timed";
     }
 
     /// A pass that ran. The next belongs to the timer until something claims
@@ -835,6 +833,11 @@ impl Schedule {
 struct Picture {
     held: Option<Topology>,
     stale: bool,
+    /// Whether a read replaced the picture since the last pass consumed one.
+    /// The pass needs this to know that autodetection's answer may have
+    /// changed: a batch reads the fresh picture *before* the pass it buys,
+    /// so by the time that pass runs, needs_reading() is already false.
+    replaced_since_pass: bool,
     /// What reading the picture cost when an event read it, so the pass that
     /// uses it can account for it. Without this a pass whose topology was read
     /// moments earlier reports "0.000 ms" for it, which reads as "not read at
@@ -847,6 +850,7 @@ impl Picture {
         Self {
             held: None,
             stale: true,
+            replaced_since_pass: false,
             carried_load: Duration::ZERO,
         }
     }
@@ -864,6 +868,7 @@ impl Picture {
         let started = world.now();
         let fresh = world.read_topology()?;
         self.stale = false;
+        self.replaced_since_pass = true;
         Ok((started.elapsed(), self.held.replace(fresh)))
     }
 
@@ -872,6 +877,7 @@ impl Picture {
     /// was held and the caller schedules the retry. The cost reported is the
     /// fresh read's, superseding anything an event carried.
     fn for_pass<W: World>(&mut self, world: &mut W) -> Duration {
+        self.replaced_since_pass = false;
         let carried = std::mem::take(&mut self.carried_load);
         if !self.needs_reading() {
             return carried;
@@ -907,6 +913,14 @@ impl Picture {
     }
 }
 
+/// "Believe nothing carried": the picture and the driver's VF answer go
+/// stale together, always - the history knows exactly the bug where one
+/// of the two was forgotten on one path.
+fn distrust_carried(picture: &mut Picture, syncer: &mut Syncer) {
+    picture.invalidate();
+    syncer.vf_stale = true;
+}
+
 /// The daemon: answer batches through the fast path, keep the pass rate
 /// bounded, and never trust a picture longer than the interval. Everything
 /// here is a decision about time or about what the world said, which is why
@@ -916,14 +930,16 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
     let mut said_empty = false;
     let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
     let mut picture = Picture::new();
+    // The threshold may move when a pair adopted at runtime reports its
+    // card's capacity; the operator's --max never moves.
+    let mut max_macs = opts.max_macs;
 
     loop {
         if world.stopping() {
             break;
         }
         if schedule.refresh_due(world.now()) {
-            picture.invalidate();
-            syncer.vf_stale = true;
+            distrust_carried(&mut picture, syncer);
         }
         if schedule.pass_due(world.now()) {
             match run_pass(
@@ -931,14 +947,11 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                 syncer,
                 &mut picture,
                 opts,
+                &mut max_macs,
                 schedule.trigger,
                 &mut said_empty,
             ) {
                 Pass::Done => schedule.completed(world.now()),
-                // One failed pass is no reason to give up: the next is seconds
-                // away and starts from the kernel's state again. It used to
-                // fall through to the full interval, which on a quiet host was
-                // five minutes of not looking after a transient rtnl failure.
                 Pass::Refused => {
                     schedule.retry_soon(world.now());
                     continue;
@@ -947,13 +960,18 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
         }
 
         let due = schedule.wait_for(world.now());
-        let woken = match world.wait(due.as_millis().min(i32::MAX as u128) as i32) {
+        // Rounded up, not truncated: poll sleeps at most what it is told,
+        // so a truncated wait woke just before the deadline and the loop
+        // then spun through poll(0) for the last millisecond. Oversleeping
+        // by under a millisecond is harmless - the deadline is re-checked
+        // at the top.
+        let millis = due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+        let woken = match world.wait(millis) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("warning: waiting for events failed: {e}");
                 schedule.at_once(world.now(), "recovery");
-                picture.invalidate();
-                syncer.vf_stale = true;
+                distrust_carried(&mut picture, syncer);
                 continue;
             }
         };
@@ -971,8 +989,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
             Err(e) => {
                 eprintln!("warning: lost neighbour notifications: {e}");
                 schedule.at_once(world.now(), "lost events");
-                picture.invalidate();
-                syncer.vf_stale = true;
+                distrust_carried(&mut picture, syncer);
                 continue;
             }
         };
@@ -983,7 +1000,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
             &mut picture,
             &events,
             schedule.last_pass,
-            opts.max_macs,
+            max_macs,
         ) {
             schedule.bring_forward(due, trigger);
         }
@@ -1004,13 +1021,16 @@ fn run_pass<W: World>(
     syncer: &mut Syncer,
     picture: &mut Picture,
     opts: &Options,
+    max_macs: &mut usize,
     trigger: &'static str,
     said_empty: &mut bool,
 ) -> Pass {
     // One reading serves both the autodetection and the reconciliation: they
     // ask about the same moment, and reading it twice was work nobody asked
-    // for.
-    let reloaded = picture.needs_reading();
+    // for. "Reloaded" includes a picture the batch read moments ago: the
+    // batch reads *before* the pass it buys, so needs_reading() alone would
+    // say false here and a bridge built at runtime waited for the timer.
+    let reloaded = picture.needs_reading() || picture.replaced_since_pass;
     let topo_load = picture.for_pass(world);
 
     // Autodetection is redone every pass. A NIC that gets its VFs later, or a
@@ -1018,7 +1038,8 @@ fn run_pass<W: World>(
     // starting before the network is up must not turn into a crash loop. But
     // it is a pure function of the picture, so on a pass that carried the
     // picture unchanged its answer cannot have changed either: a new NIC or
-    // bridge arrives as a link message, which is exactly what sets `reloaded`.
+    // bridge arrives as a link message, whose batch replaces the picture -
+    // which is exactly what sets `reloaded`.
     let auto = opts.pairs.is_empty();
     if let (true, true, Some(topo)) = (auto, reloaded, picture.held.as_ref()) {
         let found: Vec<Pair> = topo
@@ -1033,6 +1054,19 @@ fn run_pass<W: World>(
                 *said_empty = false;
             }
             syncer.pairs = found;
+            // A pair adopted at runtime brings its card's capacity with it:
+            // the start-time question never saw this uplink, and a daemon
+            // that started before its bridges - the "waiting for an SR-IOV
+            // interface" flow - would otherwise warn against the assumed
+            // number for the rest of its life. The operator's --max still
+            // wins; the gate is the same one.
+            if !opts.max_macs_set && !syncer.pairs.is_empty() {
+                let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
+                let answers = world.filter_capacities(&devs);
+                if let Some(v) = adopt_reported_capacity(answers, opts.verbose, *max_macs) {
+                    *max_macs = v;
+                }
+            }
         }
     }
     if syncer.pairs.is_empty() && !*said_empty {
@@ -1040,14 +1074,13 @@ fn run_pass<W: World>(
         *said_empty = true;
     }
 
-    // Nothing to work from. Fail closed and let the caller come back soon:
-    // one refused dump used to cost five minutes of not looking at the host.
+    // Nothing to work from. Fail closed; the caller comes back soon.
     let Some(topo) = picture.held.as_ref() else {
         return Pass::Refused;
     };
     match syncer.reconcile(world, true, topo, topo_load) {
         Ok(reports) => {
-            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, trigger);
+            report_changes(&reports, opts.dry_run, *max_macs, opts.verbose, trigger);
             if opts.timings {
                 note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
             }
@@ -1081,9 +1114,9 @@ fn handle_batch<W: World>(
     if events.links_changed {
         picture.invalidate();
     }
-    // Not the trigger name: a batch carrying both kinds is reported as a
-    // forwarding change, and would otherwise keep a topology that the link
-    // messages in the same batch just invalidated.
+    // The invalidation above keys on links_changed, not on this name: a batch
+    // carrying both kinds is called a forwarding change, and keying on the
+    // name would have kept a topology its own link messages just invalidated.
     let trigger = if events.fdb.is_empty() {
         "interface change"
     } else {
@@ -1155,53 +1188,80 @@ fn handle_batch<W: World>(
     Some(((last_pass + wait).max(world.now()), trigger))
 }
 
-/// Take the smallest capacity the uplinks report as the threshold to warn at.
+/// One uplink's capacity answer: what the card says, that it says
+/// nothing, or why asking failed - the last two look identical from the
+/// threshold and are not the same bug.
+type CapacityAnswer = Result<Option<u32>, String>;
+
+/// One devlink reading for the whole list, answered per uplink. The
+/// answer is device-independent; asking per pair re-ran the identical
+/// dump and discarded it, from the second pair on.
+fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAnswer)> {
+    let read = devlink::read();
+    devs.iter()
+        .map(|d| {
+            let answer = match &read {
+                Ok(Some(caps)) => Ok(caps.for_netdev(d)),
+                Ok(None) => Ok(None), // no devlink on this kernel
+                Err(e) => Err(e.clone()),
+            };
+            (d.clone(), answer)
+        })
+        .collect()
+}
+
+/// Take the smallest capacity the uplinks report as the threshold to warn
+/// at. The smallest, because one number governs every uplink and the
+/// filter that fills first is the one that drops addresses. A card that
+/// says nothing changes nothing; so does a number this program would
+/// refuse from a person, because a driver is not more trustworthy than an
+/// operator - and it must not veto another card's good answer either.
 ///
-/// The smallest, because one number governs every uplink and the filter that
-/// fills first is the one that drops addresses. A card that says nothing
-/// leaves the default where it is; so does a number this program would refuse
-/// from a person, because a driver is not more trustworthy than an operator.
-fn adopt_reported_capacity(opts: &mut Options, pairs: &[Pair]) {
-    let mut answers = Vec::new();
-    for p in pairs {
-        match devlink::filter_capacity(&p.dev) {
-            Ok(Some(v)) => answers.push((p.dev.clone(), v)),
+/// `None` means the assumed threshold stands. The `--max`/`MAX_MACS` gate
+/// lives at the call sites: an operator's instruction is never moved.
+fn adopt_reported_capacity(
+    answers: Vec<(String, CapacityAnswer)>,
+    verbose: bool,
+    assumed: usize,
+) -> Option<usize> {
+    let mut usable: Vec<(String, usize)> = Vec::new();
+    for (dev, answer) in answers {
+        match answer {
+            Ok(Some(v)) => match clamp_max_macs(v as usize) {
+                Ok(v) => usable.push((dev, v)),
+                Err(_) => {
+                    if verbose {
+                        note!("{dev}: reported capacity {v} is unusable, ignored");
+                    }
+                }
+            },
             Ok(None) => {
-                if opts.verbose {
-                    note!(
-                        "{}: no filter capacity reported; keeping the assumed {}",
-                        p.dev,
-                        opts.max_macs
-                    );
+                if verbose {
+                    note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
                 }
             }
             Err(e) => {
-                if opts.verbose {
-                    note!("{}: could not ask for the filter capacity: {e}", p.dev);
+                if verbose {
+                    note!("{dev}: could not ask for the filter capacity: {e}");
                 }
             }
         }
     }
-    let reported = answers.into_iter().min_by_key(|(_, v)| *v);
-    let Some((dev, value)) = reported else { return };
-    let Ok(value) = clamp_max_macs(value as usize) else {
-        return;
-    };
-    if value == opts.max_macs {
+    let (dev, value) = usable.into_iter().min_by_key(|(_, v)| *v)?;
+    if value == assumed {
         // Worth saying only to somebody who asked what was skipped: the
         // number moved nowhere, but that it was *asked for* is the
         // difference between a card that agrees and a card that is silent.
-        if opts.verbose {
+        if verbose {
             note!("{dev} says its filter holds {value} addresses, which is what was assumed");
         }
-        return;
+        return None;
     }
     note!(
         "{dev} says its filter holds {value} addresses; warning above that \
-         instead of the assumed {}",
-        opts.max_macs
+         instead of the assumed {assumed}"
     );
-    opts.max_macs = value;
+    Some(value)
 }
 
 fn run() -> Result<bool, String> {
@@ -1214,28 +1274,23 @@ fn run() -> Result<bool, String> {
     let topo_started = Instant::now();
     let topo = read_topology(&mut sock)?;
     let topo_load = topo_started.elapsed();
-    // Flush and status must not require a pair to exist: the state they
-    // inspect - notes and filter entries - outlives the pair on purpose, and
-    // "the bridge is gone" is exactly when --flush is reached for.
-    let pairs = resolve_pairs(
-        &topo,
-        &opts,
-        matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status),
-        // Strict only where a person is at the keyboard to fix the typo.
-        matches!(opts.mode, Mode::Once | Mode::Check),
-    )?;
+    let pairs = resolve_pairs(&topo, &opts)?;
 
     // What the cards say their filters hold. Only when the operator has not
     // said: a number from the hardware is better than this program's constant,
     // and worse than an instruction.
     if !opts.max_macs_set && matches!(opts.mode, Mode::Daemon | Mode::Once | Mode::Status) {
-        adopt_reported_capacity(&mut opts, &pairs);
+        let devs: Vec<String> = pairs.iter().map(|p| p.dev.clone()).collect();
+        if let Some(v) =
+            adopt_reported_capacity(capacities_via_devlink(&devs), opts.verbose, opts.max_macs)
+        {
+            opts.max_macs = v;
+        }
     }
 
     if opts.mode == Mode::Check {
-        // The check works by writing a probe entry and taking it back; there
-        // is nothing it can do without writing. Saying "fine" for having
-        // skipped every pair is the one answer it must not give.
+        // Saying "fine" for having skipped every pair is the one answer
+        // --check must not give.
         if opts.dry_run {
             return Err("--check works by writing a probe entry, which --dry-run \
                         rules out - run it without --dry-run"
@@ -1244,7 +1299,7 @@ fn run() -> Result<bool, String> {
         // The probe bookkeeping wants the same notes the daemon keeps -
         // that is what makes a killed check healable at all.
         let syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
-        return Ok(check(&mut sock, &topo, &pairs, &syncer, false));
+        return Ok(check(&mut sock, &topo, &pairs, &syncer));
     }
 
     let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
@@ -1323,12 +1378,8 @@ fn run() -> Result<bool, String> {
             let mut world = Live { sock, mon };
             daemon_loop(&mut world, &mut syncer, &opts);
 
-            // Deliberately without a flush. Everything registered stays where
-            // it is, and the notes in /run stay with it, so the daemon can be
-            // restarted without a single guest behind the bridge noticing.
-            // Say how much that is, so nobody has to wonder what was left
-            // behind - and so `--flush` is an obvious next step for anyone
-            // who wants the card cleared.
+            // Deliberately without a flush - catch_signals says why. Say how
+            // much is left behind, so nobody has to wonder.
             let held: usize = syncer.registered();
             note!(
                 "sriov-mac-sync: stopping; {held} address(es) left registered on purpose \
@@ -1355,6 +1406,84 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// The trigger labels are what bench/trial.py's quiescence check and
+    /// the [timed] canary read; internals.md promises recovery passes name
+    /// themselves. Nothing pinned the renaming rules before, and a refresh
+    /// or retry that stole a batch's label made the canary cry wolf.
+    #[test]
+    fn the_trigger_labels_survive_what_the_schedule_does() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut s = Schedule::new(now, interval);
+        assert_eq!(s.trigger, "start", "the first pass is the restart catch-up");
+        assert!(
+            !s.refresh_due(now),
+            "a refresh on the very first iteration would rename [start]"
+        );
+        s.completed(now);
+        assert_eq!(s.trigger, "timed", "the default between events");
+        s.bring_forward(now, "forwarding change");
+        assert!(s.refresh_due(now + interval));
+        assert_eq!(
+            s.trigger, "forwarding change",
+            "the refresh stole the batch's label"
+        );
+        s.retry_soon(now);
+        assert_eq!(
+            s.trigger, "forwarding change",
+            "the retried pass forgot whose pass it was"
+        );
+        s.at_once(now, "recovery");
+        assert_eq!(s.trigger, "recovery");
+        s.completed(now);
+        assert_eq!(s.trigger, "timed");
+    }
+
+    /// The capacity policy, over answers rather than over hardware: the
+    /// smallest usable answer wins, an unusable one is dropped rather than
+    /// allowed to veto, silence and failure leave the default standing.
+    #[test]
+    fn the_reported_capacity_policy() {
+        let dev = |d: &str, a: CapacityAnswer| (d.to_string(), a);
+        // The smallest usable answer wins across uplinks.
+        assert_eq!(
+            adopt_reported_capacity(
+                vec![dev("nic0", Ok(Some(256))), dev("nic1", Ok(Some(64)))],
+                false,
+                128
+            ),
+            Some(64)
+        );
+        // A card reporting nonsense is ignored, not a veto on the good one.
+        assert_eq!(
+            adopt_reported_capacity(
+                vec![dev("nic0", Ok(Some(0))), dev("nic1", Ok(Some(64)))],
+                false,
+                128
+            ),
+            Some(64)
+        );
+        // Nothing usable at all leaves the default standing.
+        assert_eq!(
+            adopt_reported_capacity(vec![dev("nic0", Ok(Some(0)))], false, 128),
+            None
+        );
+        // Agreement is not a change.
+        assert_eq!(
+            adopt_reported_capacity(vec![dev("nic0", Ok(Some(128)))], false, 128),
+            None
+        );
+        // Silence and failure leave the default standing.
+        assert_eq!(
+            adopt_reported_capacity(
+                vec![dev("nic0", Ok(None)), dev("nic1", Err("no".into()))],
+                false,
+                128
+            ),
+            None
+        );
+    }
+
     mod loop_tests {
         use super::*;
         use crate::netlink::{Events, RTM_DELNEIGH, RTM_NEWNEIGH};
@@ -1374,11 +1503,20 @@ mod tests {
             /// stands in for a receive error.
             script: VecDeque<(Duration, Result<Events, i32>)>,
             stop_at: Duration,
+            /// Until this offset the topology is a bare host with nothing
+            /// autodetectable - the world before a bridge was built.
+            bare_until: Duration,
             topo_fails: bool,
             topo_calls: usize,
             fdb: FakeSock,
             /// when each full pass ran - the dump is what a pass is
             passes: Vec<Duration>,
+            /// errno the next wait() answers with, taken once
+            fail_wait: Option<i32>,
+            /// what filter_capacities answers, per netdev
+            capacities: crate::hash::Map<String, u32>,
+            /// each list of devices it was asked about
+            capacity_asks: Vec<Vec<String>>,
         }
 
         impl FakeWorld {
@@ -1388,10 +1526,14 @@ mod tests {
                     offset: Duration::ZERO,
                     script: VecDeque::new(),
                     stop_at: Duration::from_secs(stop_at_secs),
+                    bare_until: Duration::ZERO,
                     topo_fails: false,
                     topo_calls: 0,
                     fdb: FakeSock::default(),
                     passes: Vec::new(),
+                    fail_wait: None,
+                    capacities: crate::hash::map(),
+                    capacity_asks: Vec::new(),
                 }
             }
             fn at(mut self, secs: u64, ev: Result<Events, i32>) -> Self {
@@ -1429,6 +1571,9 @@ mod tests {
                 self.offset >= self.stop_at
             }
             fn wait(&mut self, millis: i32) -> std::io::Result<bool> {
+                if let Some(errno) = self.fail_wait.take() {
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
                 let until = self.offset + Duration::from_millis(millis.max(0) as u64);
                 if let Some((at, _)) = self.script.front() {
                     if *at <= until {
@@ -1446,10 +1591,21 @@ mod tests {
                     None => Ok(Events::default()),
                 }
             }
+            fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)> {
+                self.capacity_asks.push(devs.to_vec());
+                devs.iter()
+                    .map(|d| (d.clone(), Ok(self.capacities.get(d).copied())))
+                    .collect()
+            }
             fn read_topology(&mut self) -> Result<Topology, String> {
                 self.topo_calls += 1;
                 if self.topo_fails {
                     Err("no picture today".into())
+                } else if self.offset < self.bare_until {
+                    Ok(crate::sysfs::fixture::Builder::new()
+                        .add("nic1", 2, Some(mac(1)))
+                        .vfs(1)
+                        .build())
                 } else {
                     Ok(host(mac(1)))
                 }
@@ -1498,6 +1654,144 @@ mod tests {
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 10, 20],
                 "the pass has to run at the interval, and only then"
+            );
+        }
+
+        /// A bridge built at runtime - the hotplug flow the "waiting for an
+        /// SR-IOV interface" note promises - is adopted by the prompt pass
+        /// its own link event buys, not by the next timed refresh. The batch
+        /// reads the fresh picture *before* the pass it buys, so the pass
+        /// cannot tell by needs_reading() alone; replaced_since_pass is what
+        /// carries the news. Without it, a pair appearing at runtime waited
+        /// out the whole interval - here 300 s - while the loop had already
+        /// run a pass for exactly that event.
+        #[test]
+        fn a_pair_appearing_at_runtime_is_adopted_by_the_prompt_pass() {
+            let mut opts = Options {
+                interval: 300,
+                ..Default::default()
+            };
+            opts.mode = Mode::Daemon;
+            let mut syncer = Syncer::new(Vec::new(), scratch("hotplug"));
+            let mut world = FakeWorld::new(5);
+            world.bare_until = Duration::from_secs(1);
+            world.script.push_back((
+                Duration::from_secs(2),
+                Ok(Events {
+                    fdb: Vec::new(),
+                    links_changed: true,
+                    changed_links: vec![2],
+                }),
+            ));
+            daemon_loop(&mut world, &mut syncer, &opts);
+            let names: Vec<String> = syncer
+                .pairs
+                .iter()
+                .map(|p| format!("{}:{}", p.dev, p.bridge))
+                .collect();
+            assert!(
+                world.passes.iter().any(|d| secs(*d) == 2),
+                "the link event did not buy a prompt pass"
+            );
+            assert!(
+                names.contains(&"nic1:vmbr1".to_string()),
+                "the prompt pass did not adopt the new pair (got {names:?}); \
+                 it would have waited for the timer"
+            );
+        }
+
+        /// The timed refresh's documented job is "it believes nothing it
+        /// was told" - and until now nothing asserted that it actually
+        /// distrusts both carried things. Deleting the distrust left every
+        /// loop test green.
+        #[test]
+        fn the_timed_refresh_rereads_the_picture_and_reasks_the_driver() {
+            let (mut syncer, opts) = setup("refresh-distrust", 10);
+            let mut world = FakeWorld::new(25);
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert_eq!(
+                world.topo_calls, 3,
+                "each interval owes the picture a fresh reading"
+            );
+            assert_eq!(
+                world.fdb.vf_asked, 3,
+                "each interval owes the driver a fresh question"
+            );
+        }
+
+        /// A failed wait is survived, answered with a prompt pass, and
+        /// nothing carried is believed - the only user of the "recovery"
+        /// label, which no test could reach before.
+        #[test]
+        fn a_failed_wait_is_survived_and_distrusted() {
+            let (mut syncer, opts) = setup("wait-fails", 8);
+            let mut world = FakeWorld::new(8);
+            world.fail_wait = Some(libc::EINTR);
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert!(
+                world.passes.len() >= 2,
+                "the failed wait did not buy a prompt pass: {:?}",
+                world.passes
+            );
+            assert!(
+                world.topo_calls >= 2,
+                "the recovery pass believed the carried picture"
+            );
+        }
+
+        /// A pair adopted at runtime brings its card's capacity with it.
+        /// The start-time devlink question never saw this uplink; without
+        /// the re-ask, a daemon started before its bridges warned against
+        /// the assumed 128 for the rest of its life.
+        #[test]
+        fn a_runtime_pair_brings_its_capacity_along() {
+            let mut opts = Options {
+                interval: 300,
+                ..Default::default()
+            };
+            opts.mode = Mode::Daemon;
+            let mut syncer = Syncer::new(Vec::new(), scratch("hotplug-capacity"));
+            let mut world = FakeWorld::new(5);
+            world.bare_until = Duration::from_secs(1);
+            world.capacities.insert("nic1".to_string(), 64);
+            world.script.push_back((
+                Duration::from_secs(2),
+                Ok(Events {
+                    fdb: Vec::new(),
+                    links_changed: true,
+                    changed_links: vec![2],
+                }),
+            ));
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert!(
+                !world.capacity_asks.is_empty(),
+                "the adopted pair was never asked for its capacity"
+            );
+            // The operator's word is never moved: the same run with --max
+            // set must not ask at all.
+            let mut opts = Options {
+                interval: 300,
+                max_macs: 200,
+                max_macs_set: true,
+                ..Default::default()
+            };
+            opts.mode = Mode::Daemon;
+            let mut syncer = Syncer::new(Vec::new(), scratch("hotplug-capacity-set"));
+            let mut world = FakeWorld::new(5);
+            world.bare_until = Duration::from_secs(1);
+            world.capacities.insert("nic1".to_string(), 64);
+            world.script.push_back((
+                Duration::from_secs(2),
+                Ok(Events {
+                    fdb: Vec::new(),
+                    links_changed: true,
+                    changed_links: vec![2],
+                }),
+            ));
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert!(
+                world.capacity_asks.is_empty(),
+                "--max was set and the cards were asked anyway"
             );
         }
 
@@ -1970,22 +2264,25 @@ mod tests {
             .add("nic2", 3, Some(mac(2)))
             .build();
         let with = |pairs: &[&str]| {
-            let o = Options {
+            let mut o = Options {
                 pairs: pairs.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             };
-            resolve_pairs(&topo, &o, false, true)
+            o.mode = Mode::Once; // strict: a person is at the keyboard
+            resolve_pairs(&topo, &o)
         };
         // A named pair whose interface is missing refuses where a person
         // is watching, and is kept with a warning where availability wins:
         // the daemon at boot, and flush/status, which do not read it.
         {
-            let o = Options {
+            let mut o = Options {
                 pairs: vec!["ghost:br0".into()],
                 ..Default::default()
             };
-            assert!(resolve_pairs(&topo, &o, true, true).is_err());
-            let kept = resolve_pairs(&topo, &o, true, false).expect("lenient keeps it");
+            o.mode = Mode::Once;
+            assert!(resolve_pairs(&topo, &o).is_err());
+            o.mode = Mode::Daemon;
+            let kept = resolve_pairs(&topo, &o).expect("lenient keeps it");
             assert_eq!(kept.len(), 1, "the pair waits for its interface");
         }
         for (spec, names) in [
