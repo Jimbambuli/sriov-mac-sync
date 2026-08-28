@@ -729,181 +729,222 @@ impl World for Live {
     }
 }
 
+/// When the next pass is due, when the picture is read again regardless of
+/// what anybody says, and what to call the pass that results.
+///
+/// These were three locals, and their coupling was the subtlest thing in this
+/// file: the refresh was once gated on what the pass called itself, every
+/// batch renames the pass, and so on a host whose bridges age entries - which
+/// is every host - the condition stopped being true and the daemon never
+/// refreshed at all. The `[timed]` line the trial looks for went with it.
+/// Holding them together means every rule about them is one of these methods.
+struct Schedule {
+    /// A deadline, not a sleep. Wake-ups that turn out to be none of our
+    /// business must not push the full pass further away.
+    next_full: Instant,
+    next_refresh: Instant,
+    /// When the last full pass ran, so event storms are answered with a
+    /// bounded pass rate rather than with waiting. Registrations never wait.
+    last_pass: Instant,
+    /// Which of the three reasons for a pass produced work is the only way to
+    /// tell whether the timed one earns its keep.
+    trigger: &'static str,
+    interval: Duration,
+}
+
+impl Schedule {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            next_full: now,
+            next_refresh: now,
+            last_pass: now - interval,
+            trigger: "start",
+            interval,
+        }
+    }
+
+    /// The refresh exists to catch what the events missed, an interface change
+    /// whose notification never arrived included. It believes nothing it was
+    /// told, and brings the pass forward so that what it reads is acted on.
+    /// The caller invalidates what it holds; saying so is not this type's job.
+    fn refresh_due(&mut self, now: Instant) -> bool {
+        if now < self.next_refresh {
+            return false;
+        }
+        self.trigger = "timed";
+        self.next_full = self.next_full.min(now);
+        self.next_refresh = now + self.interval;
+        true
+    }
+
+    fn pass_due(&self, now: Instant) -> bool {
+        now >= self.next_full
+    }
+
+    /// A pass that could not run - no picture, or reconciliation refused. Come
+    /// back soon rather than sitting out the whole interval: one refused dump
+    /// used to cost five minutes of not looking at the host at all.
+    fn retry_soon(&mut self, now: Instant) {
+        self.next_full = now + RETRY_AFTER;
+        self.trigger = "timed";
+    }
+
+    /// A pass that ran. The next belongs to the timer until something claims
+    /// it, which is what keeps `[timed]` honest.
+    fn completed(&mut self, now: Instant) {
+        self.last_pass = now;
+        self.next_full = now + self.interval;
+        self.trigger = "timed";
+    }
+
+    /// A batch wants a pass sooner. Everything that does goes through here.
+    fn bring_forward(&mut self, due: Instant, trigger: &'static str) {
+        self.next_full = self.next_full.min(due);
+        self.trigger = trigger;
+    }
+
+    /// Nothing carried over may be believed and the pass cannot wait: a failed
+    /// wait, or notifications the kernel dropped.
+    fn at_once(&mut self, now: Instant, trigger: &'static str) {
+        self.next_full = now;
+        self.trigger = trigger;
+    }
+
+    fn wait_for(&self, now: Instant) -> Duration {
+        self.next_full
+            .min(self.next_refresh)
+            .saturating_duration_since(now)
+    }
+}
+
+/// The topology carried over from the last pass, and whether it can still be
+/// believed. A forwarding entry appearing or going says nothing about which
+/// interfaces exist or what they are enslaved to, so a pass woken by one works
+/// from the picture it already has. Anything that touches interfaces marks it
+/// stale, as does losing notifications and the timed refresh, whose whole
+/// purpose is to find what the events missed.
+struct Picture {
+    held: Option<Topology>,
+    stale: bool,
+    /// What reading the picture cost when an event read it, so the pass that
+    /// uses it can account for it. Without this a pass whose topology was read
+    /// moments earlier reports "0.000 ms" for it, which reads as "not read at
+    /// all" - it misled the author of this line for an hour.
+    carried_load: Duration,
+}
+
+impl Picture {
+    fn new() -> Self {
+        Self {
+            held: None,
+            stale: true,
+            carried_load: Duration::ZERO,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.stale = true;
+    }
+
+    fn needs_reading(&self) -> bool {
+        self.stale || self.held.is_none()
+    }
+
+    /// The read itself. What it cost, and the picture it replaced.
+    fn read<W: World>(&mut self, world: &mut W) -> Result<(Duration, Option<Topology>), String> {
+        let started = world.now();
+        let fresh = world.read_topology()?;
+        self.stale = false;
+        Ok((started.elapsed(), self.held.replace(fresh)))
+    }
+
+    /// Before a pass, which **fails closed**: a pass on a picture that may be
+    /// wrong is worse than no pass at all, so a refused read throws away what
+    /// was held and the caller schedules the retry. The cost reported is the
+    /// fresh read's, superseding anything an event carried.
+    fn for_pass<W: World>(&mut self, world: &mut W) -> Duration {
+        let carried = std::mem::take(&mut self.carried_load);
+        if !self.needs_reading() {
+            return carried;
+        }
+        match self.read(world) {
+            Ok((cost, _)) => cost,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                self.held = None;
+                carried
+            }
+        }
+    }
+
+    /// Before the fast path, which **keeps what it had**: answering a batch
+    /// from a picture one link message out of date still beats not answering
+    /// it. The cost is carried to the pass a few milliseconds later, which
+    /// works from this same reading rather than paying for its own.
+    fn for_batch<W: World>(&mut self, world: &mut W) -> Option<Topology> {
+        if !self.needs_reading() {
+            return None;
+        }
+        match self.read(world) {
+            Ok((cost, previous)) => {
+                self.carried_load += cost;
+                previous
+            }
+            Err(e) => {
+                eprintln!("warning: {e}");
+                None
+            }
+        }
+    }
+}
+
 /// The daemon: answer batches through the fast path, keep the pass rate
 /// bounded, and never trust a picture longer than the interval. Everything
 /// here is a decision about time or about what the world said, which is why
 /// the world arrives as a parameter - the tests hand in a scripted one and
 /// this function cannot tell.
 fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
-    let auto = opts.pairs.is_empty();
     let mut said_empty = false;
-    let interval = Duration::from_secs(opts.interval);
-    // A deadline, not a sleep. Wake-ups that turn out to be none of our
-    // business must not push the full pass further away.
-    let mut next_full = world.now();
-    // When the picture is next read afresh regardless of what
-    // anybody says. Held apart from `next_full`, which only bounds
-    // how often a pass may run: the refresh used to be gated on the
-    // pass calling itself "timed", and every batch renames the pass -
-    // so on a host whose bridges age entries, which is every host,
-    // the condition stopped being true and the daemon never
-    // self-corrected. The `[timed]` line the trial looks for
-    // disappeared with it.
-    let mut next_refresh = world.now();
-    // Which of the three reasons for a pass actually produced work is
-    // the only way to tell whether the timed one earns its keep.
-    let mut trigger = "start";
-    // The topology carried over from the last pass, and whether it can
-    // still be believed. A forwarding entry appearing or going says
-    // nothing about which interfaces exist or what they are enslaved
-    // to, so a pass woken by one works from the picture it already
-    // has. Anything that touches interfaces marks it stale, as does
-    // losing notifications and the timed pass, whose whole purpose is
-    // to find what the events missed.
-    let mut held: Option<Topology> = None;
-    let mut stale = true;
-    // Whether the virtual functions' addresses have to be asked for
-    // again. Held apart from `stale` because the two have different
-    // reasons: any interface appearing or going invalidates the
-    // picture, but only an interface that has virtual functions - or
-    // is one - can have changed what they are called. Asking is the
-    // most expensive thing a pass does, and on a host full of
-    // containers most link messages are a veth nobody here cares
-    // about.
-
-    // What reading the picture cost when an event read it, so the
-    // pass that uses it can account for it. Without this a pass whose
-    // topology was read moments earlier reports "0.000 ms" for it,
-    // which reads as "not read at all" - it misled the author of this
-    // line for an hour.
-    let mut carried_topo_load = Duration::ZERO;
-    // When the last full pass ran, so event storms are answered with
-    // a bounded pass rate rather than with waiting. Registrations
-    // never wait: every batch goes through the fast path the moment
-    // it is read.
-    let mut last_pass = world.now() - interval;
+    let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
+    let mut picture = Picture::new();
 
     loop {
         if world.stopping() {
             break;
         }
-        // The refresh exists to catch what the events missed, an
-        // interface change whose notification never arrived included.
-        // It believes nothing it was told, and it brings the pass
-        // forward so that what it reads is acted on.
-        if world.now() >= next_refresh {
-            stale = true;
+        if schedule.refresh_due(world.now()) {
+            picture.invalidate();
             syncer.vf_stale = true;
-            trigger = "timed";
-            next_full = next_full.min(world.now());
-            next_refresh = world.now() + interval;
         }
-        if world.now() >= next_full {
-            // Autodetection is redone every pass. A NIC that gets its
-            // VFs later, or a bridge built after boot, must not need a
-            // restart to be noticed - and starting before the network
-            // is up must not turn into a crash loop.
-            // One reading of /sys serves both the autodetection and
-            // the pass. They ask about the same moment, and reading it
-            // twice was work nobody asked for.
-            let mut topo_load = std::mem::take(&mut carried_topo_load);
-            let reloaded = stale || held.is_none();
-            if reloaded {
-                let load_started = world.now();
-                match world.read_topology() {
-                    Ok(t) => {
-                        topo_load = load_started.elapsed();
-                        held = Some(t);
-                        stale = false;
-                    }
-                    // Fail closed: a pass on a picture that may be
-                    // wrong is worse than no pass at all. The retry
-                    // is scheduled below, where the pass gives up.
-                    Err(e) => {
-                        eprintln!("warning: {e}");
-                        held = None;
-                    }
-                }
-            }
-            let loaded = held.as_ref().map(|t| (t, topo_load));
-            // Autodetection is a pure function of the picture: on a pass
-            // that carried the picture unchanged, its answer cannot have
-            // changed either. A new NIC or bridge arrives as a link
-            // message, which is exactly what sets `reloaded`.
-            if let (true, true, Some((topo, _))) = (auto, reloaded, loaded) {
-                let found: Vec<Pair> = topo
-                    .autodetect()
-                    .0
-                    .into_iter()
-                    .map(|(dev, bridge)| Pair { dev, bridge })
-                    .collect();
-                if pair_names(&found) != pair_names(&syncer.pairs) {
-                    if !found.is_empty() {
-                        note!("now watching {}", pair_names(&found).join(" "));
-                        said_empty = false;
-                    }
-                    syncer.pairs = found;
-                }
-            }
-
-            if syncer.pairs.is_empty() && !said_empty {
-                note!("waiting for an SR-IOV interface to appear in a bridge");
-                said_empty = true;
-            }
-            {
-                let Some((topo, topo_load)) = loaded else {
-                    // Nothing to work from. Come back soon rather
-                    // than sitting out the whole reconciliation
-                    // interval: one refused dump used to cost five
-                    // minutes of not looking at the host at all.
-                    next_full = world.now() + RETRY_AFTER;
-                    trigger = "timed";
+        if schedule.pass_due(world.now()) {
+            match run_pass(
+                world,
+                syncer,
+                &mut picture,
+                opts,
+                schedule.trigger,
+                &mut said_empty,
+            ) {
+                Pass::Done => schedule.completed(world.now()),
+                // One failed pass is no reason to give up: the next is seconds
+                // away and starts from the kernel's state again. It used to
+                // fall through to the full interval, which on a quiet host was
+                // five minutes of not looking after a transient rtnl failure.
+                Pass::Refused => {
+                    schedule.retry_soon(world.now());
                     continue;
-                };
-                match syncer.reconcile(world, true, topo, topo_load) {
-                    Ok(reports) => {
-                        report_changes(
-                            &reports,
-                            opts.dry_run,
-                            opts.max_macs,
-                            opts.verbose,
-                            trigger,
-                        );
-                        if opts.timings {
-                            note!("pass [{trigger}]\n{}", syncer.timings.report().trim_end());
-                        }
-                    }
-                    // One failed pass is no reason to give up: the next
-                    // is seconds away and starts from the kernel's
-                    // state again - the same treatment the refused
-                    // topology gets above. It used to fall through to
-                    // the full interval, which on a quiet host was five
-                    // minutes of not looking after a transient rtnl
-                    // failure.
-                    Err(e) => {
-                        eprintln!("warning: reconciliation failed: {e}");
-                        next_full = world.now() + RETRY_AFTER;
-                        trigger = "timed";
-                        continue;
-                    }
                 }
             }
-            last_pass = world.now();
-            next_full = last_pass + interval;
-            trigger = "timed";
         }
 
-        let due = next_full
-            .min(next_refresh)
-            .saturating_duration_since(world.now());
+        let due = schedule.wait_for(world.now());
         let woken = match world.wait(due.as_millis().min(i32::MAX as u128) as i32) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("warning: waiting for events failed: {e}");
-                next_full = world.now();
-                stale = true;
+                schedule.at_once(world.now(), "recovery");
+                picture.invalidate();
                 syncer.vf_stale = true;
-                trigger = "recovery";
                 continue;
             }
         };
@@ -913,135 +954,196 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
 
         let events = match world.recv_events() {
             Ok(events) => events,
-            // ENOBUFS means the kernel dropped notifications because we
-            // could not keep up. Losing them is survivable - a full pass
-            // reads the real state - but exiting over it would not be.
+            // ENOBUFS means the kernel dropped notifications because we could
+            // not keep up. Losing them is survivable - a full pass reads the
+            // real state - but exiting over it would not be. What was in the
+            // messages that never arrived is not knowable, so nothing carried
+            // over may be believed.
             Err(e) => {
                 eprintln!("warning: lost neighbour notifications: {e}");
-                next_full = world.now();
-                // What was in the messages that never arrived is not
-                // knowable, so nothing carried over may be believed.
-                stale = true;
+                schedule.at_once(world.now(), "lost events");
+                picture.invalidate();
                 syncer.vf_stale = true;
-                trigger = "lost events";
                 continue;
             }
         };
-        if events.fdb.is_empty() && !events.links_changed {
-            continue; // something else's neighbour, not a bridge's
-        }
-        // Not the trigger name: a batch carrying both kinds is
-        // reported as a forwarding change, and would otherwise keep a
-        // topology that the link messages in the same batch just
-        // invalidated.
-        if events.links_changed {
-            stale = true;
-        }
-        let batch_trigger = if events.fdb.is_empty() {
-            "interface change"
-        } else {
-            "forwarding change"
-        };
 
-        // What the batch's link messages were about, judged against
-        // the picture as it stands - before it is read again, because
-        // an interface that has just gone is only in this one.
-        let before_reload: Vec<u32> = events.changed_links.clone();
-
-        // Register what just appeared before anything else, so the
-        // first reply to it is not sent into the void.
-        //
-        // The pass that follows a few milliseconds later works from
-        // the same picture, so read it here if it is wanted and let
-        // that one have it too. Reading it twice for one event was
-        // the whole of what this used to cost.
-        let mut previous: Option<Topology> = None;
-        if stale || held.is_none() {
-            let started = world.now();
-            match world.read_topology() {
-                Ok(t) => {
-                    carried_topo_load += started.elapsed();
-                    previous = held.replace(t);
-                    stale = false;
-                }
-                Err(e) => eprintln!("warning: {e}"),
-            }
+        if let Some((due, trigger)) = handle_batch(
+            world,
+            syncer,
+            &mut picture,
+            &events,
+            schedule.last_pass,
+            opts.max_macs,
+        ) {
+            schedule.bring_forward(due, trigger);
         }
-        if !before_reload.is_empty()
-            && sync::vf_may_have_changed(previous.as_ref(), held.as_ref(), &before_reload)
-        {
-            syncer.vf_stale = true;
-        }
-        // Whether the batch left anything for a pass to do. A pass
-        // dumps the host's whole forwarding table, so a batch that
-        // was entirely somebody else's - learning on the wire that
-        // was never ours, entries on unrelated bridges - must not
-        // buy one. Link changes always do.
-        let mut urgency = if events.links_changed {
-            sync::Urgency::Now
-        } else {
-            sync::Urgency::Nothing
-        };
-        if let Some(topo) = held.as_ref() {
-            // The whole batch, both kinds. What each means is the
-            // fast path's business: an address learnt behind the
-            // bridge is registered, one learnt on the uplink's own
-            // port is taken back out if it was ours, and a deletion
-            // is left to the pass that follows - one entry going
-            // does not mean the address is gone.
-            match syncer.fast_apply(world, topo, &events.fdb) {
-                Ok(u) => urgency = urgency.max(u),
-                // It could not do its work, so the pass has to.
-                Err(e) => {
-                    eprintln!("warning: answering the batch failed: {e}");
-                    urgency = sync::Urgency::Now;
-                }
-            }
-        } else {
-            urgency = sync::Urgency::Now; // no picture to judge it by
-        }
-        if urgency == sync::Urgency::Nothing {
-            // Nothing to reconcile, so nothing is scheduled - and the
-            // name of this batch is not carried into whatever pass
-            // does come next. A pass that runs on the timer has to
-            // say "timed", or the one line that tells whether the
-            // timer ever catches anything stops meaning it.
-            continue;
-        }
-        trigger = batch_trigger;
-
-        // The full pass still has to follow - it is what removes
-        // stale entries and reconciles the notes - but nothing waits
-        // for it any more. Its predecessor here waited for a 200 ms
-        // lull before running it, which held every second address of
-        // a burst back by exactly that lull, and any unrelated
-        // neighbour chatter stretched the wait towards its two-second
-        // bound. A pass rate bound does the same job - not flooding a
-        // large host with back-to-back forwarding dumps - without
-        // making anything later than it has to be: at most five
-        // passes a second, the first one immediately when the last
-        // pass is old enough.
-        // How long the pass may wait. Registrations and interface
-        // changes get the ordinary rate bound; a batch that only
-        // reported deletions waits longer, because an ageing table
-        // produces those by the hundred and each one would otherwise
-        // buy a dump of the whole table.
-        //
-        // Unless the filter is filling up: entries that should be
-        // gone are then taking room from entries that should be
-        // there, and the list is finite in a way nothing can query.
-        // Asked lazily: at Urgency::Now the wait is already decided, and
-        // registered() lists the state directory and reads every note - work
-        // the hottest path has no reason to pay.
-        let wait = if urgency == sync::Urgency::Now || syncer.registered() * 10 >= opts.max_macs * 9
-        {
-            Duration::from_millis(200)
-        } else {
-            AGEING_SETTLE
-        };
-        let due = (last_pass + wait).max(world.now());
-        next_full = next_full.min(due);
     }
+}
+
+/// Whether a pass got as far as reconciling. It is the caller that owns the
+/// clock, so a pass says what happened and schedules nothing itself.
+enum Pass {
+    Done,
+    Refused,
+}
+
+/// One full pass: read the picture if it can no longer be believed, work out
+/// which pairs there are, and reconcile every one of them against the kernel.
+fn run_pass<W: World>(
+    world: &mut W,
+    syncer: &mut Syncer,
+    picture: &mut Picture,
+    opts: &Options,
+    trigger: &'static str,
+    said_empty: &mut bool,
+) -> Pass {
+    // One reading serves both the autodetection and the reconciliation: they
+    // ask about the same moment, and reading it twice was work nobody asked
+    // for.
+    let reloaded = picture.needs_reading();
+    let topo_load = picture.for_pass(world);
+
+    // Autodetection is redone every pass. A NIC that gets its VFs later, or a
+    // bridge built after boot, must not need a restart to be noticed - and
+    // starting before the network is up must not turn into a crash loop. But
+    // it is a pure function of the picture, so on a pass that carried the
+    // picture unchanged its answer cannot have changed either: a new NIC or
+    // bridge arrives as a link message, which is exactly what sets `reloaded`.
+    let auto = opts.pairs.is_empty();
+    if let (true, true, Some(topo)) = (auto, reloaded, picture.held.as_ref()) {
+        let found: Vec<Pair> = topo
+            .autodetect()
+            .0
+            .into_iter()
+            .map(|(dev, bridge)| Pair { dev, bridge })
+            .collect();
+        if pair_names(&found) != pair_names(&syncer.pairs) {
+            if !found.is_empty() {
+                note!("now watching {}", pair_names(&found).join(" "));
+                *said_empty = false;
+            }
+            syncer.pairs = found;
+        }
+    }
+    if syncer.pairs.is_empty() && !*said_empty {
+        note!("waiting for an SR-IOV interface to appear in a bridge");
+        *said_empty = true;
+    }
+
+    // Nothing to work from. Fail closed and let the caller come back soon:
+    // one refused dump used to cost five minutes of not looking at the host.
+    let Some(topo) = picture.held.as_ref() else {
+        return Pass::Refused;
+    };
+    match syncer.reconcile(world, true, topo, topo_load) {
+        Ok(reports) => {
+            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, trigger);
+            if opts.timings {
+                note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
+            }
+            Pass::Done
+        }
+        Err(e) => {
+            eprintln!("warning: reconciliation failed: {e}");
+            Pass::Refused
+        }
+    }
+}
+
+/// One batch of notifications: register what just appeared, before anything
+/// else, so the first reply to it is not sent into the void. Says when a full
+/// pass has to follow and what to call it.
+///
+/// `None` means the batch bought nothing - and buys no name either: a pass that
+/// runs on the timer has to say "timed", or the one line that tells whether the
+/// timer ever catches anything stops meaning it.
+fn handle_batch<W: World>(
+    world: &mut W,
+    syncer: &mut Syncer,
+    picture: &mut Picture,
+    events: &netlink::Events,
+    last_pass: Instant,
+    max_macs: usize,
+) -> Option<(Instant, &'static str)> {
+    if events.fdb.is_empty() && !events.links_changed {
+        return None; // something else's neighbour, not a bridge's
+    }
+    if events.links_changed {
+        picture.invalidate();
+    }
+    // Not the trigger name: a batch carrying both kinds is reported as a
+    // forwarding change, and would otherwise keep a topology that the link
+    // messages in the same batch just invalidated.
+    let trigger = if events.fdb.is_empty() {
+        "interface change"
+    } else {
+        "forwarding change"
+    };
+
+    // What the batch's link messages were about is judged against the picture
+    // as it stands - before it is read again, because an interface that has
+    // just gone is only in that one.
+    let previous = picture.for_batch(world);
+    if !events.changed_links.is_empty()
+        && sync::vf_may_have_changed(
+            previous.as_ref(),
+            picture.held.as_ref(),
+            &events.changed_links,
+        )
+    {
+        syncer.vf_stale = true;
+    }
+
+    // Whether the batch left anything for a pass to do. A pass dumps the
+    // host's whole forwarding table, so a batch that was entirely somebody
+    // else's - learning on the wire that was never ours, entries on unrelated
+    // bridges - must not buy one. Link changes always do.
+    let mut urgency = if events.links_changed {
+        sync::Urgency::Now
+    } else {
+        sync::Urgency::Nothing
+    };
+    match picture.held.as_ref() {
+        // The whole batch, both kinds. What each means is the fast path's
+        // business: an address learnt behind the bridge is registered, one
+        // learnt on the uplink's own port is taken back out if it was ours,
+        // and a deletion is left to the pass that follows - one entry going
+        // does not mean the address is gone.
+        Some(topo) => match syncer.fast_apply(world, topo, &events.fdb) {
+            Ok(u) => urgency = urgency.max(u),
+            // It could not do its work, so the pass has to.
+            Err(e) => {
+                eprintln!("warning: answering the batch failed: {e}");
+                urgency = sync::Urgency::Now;
+            }
+        },
+        None => urgency = sync::Urgency::Now, // no picture to judge it by
+    }
+    if urgency == sync::Urgency::Nothing {
+        return None;
+    }
+
+    // The full pass still has to follow - it is what removes stale entries and
+    // reconciles the notes - but nothing waits for it any more. Its
+    // predecessor waited for a 200 ms lull, which held every second address of
+    // a burst back by exactly that, and unrelated neighbour chatter stretched
+    // the wait towards its two-second bound. A pass rate bound does the same
+    // job without making anything later than it has to be.
+    //
+    // Registrations and interface changes get the ordinary bound; a batch that
+    // only reported deletions waits longer, because an ageing table produces
+    // those by the hundred and each would otherwise buy a dump of the whole
+    // table - unless the filter is filling up, when entries that should be
+    // gone are taking room from entries that should be there. Asked lazily:
+    // at Urgency::Now the wait is already decided, and registered() lists the
+    // state directory and reads every note.
+    let wait = if urgency == sync::Urgency::Now || syncer.registered() * 10 >= max_macs * 9 {
+        Duration::from_millis(200)
+    } else {
+        AGEING_SETTLE
+    };
+    Some(((last_pass + wait).max(world.now()), trigger))
 }
 
 fn run() -> Result<bool, String> {
