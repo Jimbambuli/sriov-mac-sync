@@ -168,6 +168,18 @@ Do not try it on a machine you care about just to see. The driver tears the
 legacy eswitch down *before* building the offloads one, and when the second step
 fails the first is not undone: the VFs stay dark and the host needs a reboot.
 
+## How this was written
+
+Most of the code, the tests and much of this documentation were written by
+Claude, Anthropic's model, working from my direction and on my hardware. I set
+the goals, reviewed the work, ran the machines and decided what shipped. The
+commit trailers say so, and so does the contributor list.
+
+What is not generated is the evidence. Every hardware claim in these pages is a
+measurement taken on the cards named, across four driver families, with the
+trial harness in `bench/` and integration checks against a real kernel. Where
+something could not be measured, it says so.
+
 ## Versions
 
 Dated: `YEAR.MONTH.N`, where `N` counts releases within that month — the number
