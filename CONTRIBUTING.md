@@ -59,3 +59,36 @@ daemon is already at work.
 
 CI runs all of the above, an MSRV build and a static build on every push to main
 and on pull requests.
+
+## Releasing
+
+The order matters, and every step has a reason it is where it is.
+
+1. **Push the work first, and wait for CI.** A version bump on top of a red
+   build is a release nobody can trust. Tests here guard the README, the manual
+   page, the unit file and the example configuration against the code, so even
+   a documentation-only change can fail — run `cargo test` before every push.
+2. **Put it on real hardware.** No release goes out without a full
+   `bench/trial.py` run on all four driver families — `mlx5`, `mlx4`, `i40e`,
+   `ixgbe` — *with the binary the release will ship*. Any later commit voids
+   those runs, the version bump included, so bump first and test the bumped
+   build.
+3. **Bump the version** in `Cargo.toml` (`YEAR.MONTH.N`), commit, push, wait
+   for CI again.
+4. **Build the artefacts:** `APK=/path/to/apk.static ./dist/package.sh`. Without
+   apk-tools v3 the script skips the `.apk` packages *silently*, and the
+   OpenWrt 24.10 install path the README documents then 404s at
+   `/releases/latest/download/`. Debian has no such package; a static
+   `apk.static` from Alpine's `apk-tools-static` does the job.
+5. **Tag and publish:** `git tag -a vYEAR.MONTH.N`, push the tag,
+   `gh release create ... dist/out/*`.
+6. **`cargo publish`.** The README advertises `cargo install sriov-mac-sync`,
+   and `readme = "README.md"` makes this file's twin the crates.io page. Skip
+   this and the registry quietly serves an older build to anyone who follows
+   the README — which is exactly what happened between 2026.8.2 and 2026.8.4.
+   Check `cargo publish --dry-run` first; a published version can be yanked but
+   never replaced.
+7. **Roll out the package**, not a hand-copied binary: `dpkg -i` the built
+   `.deb`. Copying the bare binary over a package-managed path leaves
+   `dpkg -V` reporting a modified file, and the next `apt` upgrade silently
+   reverts it.
