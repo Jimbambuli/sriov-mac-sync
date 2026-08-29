@@ -673,7 +673,10 @@ fn a_check_probe_is_noted_first_and_forgotten_as_a_difference() {
     let dir = scratch("check-probe");
     let s = ready_syncer(&dir);
     const PROBE: Mac = [0x02, 0xe3, 0, 0, 0, 0x59];
-    s.note_check_probe("nic1", &PROBE);
+    assert!(
+        s.note_check_probe("nic1", 2, &PROBE),
+        "a probe the note took has to say so"
+    );
     let noted = fs::read_to_string(dir.join("nic1.owned")).unwrap();
     assert!(noted.contains(&format_mac(&PROBE)), "noted before written");
     // A parallel --once registers something while the probe is out.
@@ -705,6 +708,290 @@ fn eexist_is_not_claimed_as_ours() {
     assert!(
         !s.load_owned("nic1").contains(&BEHIND_GUEST),
         "an entry somebody else created was claimed - it would be deleted later"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The note takes an address before the card does. Killed between the two,
+/// the old order left an entry in the card that no note named - permanent,
+/// counted as foreign, never touched again. The new order leaves a note
+/// naming an entry that is not there, and the ordinary paths heal that:
+/// the add is retried while the address is wanted, and the removal's
+/// ENOENT settles the note once it is not. A failed add is the observable
+/// half of that crash window - the intent has to be on file although the
+/// card never took the address.
+#[test]
+fn an_addition_is_noted_before_the_card_is_written() {
+    let dir = scratch("note-first");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(3, 10, BEHIND_NIC)],
+        vf: vec![(2, VF_ADMIN)],
+        fail_add: [(BEHIND_NIC, libc::EIO)].into_iter().collect::<Map<_, _>>(),
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        s.load_owned("nic1").contains(&BEHIND_NIC),
+        "the failed add lost its intent - a crash in that window is an orphan again"
+    );
+    assert!(
+        s.timings.failures.iter().any(|f| f.contains("register")),
+        "the failure went unrecorded: {:?}",
+        s.timings.failures
+    );
+
+    // The address stops being wanted before the add ever succeeds: the
+    // removal meets ENOENT and the intent settles to nothing.
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_del: [(BEHIND_NIC, libc::ENOENT)]
+            .into_iter()
+            .collect::<Map<_, _>>(),
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !s.load_owned("nic1").contains(&BEHIND_NIC),
+        "the intent outlived the address it was for"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same order on the fast path: the batch's addresses are in the note
+/// before any of them reaches the card, and a failed add keeps its intent
+/// for the prompt pass to retry.
+#[test]
+fn the_fast_path_notes_before_it_writes() {
+    let dir = scratch("fast-note-first");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_add: [(BEHIND_NIC, libc::EIO)].into_iter().collect::<Map<_, _>>(),
+        ..Default::default()
+    };
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        )
+        .unwrap();
+    assert!(
+        sock.added.is_empty(),
+        "the card took what the driver refused"
+    );
+    assert!(
+        s.load_owned("nic1").contains(&BEHIND_NIC),
+        "the failed add lost its intent"
+    );
+    assert_eq!(
+        urgency,
+        Urgency::Now,
+        "the failed add has to buy the pass that retries it"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// EEXIST on the fast path is somebody else's entry, exactly as in a full
+/// pass - and with the note written first, the fresh intent has to come
+/// back out, or their entry is deleted the day it stops being wanted.
+#[test]
+fn a_foreign_entry_met_by_the_fast_path_is_not_claimed() {
+    let dir = scratch("fast-eexist");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_add: [(BEHIND_NIC, libc::EEXIST)]
+            .into_iter()
+            .collect::<Map<_, _>>(),
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert!(
+        !s.load_owned("nic1").contains(&BEHIND_NIC),
+        "an entry somebody else created was claimed"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A note that cannot be taken keeps the card untouched: nothing may reach
+/// the hardware that the note does not already name, or a crash right
+/// after leaves the entry ownerless - the exact window the note-first
+/// order exists to close. A directory where the note should be is
+/// unreadable and unwritable alike, for root too.
+#[test]
+fn an_unusable_note_holds_the_card_back() {
+    let dir = scratch("note-refused");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir(dir.join("nic1.owned")).unwrap();
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(3, 10, BEHIND_NIC)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock.added.is_empty(),
+        "the card took an address the note could not: {:?}",
+        sock.added
+    );
+    assert!(
+        s.timings.failures.iter().any(|f| f.contains("held back")),
+        "the held-back registrations left no failure: {:?}",
+        s.timings.failures
+    );
+
+    // The fast path refuses the same way.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert!(
+        sock.added.is_empty(),
+        "the fast path wrote past a note it could not take"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// --check's healing story stands on the probe being noted first, so a
+/// probe that cannot be noted has to be refused out loud - the caller
+/// then writes nothing.
+#[test]
+fn a_probe_that_cannot_be_noted_says_so() {
+    let dir = scratch("probe-refused");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir(dir.join("nic1.owned")).unwrap();
+    let s = ready_syncer(&dir);
+    assert!(
+        !s.note_check_probe("nic1", 2, &[0x02, 0xe3, 0, 0, 0, 0x59]),
+        "a probe the note could not take was reported as noted"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An interface rename keeps the index, the filter entries and the guests -
+/// it takes only the name, and the note is found by name. The sweep used
+/// to read that as the device being gone: note unlinked, "removed" logged,
+/// and every entry it named still in the card under the new name, owned by
+/// nobody. The index recorded beside the note is what tells a rename from
+/// a disappearance, and the note follows the interface.
+#[test]
+fn a_renamed_uplink_keeps_its_note() {
+    let dir = scratch("rename");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(3, 10, BEHIND_NIC)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
+    assert_eq!(
+        s.noted_index("nic1"),
+        Some(2),
+        "the index went unrecorded - a rename could never be told apart"
+    );
+
+    // The same interface, same index, new name - and still the uplink, as
+    // autodetection would rediscover it.
+    let renamed = Builder::new()
+        .add("nicX", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nicX")
+        .lower("nic2")
+        .build();
+    s.pairs = vec![Pair {
+        dev: "nicX".into(),
+        bridge: "vmbr1".into(),
+    }];
+    let mut sock = FakeSock {
+        fdb: vec![
+            learned(3, 10, BEHIND_NIC),
+            // The registration itself, alive in the card under the new name.
+            FdbEntry {
+                ifindex: 2,
+                master: None,
+                mac: BEHIND_NIC,
+                state: 0x80, // NUD_PERMANENT
+                flags: 0x02, // NTF_SELF
+            },
+        ],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &renamed, Dur::ZERO).unwrap();
+    assert!(
+        sock.removed.is_empty(),
+        "a rename had something removed from a live filter: {:?}",
+        sock.removed
+    );
+    assert!(
+        !dir.join("nic1.owned").exists(),
+        "the note stayed under the old name, where nothing can reach it"
+    );
+    assert_eq!(
+        s.load_owned("nicX"),
+        [BEHIND_NIC].into_iter().collect::<Set<_>>(),
+        "the note did not follow the interface"
+    );
+    assert!(
+        sock.added.is_empty(),
+        "the migrated note was not believed and the entry re-registered: {:?}",
+        sock.added
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// --flush finds notes by name but removes entries by index, and a rename
+/// moves only the name: the recorded index has to reach the entries under
+/// whatever the interface is called now.
+#[test]
+fn a_flush_reaches_entries_through_a_rename() {
+    let dir = scratch("flush-rename");
+    let mut s = Syncer::new(Vec::new(), dir.clone());
+    s.save_owned("nic1", &[mac(0x61)].into_iter().collect::<Set<_>>());
+    s.note_index("nic1", 5);
+    let mut sock = FakeSock {
+        links: vec![crate::netlink::LinkInfo {
+            index: 5,
+            name: "nicX".into(),
+            mac: Some(mac(1)),
+            kind: Some("veth".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(s.flush(&mut sock).unwrap(), "a clean flush says so");
+    assert_eq!(
+        sock.removed,
+        vec![(5, mac(0x61))],
+        "the entries were not removed through the renamed interface"
+    );
+    assert!(
+        !dir.join("nic1.owned").exists() && !dir.join(".nic1.owned.index").exists(),
+        "the settled note or its index record lingers"
     );
     let _ = fs::remove_dir_all(&dir);
 }

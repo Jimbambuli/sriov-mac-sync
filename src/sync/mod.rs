@@ -24,8 +24,10 @@ pub struct Pair {
 /// once for the whole batch, because a batch describes a single moment.
 /// The two halves of fast_apply's grow-only driver refresh. They never
 /// vary independently: deciding collects what would be registered - stale
-/// carried VF exclusions included - and writes nothing; committing writes
-/// and trusts the (by then fresh) skip sets.
+/// carried VF exclusions included - so the fresh driver question can be
+/// paid only when something would grow; committing collects the batch's
+/// real candidates, trusting the (by then fresh) skip sets. Neither
+/// phase writes - the caller writes the decided batch through, note first.
 #[derive(Clone, Copy, PartialEq)]
 enum FastPhase {
     Decide,
@@ -190,6 +192,9 @@ pub struct Syncer {
     /// rename, which changes the inode, and any other writer changes at
     /// least the timestamp.
     notes: std::cell::RefCell<Map<String, Note>>,
+    /// The interface index last recorded beside each note, so the record
+    /// is written when the answer changes rather than once per pass.
+    indices: std::cell::RefCell<Map<String, u32>>,
     /// Which addresses the last pass saw out on the wire, per uplink. The
     /// fast path has no forwarding dump to work this out from, and an address
     /// that lives on the wire in one VLAN and behind the bridge in another
@@ -357,6 +362,7 @@ impl Syncer {
             carried_wire: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
+            indices: std::cell::RefCell::new(crate::hash::map()),
         }
     }
 
@@ -425,6 +431,29 @@ impl Syncer {
         failures: &mut Vec<String>,
     ) {
         for dev in self.orphaned() {
+            // A name that is gone while its interface lives on is a rename,
+            // not a disappearance. The filter entries survived it, under the
+            // new name; reading the old name as "the device is gone" would
+            // unlink the note and leave every one of them in the card owned
+            // by nobody. The note follows the interface instead. (Identity
+            // is the recorded index, which a boot never re-uses; two
+            // interfaces swapping names in one breath is the residual case
+            // this cannot tell apart, and the index still points each note
+            // at the right interface then.)
+            if topo.get(&dev).is_none() {
+                if let Some((index, new_name)) = self.renamed_target(&dev, topo) {
+                    if !apply || self.dry_run {
+                        note!("{dev}: now called {new_name}; its note would follow");
+                    } else if self.migrate_note(&dev, &new_name, index) {
+                        note!("{dev}: now called {new_name}, its note follows the interface");
+                    }
+                    // Worked, or waits (an unreadable note, an unwritable
+                    // new one - both said out loud where they happened, and
+                    // looked at again next sweep). Either way there is
+                    // nothing to unregister: the device lives.
+                    continue;
+                }
+            }
             if !apply || self.dry_run {
                 let owned = self.load_owned(&dev);
                 if !owned.is_empty() {
@@ -450,22 +479,20 @@ impl Syncer {
                     // it can be read, the same answer read_owned already gave
                     // out loud.
                     if self.note_is_readable(&dev) {
-                        let _ = fs::remove_file(self.state_path(&dev));
+                        self.remove_note(&dev);
                     }
                     return;
                 }
                 let (gone, kept) = match topo.get(&dev) {
                     Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
-                    // The device itself is gone, and a unicast filter does not
-                    // outlive its netdev - the entries died with it. (A device
-                    // that was merely renamed keeps its entries under the new
-                    // name, but a note under the old name could never reach
-                    // them anyway.)
+                    // The device itself is gone - a rename was told apart
+                    // above - and a unicast filter does not outlive its
+                    // netdev: the entries died with it.
                     None => (owned.len(), crate::hash::set()),
                 };
                 if kept.is_empty() && self.note_is_readable(&dev) {
                     note!("{dev}: no longer an uplink, removed {gone} address(es)");
-                    let _ = fs::remove_file(self.state_path(&dev));
+                    self.remove_note(&dev);
                 } else {
                     // What could not be removed is still in the card;
                     // forgetting it here is how a registration becomes
@@ -486,6 +513,21 @@ impl Syncer {
                 }
             });
         }
+    }
+
+    /// Where a noted device's interface lives now, when the name is gone
+    /// but the recorded index is not: the rename case. `None` where no
+    /// index was ever recorded (a note from an older build) or the
+    /// interface really is gone - and then the caller's old answer stands.
+    fn renamed_target(&self, dev: &str, topo: &Topology) -> Option<(u32, String)> {
+        let index = self.noted_index(dev)?;
+        let link = topo.at(index)?;
+        if link.name == dev {
+            // Cannot happen when the name lookup already failed, but the
+            // honest answer to "renamed to itself" is that it was not.
+            return None;
+        }
+        Some((index, link.name.clone()))
     }
 
     /// Takes every one of `owned` back out of the filter. Returns how many
@@ -561,8 +603,13 @@ impl Syncer {
     /// nothing would ever touch, until a reboot. The tiny cost: a pass
     /// racing a live check can take the probe out early and fail the check
     /// with "accepted but not listed" - a diagnostic re-run, not a harm.
-    pub fn note_check_probe(&self, dev: &str, mac: &Mac) {
-        self.append_owned(dev, &[*mac]);
+    ///
+    /// Whether the noting worked is the answer, and a probe the note could
+    /// not take must not be written at all: "noted first" used to be true
+    /// only when the write happened to succeed, and nothing said otherwise.
+    pub fn note_check_probe(&self, dev: &str, index: u32, mac: &Mac) -> bool {
+        self.note_index(dev, index);
+        self.append_owned(dev, &[*mac])
     }
 
     pub fn forget_check_probe(&self, dev: &str, mac: &Mac) {
@@ -932,60 +979,115 @@ impl Syncer {
             self.carried_wire.insert(pair.dev.clone(), wire);
 
             let owned_before = self.load_owned(&pair.dev);
-            // While the note cannot be read, nothing new is registered for
-            // this device: write_owned will refuse the note afterwards, and
-            // an entry registered in that window would be permanently
-            // ownerless - read_owned promised "leaving that device alone
-            // until it can be read", and the register loop is part of that
-            // promise. Removals need no guard: owned reads empty.
-            let note_ok = self.note_is_readable(&pair.dev);
-            let mut suppressed = 0usize;
             let mut owned = owned_before.clone();
             let mut added = 0usize;
             let mut removed = 0usize;
             let mut foreign = 0usize;
 
+            let mut to_add: Vec<Mac> = Vec::new();
             for mac in &want {
                 if present.contains(mac) {
                     if !owned.contains(mac) {
                         foreign += 1;
                     }
-                    continue;
+                } else {
+                    to_add.push(*mac);
                 }
-                added += 1;
-                if apply && !self.dry_run {
-                    if !note_ok {
-                        added -= 1;
-                        suppressed += 1;
-                        continue;
+            }
+
+            // Which interface these notes are about, recorded so a rename
+            // can be followed. Only where a note exists or is about to.
+            if apply && !self.dry_run && !(owned_before.is_empty() && to_add.is_empty()) {
+                self.note_index(&pair.dev, dev_index);
+            }
+
+            if !apply || self.dry_run {
+                added = to_add.len();
+            } else if !to_add.is_empty() {
+                // The note first, then the card - the order --check has
+                // always used, for the same reason. Written the other way
+                // round, a crash between the two (an OOM kill, an abort)
+                // left an entry in the card that no note named: counted as
+                // foreign from the next start on, and foreign entries are
+                // deliberately never touched. This way round, the crash
+                // leaves a note naming an entry that is not there, and the
+                // ordinary paths heal that: the add is retried while the
+                // address is wanted, and the removal's ENOENT settles the
+                // note once it is not. A note that cannot be written keeps
+                // the card untouched entirely - which also covers the note
+                // that cannot be read, the promise read_owned makes.
+                //
+                // The card is written under the note's lock: --flush reads,
+                // unregisters and unlinks under it, and an intent appended
+                // outside it would meet exactly that window - the flush's
+                // removal answers ENOENT for the not-yet-written entry, the
+                // note is settled away, and the add then lands owned by
+                // nobody.
+                self.locked(&pair.dev, || {
+                    let Some(fresh) = self.append_owned_locked(&pair.dev, &to_add) else {
+                        eprintln!(
+                            "warning: {}: {} address(es) not registered - the \
+                             ownership note has to take them first and could not",
+                            pair.dev,
+                            to_add.len()
+                        );
+                        timings.failures.push(format!(
+                            "{}: note unusable, {} registration(s) held back",
+                            pair.dev,
+                            to_add.len()
+                        ));
+                        return;
+                    };
+                    let fresh: Set<Mac> = fresh.into_iter().collect();
+                    let mut unclaim: Vec<Mac> = Vec::new();
+                    for mac in &to_add {
+                        match sock.set_self_fdb(dev_index, mac, true) {
+                            Ok(()) => {
+                                owned.insert(*mac);
+                                added += 1;
+                            }
+                            // The dump a moment ago said it was absent, so
+                            // somebody else put it there in between - the
+                            // same call from a --once in a second terminal
+                            // is somebody else. Claiming it would mean
+                            // deleting their entry later, so the intent
+                            // this pass noted comes back out; a line that
+                            // predates this pass stays, because it was
+                            // ours all along. The next pass counts the
+                            // entry as foreign.
+                            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                                if fresh.contains(mac) {
+                                    unclaim.push(*mac);
+                                }
+                            }
+                            // The entry does not exist and the note names
+                            // it: the crash posture, reached while running.
+                            // Kept on record on purpose - the retry and the
+                            // ENOENT settling above depend on it.
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: {}: cannot register {}: {e}",
+                                    pair.dev,
+                                    format_mac(mac)
+                                );
+                                timings.failures.push(format!(
+                                    "{}: register {}: {e}",
+                                    pair.dev,
+                                    format_mac(mac)
+                                ));
+                            }
+                        }
                     }
-                    match sock.set_self_fdb(dev_index, mac, true) {
-                        Ok(()) => {
-                            owned.insert(*mac);
-                        }
-                        // The dump a moment ago said it was absent, so
-                        // somebody else put it there in between. Claiming it
-                        // would mean deleting somebody else's entry later -
-                        // the same call as --once from a second terminal is
-                        // somebody else. The next pass counts it as foreign.
-                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                            added -= 1;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "warning: {}: cannot register {}: {e}",
-                                pair.dev,
-                                format_mac(mac)
-                            );
-                            timings.failures.push(format!(
-                                "{}: register {}: {e}",
-                                pair.dev,
-                                format_mac(mac)
-                            ));
-                            added -= 1;
-                        }
+                    if !unclaim.is_empty() && !self.unnote_locked(&pair.dev, &unclaim) {
+                        eprintln!(
+                            "warning: {}: {} refused address(es) could not be taken \
+                             back off the ownership note - they are somebody else's \
+                             entries and would be removed when they stop being wanted",
+                            pair.dev,
+                            unclaim.len()
+                        );
                     }
-                }
+                });
             }
 
             let stale: Vec<Mac> = owned
@@ -1029,46 +1131,17 @@ impl Syncer {
                 }
             }
 
-            if suppressed > 0 {
-                eprintln!(
-                    "warning: {}: note unreadable, {suppressed} address(es) not \
-                     registered until it can be read",
-                    pair.dev
-                );
-                timings.failures.push(format!(
-                    "{}: note unreadable, {suppressed} registration(s) held back",
-                    pair.dev
-                ));
-            }
-
             // Only when this pass changed something: the merge takes the
             // note's lock and reads the file past the stat cache, which an
             // idle pass has no reason to pay - and an empty difference can
-            // never change what is merged.
-            if apply
-                && owned != owned_before
-                && !self.save_owned_merged(&pair.dev, &owned_before, &owned)
-            {
-                // The note does not name what was just registered, and an
-                // entry no note names would never be removed again. Take the
-                // fresh ones back out; the next pass retries them once the
-                // note can be written.
-                let unnoted: Vec<Mac> = owned.difference(&owned_before).copied().collect();
-                for mac in &unnoted {
-                    let _ = sock.set_self_fdb(dev_index, mac, false);
-                }
-                added -= unnoted.len();
-                eprintln!(
-                    "warning: {}: note write failed, unregistered {} fresh \
-                     address(es) for retry",
-                    pair.dev,
-                    unnoted.len()
-                );
-                timings.failures.push(format!(
-                    "{}: note write failed, {} registration(s) rolled back",
-                    pair.dev,
-                    unnoted.len()
-                ));
+            // never change what is merged. The additions are already on
+            // file - they were noted before the card was touched - so what
+            // this records is the removals, and failing to record one is
+            // the safe direction: the note then still names entries that
+            // are out of the card, and a later pass settles them through
+            // ENOENT. write_owned says so when it fails.
+            if apply && owned != owned_before {
+                self.save_owned_merged(&pair.dev, &owned_before, &owned);
             }
 
             // Unsorted on purpose: outside --status only its length is read,
@@ -1115,10 +1188,12 @@ impl Syncer {
     /// that the last one is gone. The pass that follows this batch does
     /// exactly that.
     ///
-    /// The ownership notes are read once per device and written once at the
-    /// end. Doing it per address meant rewriting a growing file for every
-    /// entry of a burst - work that squares with the size of the burst, which
-    /// is exactly when there is least of it to spare.
+    /// The ownership notes are read once per device, and each device's
+    /// additions are appended in one piece - before its card is written,
+    /// the same note-first order the full pass keeps. Doing it per address
+    /// meant rewriting a growing file for every entry of a burst - work
+    /// that squares with the size of the burst, which is exactly when there
+    /// is least of it to spare.
     /// Returns whether the batch is worth a full pass. A batch of learning
     /// that turns out to be entirely somebody else's - addresses appearing on
     /// the wire that were never ours, entries on bridges that have nothing to
@@ -1326,7 +1401,7 @@ impl Syncer {
                 if *kind != crate::netlink::RTM_NEWNEIGH {
                     continue;
                 }
-                self.fast_add(sock, topo, entry, &pairs, &mut would, FastPhase::Decide);
+                self.fast_add(topo, entry, &pairs, &mut would, FastPhase::Decide);
             }
             // An address already registered and ours was vetted by the
             // fresh answer that let it in; re-learning it grows nothing.
@@ -1384,53 +1459,91 @@ impl Syncer {
             }
         }
 
-        let mut registered: Map<String, Vec<Mac>> = crate::hash::map();
+        // What this batch would register, per uplink - decided first,
+        // written after, because the note has to take every address before
+        // the card does. The pass explains the order; it is the same one,
+        // for the same crash.
+        let mut to_register: Map<String, Vec<Mac>> = crate::hash::map();
         for (kind, entry) in events {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
             }
-            if self.fast_add(
-                sock,
-                topo,
-                entry,
-                &pairs,
-                &mut registered,
-                FastPhase::Commit,
-            ) {
+            if self.fast_add(topo, entry, &pairs, &mut to_register, FastPhase::Commit) {
                 urgency = Urgency::Now;
             }
         }
-        for (dev, added) in registered {
-            if !self.append_owned(&dev, &added) {
-                // The note does not name them, and an entry no note names
-                // would never be removed again. Take them back out; the pass
-                // this buys retries them once the note can be written.
-                if let Some(fp) = pairs.iter().find(|f| f.dev == dev) {
-                    for mac in &added {
-                        let _ = sock.set_self_fdb(fp.index, mac, false);
+        for (dev, mut macs) in to_register {
+            // The same address can arrive several times in one drained
+            // burst - once per VLAN on a vlan-aware bridge - and both the
+            // note and the card want it once.
+            macs.sort_unstable();
+            macs.dedup();
+            let Some(fp) = pairs.iter().find(|f| f.dev == dev) else {
+                continue;
+            };
+            self.note_index(&dev, fp.index);
+            // Under the note's lock, like the pass: an intent appended
+            // outside it can be settled away by a concurrent --flush before
+            // the add lands, and the add then lands owned by nobody.
+            self.locked(&dev, || {
+                let Some(fresh) = self.append_owned_locked(&dev, &macs) else {
+                    // A batch of ours already bought the pass, which says
+                    // the held-back count out loud and retries.
+                    eprintln!(
+                        "warning: {dev}: {} address(es) not registered - the \
+                         ownership note has to take them first and could not",
+                        macs.len()
+                    );
+                    return;
+                };
+                let fresh: Set<Mac> = fresh.into_iter().collect();
+                let mut unclaim: Vec<Mac> = Vec::new();
+                for mac in &macs {
+                    match sock.set_self_fdb(fp.index, mac, true) {
+                        Ok(()) => {}
+                        // Somebody else put it there first; claiming it
+                        // would mean deleting their entry later. The intent
+                        // this batch noted comes back out, and the next full
+                        // pass classifies the entry properly.
+                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                            if fresh.contains(mac) {
+                                unclaim.push(*mac);
+                            }
+                        }
+                        // The entry does not exist and the note names it:
+                        // the prompt pass this batch bought retries the add,
+                        // and if the address stops being wanted first, the
+                        // removal's ENOENT settles the note.
+                        Err(e) => {
+                            eprintln!("warning: {dev}: cannot register {}: {e}", format_mac(mac))
+                        }
                     }
                 }
-                eprintln!(
-                    "warning: {dev}: note write failed, unregistered {} fresh \
-                     address(es) for retry",
-                    added.len()
-                );
-                urgency = Urgency::Now;
-            }
+                if !unclaim.is_empty() && !self.unnote_locked(&dev, &unclaim) {
+                    eprintln!(
+                        "warning: {dev}: {} refused address(es) could not be taken \
+                         back off the ownership note - they are somebody else's \
+                         entries and would be removed when they stop being wanted",
+                        unclaim.len()
+                    );
+                }
+            });
         }
         Ok(urgency)
     }
 
-    /// Returns whether this entry was any of our business - registered,
-    /// refused, or something the full pass will have to look at. An entry
-    /// that concerns none of the pairs returns false, and a batch made
-    /// entirely of those does not earn a pass.
+    /// Returns whether this entry was any of our business - a candidate to
+    /// register, refused, or something the full pass will have to look at.
+    /// An entry that concerns none of the pairs returns false, and a batch
+    /// made entirely of those does not earn a pass.
     ///
-    /// In the decide phase nothing is written: what would have been
-    /// registered lands in `registered` and the filter is left alone.
+    /// Nothing is written here, in either phase: what would be registered
+    /// lands in `registered`, and the caller writes the batch through -
+    /// note first - once it is decided. The commit phase used to write the
+    /// card itself, which is what made "note the batch afterwards" the
+    /// only possible order.
     fn fast_add(
         &self,
-        sock: &mut dyn FdbWriter,
         topo: &Topology,
         entry: &FdbEntry,
         pairs: &[FastPair],
@@ -1520,31 +1633,10 @@ impl Syncer {
                 continue;
             }
             ours = true;
-            if phase == FastPhase::Decide {
-                registered
-                    .entry(fp.dev.clone())
-                    .or_default()
-                    .push(entry.mac);
-                continue;
-            }
-            match sock.set_self_fdb(fp.index, &entry.mac, true) {
-                Ok(()) => {
-                    registered
-                        .entry(fp.dev.clone())
-                        .or_default()
-                        .push(entry.mac);
-                }
-                // Already there, and unlike in a full pass nothing checked
-                // beforehand whether it was ours. Claiming it now could mean
-                // deleting somebody else's entry later, so leave the note be;
-                // the next full pass classifies it properly.
-                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
-                Err(e) => eprintln!(
-                    "warning: {}: cannot register {}: {e}",
-                    fp.dev,
-                    format_mac(&entry.mac)
-                ),
-            }
+            registered
+                .entry(fp.dev.clone())
+                .or_default()
+                .push(entry.mac);
         }
         ours
     }
@@ -1582,12 +1674,20 @@ impl Syncer {
             // that wait is precisely what the daemon's append has to sit out.
             let settled = self.locked(&dev, || {
                 let owned = self.load_owned(&dev);
-                let (gone, kept) = match topo.get(&dev) {
-                    Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
+                // The name is how a note is found, the index is what the
+                // entries are attached to - and a rename moves only the
+                // name. The recorded index reaches the entries anyway.
+                let index = topo.get(&dev).map(|l| l.index).or_else(|| {
+                    let (index, new_name) = self.renamed_target(&dev, &topo)?;
+                    println!("{dev}: now called {new_name}, removing through it");
+                    Some(index)
+                });
+                let (gone, kept) = match index {
+                    Some(index) => self.unregister_all(sock, &dev, index, &owned),
                     None => (owned.len(), crate::hash::set()),
                 };
                 if kept.is_empty() && self.note_is_readable(&dev) {
-                    let _ = fs::remove_file(self.state_path(&dev));
+                    self.remove_note(&dev);
                     println!("{dev}: removed {gone} address(es)");
                     true
                 } else {

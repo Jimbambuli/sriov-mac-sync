@@ -75,6 +75,28 @@ only autodetection sees every uplink; naming pairs by hand says nothing about
 the pairs it omits. Notes are written 0600 in a 0700 directory — a note another
 user can write is a note that decides what a root daemon takes out of a card.
 
+**An address is noted before the card takes it** — the order `--check` has
+always used, now used everywhere. Written the other way round, a crash between
+the netlink acknowledgement and the note (an OOM kill, an abort) left an entry
+no note named: counted as foreign from the next start on, and foreign entries
+are deliberately never touched. Note first, the same crash leaves an intent the
+ordinary paths heal — the add is retried while the address is wanted, and the
+removal's ENOENT settles the note once it is not — and a note that cannot be
+written keeps the card untouched entirely. An address the card then refuses as
+somebody else's (EEXIST) has its fresh intent taken back out. The card is
+written under the note's lock, so a `--flush` running in the same moment cannot
+settle the intent away between the append and the add.
+
+**A rename moves the name and nothing else** — the interface, its index and its
+filter entries live on, and the note is found by name. The index is therefore
+recorded beside each note (`.<dev>.owned.index`), and a noted name that is gone
+while its index lives on is read as the rename it is: the note follows the
+interface instead of being unlinked with every entry it names still in the
+card. Within one boot an index identifies an interface outright — the kernel
+hands them out from a counter that does not re-use one — and `/run` does not
+outlive a boot either. `--flush` resolves through the same record, so it
+reaches the entries under whatever name the interface wears now.
+
 ## What a pass costs
 
 Measured on a namespace built for the purpose — 406 interfaces, 9826 forwarding

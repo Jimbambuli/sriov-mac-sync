@@ -43,6 +43,81 @@ impl Syncer {
         self.state_dir.join(format!("{dev}.owned"))
     }
 
+    pub(super) fn index_path(&self, dev: &str) -> PathBuf {
+        self.state_dir.join(format!(".{dev}.owned.index"))
+    }
+
+    /// Record which interface a device's note is about - beside the note,
+    /// not in it, so the note stays a plain list of addresses that any
+    /// build of this program can read.
+    ///
+    /// A note is found by interface name, and a name is the one thing a
+    /// rename takes away while the interface, its filter entries and its
+    /// index all live on. The recorded index is what lets the orphan sweep
+    /// and --flush tell that case from a device that is really gone.
+    /// Within one boot an index identifies an interface outright: the
+    /// kernel hands them out from a per-namespace counter that does not
+    /// re-use one, and /run does not outlive a boot either.
+    ///
+    /// Best-effort, on purpose: without the record a rename is simply not
+    /// followed, which is all this program ever did. The value is cached
+    /// so the write happens when the answer changes, not once per pass -
+    /// and cached even when the write fails, so the warning is said once
+    /// rather than becoming a line per pass forever.
+    pub(super) fn note_index(&self, dev: &str, index: u32) {
+        if self.indices.borrow().get(dev) == Some(&index) {
+            return;
+        }
+        let path = self.index_path(dev);
+        let put = || -> io::Result<()> {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?
+                .write_all(format!("{index}\n").as_bytes())
+        };
+        let wrote = put().or_else(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                self.ensure_state_dir()?;
+                put()
+            } else {
+                Err(e)
+            }
+        });
+        if let Err(e) = wrote {
+            eprintln!(
+                "warning: cannot record which interface {dev} is: {e} - \
+                 a rename of it would not be followed"
+            );
+        }
+        self.indices.borrow_mut().insert(dev.to_string(), index);
+    }
+
+    /// The interface index recorded for a device's note, if any run of
+    /// this program ever recorded one. Read from the file, not the cache:
+    /// the callers are the rename paths, which mostly run in a process
+    /// that never stamped the record itself.
+    pub(super) fn noted_index(&self, dev: &str) -> Option<u32> {
+        fs::read_to_string(self.index_path(dev))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// A note that is settled: the file, its index record and the cached
+    /// copies go together, or a later run reads a record about a note that
+    /// no longer exists.
+    pub(super) fn remove_note(&self, dev: &str) {
+        let _ = fs::remove_file(self.state_path(dev));
+        let _ = fs::remove_file(self.index_path(dev));
+        self.notes.borrow_mut().remove(dev);
+        self.indices.borrow_mut().remove(dev);
+    }
+
     /// The directory the notes live in, made if it is not there - and made
     /// reachable by nobody but the user that runs this.
     ///
@@ -473,19 +548,32 @@ impl Syncer {
         // change the set - so the file would grow by a line every time an
         // address was registered afresh, for ever. Read and write under one
         // lock, or two writers each decide "not there yet" and both add it.
-        self.locked(dev, || self.append_owned_locked(dev, added))
+        self.locked(dev, || self.append_owned_locked(dev, added).is_some())
     }
 
-    pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> bool {
+    /// The addresses that were actually appended - the register paths need
+    /// them, because only a line this very call added may be taken back out
+    /// when the card refuses the address as somebody else's. `None` when
+    /// the note could not take the addresses, and the caller then must not
+    /// write any of them into the card: the note comes first.
+    pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> Option<Vec<Mac>> {
         use std::io::Write;
         let mut set = self.load_owned(dev);
+        // A note that cannot be read cannot be added to either: what the
+        // file holds is unknown, and read_owned has already said the device
+        // is on hold until it can be read. Appending anyway would put lines
+        // into a file this cannot check for duplicates - and, worse, let a
+        // caller register on the strength of a note nobody can believe.
+        if !self.note_is_readable(dev) {
+            return None;
+        }
         let fresh: Vec<Mac> = added
             .iter()
             .filter(|m| !set.contains(*m))
             .copied()
             .collect();
         if fresh.is_empty() {
-            return true;
+            return Some(fresh);
         }
         let mut text = String::with_capacity(fresh.len() * 18);
         for mac in &fresh {
@@ -518,7 +606,7 @@ impl Syncer {
         match wrote {
             Ok(()) => {
                 let expected = was.map(|w| w + text.len() as u64);
-                set.extend(fresh);
+                set.extend(fresh.iter().copied());
                 self.remember(dev, &set);
                 let agrees = match (expected, self.notes.borrow().get(dev)) {
                     (Some(want), Some(now)) => now.len == want,
@@ -532,14 +620,66 @@ impl Syncer {
                     // stop thinking it - the next read goes to the file.
                     self.notes.borrow_mut().remove(dev);
                 }
-                true
+                Some(fresh)
             }
             Err(e) => {
                 self.notes.borrow_mut().remove(dev);
                 eprintln!("warning: cannot add to the ownership note for {dev}: {e}");
-                false
+                None
             }
         }
+    }
+
+    /// Take addresses back out of the note, the lock already held. For the
+    /// intent that turned out to be somebody else's entry: the card
+    /// answered EEXIST, and a line left standing would have that entry
+    /// deleted the day its address stops being wanted. Whether the note now
+    /// agrees - a caller that cannot un-note has claimed a foreign entry
+    /// and has to say so.
+    pub(super) fn unnote_locked(&self, dev: &str, macs: &[Mac]) -> bool {
+        let before = self.load_owned(dev);
+        let mut after = before.clone();
+        for mac in macs {
+            after.remove(mac);
+        }
+        if after.len() == before.len() {
+            return true;
+        }
+        self.write_owned(dev, &after)
+    }
+
+    /// Move a note - and its index record - to the name its interface now
+    /// wears. Both locks are taken, in name order so that two processes
+    /// migrating a swapped pair of names cannot deadlock; the append comes
+    /// before the unlink, so a crash between the two leaves the addresses
+    /// named twice - which the next sweep settles, the append deduplicates -
+    /// rather than named nowhere.
+    pub(super) fn migrate_note(&self, old: &str, new: &str, index: u32) -> bool {
+        let (first, second) = if old <= new { (old, new) } else { (new, old) };
+        self.locked(first, || {
+            self.locked(second, || {
+                let macs: Vec<Mac> = self.load_owned(old).iter().copied().collect();
+                if !self.note_is_readable(old) {
+                    // Unreadable is not "owns nothing": moving nothing and
+                    // unlinking would abandon whatever the note names. It
+                    // stays an orphan and is looked at again.
+                    return false;
+                }
+                if macs.is_empty() {
+                    // A note that was already settled: nothing to move, and
+                    // stamping the new name would leave an index record with
+                    // no note beside it.
+                    self.remove_note(old);
+                    return true;
+                }
+                if self.append_owned_locked(new, &macs).is_none() {
+                    return false; // the new note would not take them; keep the old
+                }
+                self.note_index(new, index);
+                self.remove_note(old);
+                true
+            })
+        })
     }
 
     /// How many addresses this daemon currently has on record as its own,

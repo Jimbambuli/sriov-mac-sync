@@ -142,9 +142,11 @@ daemon will not help.
 Optional configuration.
 .TP
 .I /run/sriov\-mac\-sync/
-One note per uplink, recording which entries are this daemon's. Kept across a
-restart on purpose; a reboot clears it, which is right, because the card's filter
-is empty by then too.
+One note per uplink, recording which entries are this daemon's - written before
+the entry is, so a crash cannot leave an entry nobody owns. Beside each note, a
+record of the uplink's interface index, so the note can follow a renamed
+interface. Kept across a restart on purpose; a reboot clears it, which is right,
+because the card's filter is empty by then too.
 .TP
 .I /usr/lib/systemd/system/sriov\-mac\-sync.service
 The service, as installed by the Debian package.

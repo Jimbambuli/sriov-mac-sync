@@ -535,8 +535,19 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
         // Noted before it is written: a check killed between the write and
         // the take-back then leaves an OWNED entry, which the daemon's next
         // pass removes and heals - unnoted it was foreign, and foreign
-        // entries are deliberately never touched.
-        syncer.note_check_probe(&pair.dev, &probe);
+        // entries are deliberately never touched. Which is why a probe the
+        // note could not take is not written at all: the healing story
+        // held only when this call happened to succeed, and nothing said so.
+        if !syncer.note_check_probe(&pair.dev, link.index, &probe) {
+            println!(
+                "{} ({driver}): cannot check - the probe could not be noted in \
+                 {STATE_DIR} first, and an unnoted probe would outlive a killed \
+                 check as a foreign entry",
+                pair.dev
+            );
+            ok = false;
+            continue;
+        }
         match sock.set_self_fdb(link.index, &probe, true) {
             Ok(()) => {}
             // Left over from an earlier check that could not clean up. The
