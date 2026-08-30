@@ -172,6 +172,10 @@ pub struct Syncer {
     /// note is still written, unlocked; what this stops is a line about it on
     /// every address of every burst.
     lock_warned: std::cell::RefCell<Set<String>>,
+    /// Devices whose quiet-keep memory could not be written, already said
+    /// once - the keeps still work in this process, they just will not
+    /// outlive it, and that is one warning, not one per pass.
+    ports_warned: std::cell::RefCell<Set<String>>,
     /// Whether an unlistable state directory has been said out loud. Once:
     /// the list is asked for on every batch, and the condition does not
     /// come and go.
@@ -210,12 +214,27 @@ pub struct Syncer {
     /// 1200 s against the bridge's 300) keeps sending unicast without asking
     /// again, and without this those frames went out on the wire.
     ///
-    /// Only in memory, on purpose: after a restart, what has already aged is
-    /// treated the way it always was, and heals on the next ARP.
+    /// Written down beside the note, because a daemon that restarts is
+    /// mostly a daemon being updated - and forgetting the keeps there would
+    /// unregister every quiet guest on the next pass, which is the very
+    /// outage this exists to prevent, caused by our own package. The file
+    /// lives in the same tmpfs as the notes, so a reboot still starts from
+    /// nothing: then the addresses are gone from the card too, and there is
+    /// nothing to keep.
     ///
     /// The value is the port and, once the address goes missing from the
-    /// dump, when that was first noticed - the age the pressure valve evicts by.
-    carried_ports: Map<String, Map<Mac, (u32, Option<Instant>)>>,
+    /// dump, when that was first noticed - the age the pressure valve evicts
+    /// by, counted in milliseconds since boot so it can be written down and
+    /// read back by the next process.
+    carried_ports: Map<String, Map<Mac, (u32, Option<u64>)>>,
+    /// Uplinks whose written-down memory has already been read this run. The
+    /// file is the previous process's word and is believed once, at the
+    /// first pass that needs it; after that this process's own map is ahead
+    /// of it.
+    ports_loaded: Set<String>,
+    /// What was last written to each uplink's memory file, so an idle pass
+    /// writes nothing at all.
+    ports_written: Map<String, Vec<String>>,
     /// The filter capacity the quiet-keep must respect. Kept addresses cost
     /// filter slots, and past its capacity the card drops entries silently -
     /// so keeps are the first surrendered as the list nears this limit.
@@ -381,10 +400,13 @@ impl Syncer {
             warned_unknown_vf: crate::hash::set(),
             unreadable: std::cell::RefCell::new(crate::hash::set()),
             lock_warned: std::cell::RefCell::new(crate::hash::set()),
+            ports_warned: std::cell::RefCell::new(crate::hash::set()),
             dir_checked: std::cell::Cell::new(false),
             dir_list_warned: std::cell::Cell::new(false),
             carried_wire: crate::hash::map(),
             carried_ports: crate::hash::map(),
+            ports_loaded: crate::hash::set(),
+            ports_written: crate::hash::map(),
             max_macs: 128,
             noted_quiet: crate::hash::map(),
             warned_extra: crate::hash::map(),
@@ -478,6 +500,13 @@ impl Syncer {
                         if let Some(ports) = self.carried_ports.remove(&dev) {
                             self.carried_ports.insert(new_name.clone(), ports);
                         }
+                        // The written-down copy went with the old note; the
+                        // new name has nothing on file yet, so forget what
+                        // was written there and let the next pass put the
+                        // carried map down under the new name.
+                        self.ports_loaded.remove(&dev);
+                        self.ports_written.remove(&dev);
+                        self.ports_written.remove(&new_name);
                         // The said-once mark travels too, or the same keeps
                         // are announced a second time under the new name.
                         if let Some(said) = self.noted_quiet.remove(&dev) {
@@ -555,6 +584,10 @@ impl Syncer {
             // goes with it, so a return also announces afresh.
             self.carried_ports.remove(&dev);
             self.noted_quiet.remove(&dev);
+            // remove_note took the file; a device that returns as a pair
+            // reads afresh rather than believing this run's leftovers.
+            self.ports_loaded.remove(&dev);
+            self.ports_written.remove(&dev);
         }
     }
 
@@ -659,22 +692,15 @@ impl Syncer {
         if !self.load_owned(dev).contains(mac) {
             return;
         }
-        // Under the lock and against the current file, so whatever a
-        // parallel writer noted meanwhile survives - same rule as every
-        // other write-back. And no trace: when the probe was the note's
-        // only line, note and index came into being for the probe and go
-        // with it - an empty leftover would read as a managed device to
-        // --flush and to anyone listing the state directory.
-        self.locked(dev, || {
-            let mut merged = self.read_owned(dev);
-            merged.remove(mac);
-            if merged.is_empty() {
-                self.remove_note(dev);
-                true
-            } else {
-                self.write_owned(dev, &merged)
-            }
-        });
+        // Under the lock and against the file, so whatever a parallel writer
+        // noted meanwhile survives - same rule as every other write-back.
+        // One line out, the rest byte for byte: a whole-set write would
+        // sort the note, and reordering a file this had no business
+        // changing is a trace where the point was to leave none. When the
+        // probe was the only line, note and index came into being for the
+        // probe and go with it - an empty leftover would read as a managed
+        // device to --flush and to anyone listing the state directory.
+        self.locked(dev, || self.drop_line_locked(dev, mac));
     }
 
     /// Say so when a virtual function's address cannot be known.
@@ -731,6 +757,94 @@ impl Syncer {
                 pf_link.name
             );
         }
+    }
+
+    /// Take the previous process's written-down quiet memory, once per
+    /// uplink per run.
+    ///
+    /// A daemon restarts most often because it is being updated, and an
+    /// update that forgot the keeps would unregister every quiet guest on
+    /// its first pass - the outage this feature exists to prevent, caused
+    /// by our own package. So the file is believed, but only where it still
+    /// describes this kernel: a line counts when the port it names still
+    /// exists AND still carries the index it was written with. An interface
+    /// replaced under the same name, or a name that has moved, therefore
+    /// loses its memory rather than inheriting somebody else's - and losing
+    /// it costs the keeps and nothing else, which is what every build
+    /// before this one did.
+    ///
+    /// Read once: after this the running map is ahead of the file, and a
+    /// second read would put back what this process has already pruned.
+    fn load_ports(&mut self, dev: &str, topo: &Topology) {
+        if !self.ports_loaded.insert(dev.to_string()) {
+            return;
+        }
+        let now = Self::boot_millis();
+        let mut ports: Map<Mac, (u32, Option<u64>)> = crate::hash::map();
+        let mut lines: Vec<String> = Vec::new();
+        for (mac, name, index, since) in self.read_ports(dev) {
+            if topo.index_of(&name) != Some(index) {
+                continue;
+            }
+            // A stamp from after now is a clock that was tampered with or a
+            // file from another boot; treat it as missing since now rather
+            // than as ancient, which would make it the valve's first victim.
+            let since = since.map(|t| t.min(now));
+            ports.insert(mac, (index, since));
+            lines.push(Self::ports_line(&mac, &name, index, since));
+        }
+        if ports.is_empty() {
+            return;
+        }
+        note!(
+            "{dev}: took over {} quiet address(es) from the last run",
+            ports.len()
+        );
+        self.carried_ports.insert(dev.to_string(), ports);
+        lines.sort();
+        self.ports_written.insert(dev.to_string(), lines);
+    }
+
+    fn ports_line(mac: &Mac, name: &str, index: u32, since: Option<u64>) -> String {
+        match since {
+            Some(t) => format!("{} {name} {index} {t}", format_mac(mac)),
+            None => format!("{} {name} {index} -", format_mac(mac)),
+        }
+    }
+
+    /// Write the quiet memory down for whoever runs next, when it changed.
+    ///
+    /// Under the note's lock, like every other writer here: `--once` and
+    /// `--flush` are run by hand while the daemon is running. An idle pass
+    /// writes nothing - the lines are compared against what was last put
+    /// there, so the file is touched when an address is learnt, goes quiet
+    /// or leaves, and not once per pass.
+    fn save_ports(&mut self, dev: &str, topo: &Topology) {
+        // A dry run changes nothing on disk, and --status is a reader: both
+        // keep the memory in RAM for an honest report and leave the file to
+        // whoever is actually managing the card.
+        if self.dry_run {
+            return;
+        }
+        let mut lines: Vec<String> = match self.carried_ports.get(dev) {
+            // A port whose index no longer has a name is a port that is
+            // gone: the keep is over for it anyway, and a line that cannot
+            // be written honestly is better not written.
+            Some(ports) => ports
+                .iter()
+                .filter_map(|(m, &(index, since))| {
+                    topo.name_of(index)
+                        .map(|name| Self::ports_line(m, name, index, since))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        lines.sort();
+        if self.ports_written.get(dev) == Some(&lines) {
+            return;
+        }
+        self.locked(dev, || self.write_ports(dev, &lines));
+        self.ports_written.insert(dev.to_string(), lines);
     }
 
     /// The owned addresses that aged out of the bridge but should stay:
@@ -1073,6 +1187,9 @@ impl Syncer {
             // survivors have to be in `want` by then: a kept address missing
             // from the filter is a growth, and growing on a carried VF
             // answer is exactly the bug class the refresh exists for.
+            // Before the survivors are asked for: the previous run's memory
+            // is what makes an update invisible to a quiet guest.
+            self.load_ports(&pair.dev, topo);
             let owned_before = self.load_owned(&pair.dev);
             // The readability that matters for the memory prune below is the
             // one at THIS read: a note that turns readable again mid-pass
@@ -1185,16 +1302,18 @@ impl Syncer {
             // surrendered keep is exactly the old behaviour, never worse.
             if !kept.is_empty() && want.len() * 10 >= self.max_macs * 9 {
                 let ports = self.carried_ports.get(&pair.dev);
-                let now = Instant::now();
-                let mut order: Vec<(Duration, Mac)> = kept
+                let now = Self::boot_millis();
+                let mut order: Vec<(u64, Mac)> = kept
                     .iter()
                     .map(|m| {
                         // No clock yet means missed this very pass - the
-                        // youngest there is, surrendered last.
+                        // youngest there is, surrendered last. Saturating,
+                        // because a stamp from the future is a clock that
+                        // was tampered with, not an ancient address.
                         let missing = ports
                             .and_then(|ps| ps.get(m))
                             .and_then(|&(_, t)| t)
-                            .map_or(Duration::ZERO, |t| now.duration_since(t));
+                            .map_or(0, |t| now.saturating_sub(t));
                         (missing, *m)
                     })
                     .collect();
@@ -1425,11 +1544,14 @@ impl Syncer {
                 // What the dump no longer shows starts its missing-clock;
                 // a clock already running keeps its start - the age the
                 // pressure valve evicts by measures from the first miss.
-                let now = Instant::now();
+                let now = Self::boot_millis();
                 for (m, slot) in ports.iter_mut() {
                     if slot.1.is_none() && !seen.contains(m) {
                         slot.1 = Some(now);
                     }
+                }
+                if apply {
+                    self.save_ports(&pair.dev, topo);
                 }
             }
 

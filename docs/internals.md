@@ -26,7 +26,7 @@ bridge" is one walk rather than one per interface.
 
 The daemon works from notifications. An address is registered as soon as the
 kernel says a bridge learnt it, dropped when the bridge ages it out - unless
-its port testifies otherwise: the pass remembers, in memory, which bridge port
+its port testifies otherwise: the pass remembers which bridge port
 each owned address was last learnt behind, and an aged-out address whose port
 still exists in the bridge is kept - for a guest the kernel deletes the veth
 or tap with its endpoint, so the port existing is the guest existing, and a
@@ -34,7 +34,22 @@ device behind a physical port in the bridge is blackholed by ageing all the
 same. What bounds the keep is capacity, not time: nearing the filter's limit,
 the longest-missing entries are released first, and every fresh learn makes
 an entry young again. The entry also goes when its port goes or the address
-moves out to the wire. The whole picture is rebuilt whenever an
+moves out to the wire.
+
+That memory outlives the process. It is written to `.<dev>.owned.ports`
+beside the note, under the same lock and through the same temp-and-rename,
+one line per address: the port by name *and* index, and the boot-clock
+reading at which the address went missing. A restart is mostly an update,
+and an update that forgot its keeps would unregister every quiet guest on
+its first pass - the outage the keep exists to prevent, delivered by our
+own package. A line is believed only where it still describes this kernel,
+which is what the name-and-index pair is for: an interface replaced under
+the same name does not inherit somebody else's keeps. The clock is
+`CLOCK_BOOTTIME` in milliseconds, which can be written down and read back
+and cannot step under NTP; the file shares the notes' tmpfs, so a stamp and
+the clock that reads it always come from the same boot. Losing the file
+costs the keeps and nothing else, so every failure to read or write it is a
+warning and a fall back to what every build before it did. The whole picture is rebuilt whenever an
 interface appears, disappears or is reconfigured. What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever

@@ -140,10 +140,13 @@ The quiet-keep covers the bitten set whole: an aged-out address is kept
 while the port it was learnt behind still hangs in the bridge - ageing is
 the bridge managing its own table, not news about the device. The entry
 goes when its port goes, when the address moves out to the wire, or under
-filter pressure, longest-missing first. Where that does not help - an older
-build, a `--once` cron beside the daemon - either pin the address with
-`EXTRA`, or align the one pair of numbers this hinges on: the router's ARP
-lifetime against the bridge's `ageing_time`.
+filter pressure, longest-missing first. The memory is written down beside
+the notes, so an update carries the keeps over instead of unregistering
+every quiet guest on the daemon's first pass, and a `--once` run by hand
+reads the same file rather than working against it. Where none of it helps
+- an older build, or a reboot, after which nothing is registered anyway -
+either pin the address with `EXTRA`, or align the one pair of numbers this
+hinges on: the router's ARP lifetime against the bridge's `ageing_time`.
 
 ## The first registration after a topology change can wait on the host
 

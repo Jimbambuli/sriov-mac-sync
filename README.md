@@ -152,10 +152,12 @@ hardware are welcome; those four steps are the whole test.
   news about the device. The entry goes when its port goes, when the
   address moves out to the wire, or under filter pressure: as the list
   nears its capacity the longest-missing entries are released first, and
-  every fresh learn makes an entry young again. The memory lives in the
-  daemon: after a restart, or beside a hand-run `--once`, an already-aged
-  address falls back to the old behaviour until the next ARP. `EXTRA` still
-  pins an address outright.
+  every fresh learn makes an entry young again. What the daemon remembers
+  is written down beside its notes, so an update or a restart hands the
+  keeps to the next process instead of unregistering every quiet guest on
+  its first pass. A reboot does start from nothing - `/run` is a tmpfs, and
+  the card's filter went with the power. `EXTRA` still pins an address
+  outright.
 - **Stopping the daemon leaves the filter as it is**, which is what makes a
   restart invisible to every guest. `--flush` clears the card.
 - **It only removes what it added**, from a note in `/run/sriov-mac-sync/`.

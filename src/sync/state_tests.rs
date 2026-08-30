@@ -2718,10 +2718,12 @@ fn a_reflection_evicts_the_port_memory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The memory lives with the process, on purpose. A fresh syncer over the
-/// same notes treats what has already aged the way it always was.
+/// A restart is mostly an update, and an update that forgot its keeps
+/// would unregister every quiet guest on its first pass - the outage this
+/// feature exists to prevent, caused by our own package. The memory is
+/// written down beside the note and taken over by whoever runs next.
 #[test]
-fn a_fresh_syncer_has_no_quiet_memory() {
+fn a_restart_takes_over_the_quiet_memory() {
     let dir = scratch("quiet-restart");
     let topo = host(mac(1));
     let mut s = ready_syncer(&dir);
@@ -2731,8 +2733,56 @@ fn a_fresh_syncer_has_no_quiet_memory() {
         ..Default::default()
     };
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // The guest goes quiet while the old process is still running, so the
+    // clock is already ticking when it is written down.
+    age_out(&mut s, &topo, BEHIND_GUEST);
     drop(s);
 
+    let mut restarted = ready_syncer(&dir);
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.push(card_holds(2, BEHIND_GUEST));
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = restarted
+        .reconcile(&mut sock2, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the restart unregistered the quiet guest - the memory did not survive"
+    );
+    assert_eq!(reports[0].quiet, 1);
+    assert!(restarted.load_owned("nic1").contains(&BEHIND_GUEST));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A reboot is the one restart that legitimately forgets: /run is a tmpfs,
+/// so the notes and the memory go together - and the card's filter went
+/// with the power, so there is nothing left to keep.
+#[test]
+fn a_reboot_starts_from_nothing() {
+    let dir = scratch("quiet-reboot");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    age_out(&mut s, &topo, BEHIND_GUEST);
+    assert!(
+        dir.join(".nic1.owned.ports").exists(),
+        "nothing was written down"
+    );
+    drop(s);
+
+    // The tmpfs is empty again, but the note survived on paper - the state
+    // this cannot distinguish from a hand-deleted memory, and it has to
+    // behave like every build before it did.
+    let _ = fs::remove_file(dir.join(".nic1.owned.ports"));
     let mut restarted = ready_syncer(&dir);
     let mut sock2 = FakeSock {
         fdb: fdb_without(BEHIND_GUEST),
@@ -2744,9 +2794,225 @@ fn a_fresh_syncer_has_no_quiet_memory() {
         .unwrap();
     assert!(
         sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
-        "a restart must fall back to the old behaviour"
+        "without a memory a restart has to fall back to the old behaviour"
     );
     assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The written-down memory names a port both ways, and only a line whose
+/// name still carries that very index counts. An interface replaced under
+/// the same name does not hand its keeps to whatever took its place.
+#[test]
+fn a_replaced_port_does_not_inherit_the_memory() {
+    let dir = scratch("quiet-replaced-port");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    age_out(&mut s, &topo, BEHIND_GUEST);
+    drop(s);
+
+    // veth0 was deleted and recreated while nobody was running: same name,
+    // new index - and index 13, which the memory names, now belongs to a
+    // different interface that IS a live port of this bridge. Only the
+    // name-and-index check can tell; an index alone still resolves, and
+    // resolves to somebody else's port.
+    let replaced = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("nic9", 13, Some(mac(9)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .lower("nic2")
+        .lower("nic9")
+        .add("vmbr1.44", 11, Some(mac(1)))
+        .lower("vmbr1")
+        .add("IOT", 12, Some(mac(0x12)))
+        .bridge()
+        .lower("vmbr1.44")
+        .lower("veth0")
+        .add("veth0", 99, Some(mac(0x13)))
+        .master("IOT")
+        .build();
+    let mut restarted = ready_syncer(&dir);
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, BEHIND_GUEST)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = restarted
+        .reconcile(&mut sock2, true, &replaced, Dur::ZERO)
+        .unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the keep was inherited by an interface that only shares the name"
+    );
+    assert!(!restarted.load_owned("nic1").contains(&BEHIND_GUEST));
+    // The address behind nic2 keeps its memory: that port is untouched,
+    // and only the line about veth0 stopped describing this kernel.
+    assert_eq!(reports[0].quiet, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The clock survives with the memory: an address that went quiet before a
+/// restart keeps its age, so the valve still sheds the longest-missing
+/// first rather than treating every survivor as newborn. Asserted through
+/// the valve, because ordering evictions is the only thing the number is
+/// for - reading it back out of the file would pass even if the loading
+/// process had restamped it, because then it would write the same value
+/// back.
+#[test]
+fn the_missing_clock_survives_a_restart() {
+    let dir = scratch("quiet-clock-restart");
+    // `old` sorts after `young`, so only a surviving clock can name it.
+    let old: Mac = [0x02, 0xe6, 0, 0, 0, 2];
+    let young: Mac = [0x02, 0xe6, 0, 0, 0, 1];
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let pairs = vec![Pair {
+        dev: "nic1".into(),
+        bridge: "br0".into(),
+    }];
+    let mut s = Syncer::new(pairs.clone(), dir.clone());
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Both go quiet before the restart, thirty milliseconds apart: after
+    // this the only thing that tells them apart is the gap between their
+    // clocks, which is exactly what has to survive.
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(30));
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, old), card_holds(2, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    drop(s);
+
+    // The update lands, and the filter is tight. The one shed has to be
+    // `old`; a process that restamped both on the way in would see a tie
+    // and fall back to the addresses themselves, which names `young`.
+    let mut restarted = Syncer::new(pairs, dir.clone());
+    restarted.authoritative = true;
+    restarted.max_macs = 3;
+    let mut sock4 = FakeSock {
+        fdb: vec![card_holds(2, old), card_holds(2, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    restarted
+        .reconcile(&mut sock4, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        sock4.removed.iter().any(|(_, m)| *m == old),
+        "the restart lost the head start; the valve shed by address order"
+    );
+    assert!(
+        !sock4.removed.iter().any(|(_, m)| *m == young),
+        "the entry that only just went quiet was shed first"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A memory file full of nonsense is no memory: unreadable lines are
+/// stepped over, and what is left still has to be true of this kernel.
+#[test]
+fn a_damaged_memory_file_is_stepped_over() {
+    let dir = scratch("quiet-damaged");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // Both go quiet, so both are written down with a clock - one line to
+    // damage, one to leave alone.
+    let mut aged: Vec<crate::netlink::FdbEntry> = fdb()
+        .into_iter()
+        .filter(|e| e.mac != BEHIND_GUEST && e.mac != BEHIND_NIC)
+        .collect();
+    aged.push(card_holds(2, BEHIND_GUEST));
+    aged.push(card_holds(2, BEHIND_NIC));
+    let mut quiet = FakeSock {
+        fdb: aged.clone(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut quiet, true, &topo, Dur::ZERO).unwrap();
+    assert!(quiet.removed.is_empty(), "both should be kept, not removed");
+    drop(s);
+
+    let path = dir.join(".nic1.owned.ports");
+    let good = fs::read_to_string(&path).unwrap();
+    // Keep the guest's line intact and replace the other one with a line
+    // whose clock cannot be read, then bury both in junk: no address, an
+    // unparsable index, a truncated line, a blank one.
+    let keep: Vec<&str> = good
+        .lines()
+        .filter(|l| l.starts_with(&format_mac(&BEHIND_GUEST)))
+        .collect();
+    assert_eq!(keep.len(), 1, "the fixture wrote something unexpected");
+    fs::write(
+        &path,
+        format!(
+            "not-an-address veth0 13 0\n{}\n\n02:00:00:00:00:99 veth0 notanumber 0\n\
+             {} nic2 3 notaclock\n02:00:00:00:00:98\n",
+            keep[0],
+            format_mac(&BEHIND_NIC)
+        ),
+    )
+    .unwrap();
+
+    let mut restarted = ready_syncer(&dir);
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = restarted
+        .reconcile(&mut sock2, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the one good line was thrown away with the damaged ones"
+    );
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "a line whose clock cannot be read was believed anyway"
+    );
+    assert_eq!(reports[0].quiet, 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -3774,6 +4040,36 @@ fn a_bound_sister_vf_is_excluded_by_its_netdev() {
     assert!(
         !sock.added.iter().any(|(_, m)| *m == vf_mac),
         "a bound VF's own address was registered past its function"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `--check` leaves the note byte for byte as it found it. The probe is
+/// added and taken away again, and everything else keeps its own bytes and
+/// its own order - a whole-set write would sort the file, which is a trace
+/// where the point is to leave none.
+#[test]
+fn a_check_probe_leaves_the_note_byte_identical() {
+    let dir = scratch("check-bytes");
+    let s = ready_syncer(&dir);
+    const PROBE: Mac = [0x02, 0xe3, 0, 0, 0, 0x61];
+    // Deliberately unsorted, the way an append leaves a note.
+    let path = dir.join("nic1.owned");
+    fs::create_dir_all(&dir).unwrap();
+    let before = format!(
+        "{}\n{}\n{}\n",
+        format_mac(&BEHIND_GUEST),
+        format_mac(&BEHIND_NIC),
+        format_mac(&[0x02, 0x00, 0, 0, 0, 0x77])
+    );
+    fs::write(&path, &before).unwrap();
+
+    assert!(s.note_check_probe("nic1", 2, &PROBE));
+    s.forget_check_probe("nic1", &PROBE);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        before,
+        "the check rewrote the note it was only borrowing"
     );
     let _ = fs::remove_dir_all(&dir);
 }

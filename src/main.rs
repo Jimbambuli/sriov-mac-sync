@@ -1501,6 +1501,12 @@ fn run() -> Result<bool, String> {
                 // disagree with `bridge fdb show` over them.
                 println!("  wanted in filter  : {}", r.wanted.len());
                 println!("  registered by us  : {}", r.owned);
+                // Worth a line only when there are any: the memory this
+                // reads is the running daemon's, taken from the file it
+                // writes, so a fresh --status can now answer for it.
+                if r.quiet > 0 {
+                    println!("  held quiet        : {}", r.quiet);
+                }
                 println!("  unicast list      : {}", r.present);
                 println!(
                     "  stacked bridges   : {}",

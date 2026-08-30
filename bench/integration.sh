@@ -285,6 +285,43 @@ stop_daemon
 $NS bridge fdb replace $M1 dev veth-g1 master dynamic
 $NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
 
+say "S6e: an update hands the keeps to the next process"
+# The scenario the persistence exists for: a quiet guest whose daemon is
+# replaced under it must not be unregistered by the new one's first pass.
+$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6e.log 2>&1 &
+DPID=$!
+sleep 1
+M6="02:be:5c:00:00:66"
+$NS bridge fdb replace $M6 dev veth-g1 master dynamic
+sleep 2
+check "M6 registered while learnt" "has_self $M6"
+# It ages out, and is kept.
+$NS bridge fdb del $M6 dev veth-g1 master
+sleep 3
+check "M6 kept while its port lives" "has_self $M6"
+# The update: stop, start again, and let the new process run a full pass.
+stop_daemon
+$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6e2.log 2>&1 &
+DPID=$!
+sleep 4
+check "M6 survived the restart" "has_self $M6"
+check "the takeover is said" "grep -q 'took over' /tmp/sms-it-s6e2.log"
+# And the memory is still live in the new process: the port going still ends it.
+$NS ip link del veth-g1
+sleep 3
+check "M6 gone once its port is" "! has_self $M6"
+stop_daemon
+# Restore the guest port and M1 for the scenarios that follow.
+$NS ip link add veth-g1 type veth peer name veth-g1P
+$NS ip link set veth-g1 master br0
+$NS sh -c 'ip link set veth-g1 up; ip link set veth-g1P up'
+for _ in $(seq 1 50); do
+  $NS bridge link show dev veth-g1 2>/dev/null | grep -q "state forwarding" && break
+  sleep 0.1
+done
+$NS bridge fdb replace $M1 dev veth-g1 master dynamic
+$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
+
 say "S7: --status reads without writing"
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)
 $NS "$BIN" --status --pair veth-up:br0 >/tmp/sms-it-s7.log 2>&1

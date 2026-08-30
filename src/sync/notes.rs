@@ -47,6 +47,134 @@ impl Syncer {
         self.state_dir.join(format!(".{dev}.owned.index"))
     }
 
+    pub(super) fn ports_path(&self, dev: &str) -> PathBuf {
+        self.state_dir.join(format!(".{dev}.owned.ports"))
+    }
+
+    /// Milliseconds since this boot, the clock the quiet memory is stamped
+    /// in.
+    ///
+    /// `Instant` cannot be written down and read back, and a wall clock can
+    /// step backwards under NTP. `CLOCK_BOOTTIME` counts monotonically from
+    /// boot, suspends included, which is exactly as long as the memory is
+    /// allowed to mean anything: the state directory lives in a tmpfs and
+    /// starts empty after a reboot, so a stamp and the clock that reads it
+    /// always come from the same boot.
+    ///
+    /// Milliseconds rather than seconds because the valve orders by this,
+    /// and two addresses that went quiet in the same second are still one
+    /// after the other - at whole seconds the order fell back to the
+    /// addresses themselves.
+    pub(super) fn boot_millis() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // CLOCK_BOOTTIME is read-only and the struct is ours; the call
+        // cannot fail with these arguments on any kernel this runs on, and
+        // a zero answer would only make everything look equally young.
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+        (ts.tv_sec.max(0) as u64)
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec.max(0) as u64 / 1_000_000)
+    }
+
+    /// The quiet memory as it was last written: which bridge port each owned
+    /// address was learnt behind, and since when it has been missing from
+    /// the forwarding table.
+    ///
+    /// Beside the note rather than in it, so the note stays a plain list of
+    /// addresses that any build of this program can read - the same
+    /// reasoning as the index record. A line is
+    ///
+    ///     <address> <port-name> <port-ifindex> <missing-since|->
+    ///
+    /// and the port is written both ways on purpose: the index is what the
+    /// pass works in, and the caller only believes a line whose name still
+    /// carries that very index. An interface that was replaced under the
+    /// same name, or a name that moved, therefore loses its memory rather
+    /// than inheriting somebody else's.
+    ///
+    /// Best-effort in both directions. This file is evidence, never
+    /// ownership: losing it costs the keeps and nothing else, which is
+    /// exactly what every build before it did.
+    pub(super) fn read_ports(&self, dev: &str) -> Vec<(Mac, String, u32, Option<u64>)> {
+        let Ok(text) = fs::read_to_string(self.ports_path(dev)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut f = line.split_whitespace();
+            let (Some(mac), Some(name), Some(index)) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            let (Some(mac), Ok(index)) = (crate::netlink::parse_mac(mac), index.parse::<u32>())
+            else {
+                continue;
+            };
+            // A missing clock is written as a dash: the address was in the
+            // table when this was written, so it has not started ageing.
+            let since = match f.next() {
+                Some("-") | None => None,
+                Some(v) => match v.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => continue,
+                },
+            };
+            out.push((mac, name.to_string(), index, since));
+        }
+        out
+    }
+
+    /// Write the quiet memory, under the note's lock and through a temporary
+    /// file - the same rules the note itself is written by, for the same
+    /// reasons. Says so once per device when it cannot, and then carries on:
+    /// the memory still works in this process, it just will not outlive it.
+    pub(super) fn write_ports(&self, dev: &str, lines: &[String]) {
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            let mut sorted = lines.to_vec();
+            sorted.sort();
+            sorted.join("\n") + "\n"
+        };
+        let put = |tmp: &PathBuf| -> io::Result<()> {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(tmp)?
+                .write_all(text.as_bytes())
+        };
+        let write = || -> io::Result<()> {
+            let tmp = self
+                .state_dir
+                .join(format!(".{dev}.owned.ports.{}.tmp", std::process::id()));
+            if let Err(e) = put(&tmp) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(e);
+                }
+                self.ensure_state_dir()?;
+                put(&tmp)?;
+            }
+            fs::rename(&tmp, self.ports_path(dev)).map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                e
+            })
+        };
+        if let Err(e) = write() {
+            if self.ports_warned.borrow_mut().insert(dev.to_string()) {
+                eprintln!(
+                    "warning: cannot write the quiet-keep memory for {dev}: {e} - \
+                     addresses held while their port lives will be forgotten if \
+                     this daemon restarts"
+                );
+            }
+        }
+    }
+
     /// Record which interface a device's note is about - beside the note,
     /// not in it, so the note stays a plain list of addresses that any
     /// build of this program can read.
@@ -114,6 +242,10 @@ impl Syncer {
     pub(super) fn remove_note(&self, dev: &str) {
         let _ = fs::remove_file(self.state_path(dev));
         let _ = fs::remove_file(self.index_path(dev));
+        // The quiet memory is about the addresses this note names; without
+        // the note it says nothing, and a device that comes back records
+        // afresh from its first dump.
+        let _ = fs::remove_file(self.ports_path(dev));
         self.notes.borrow_mut().remove(dev);
         self.indices.borrow_mut().remove(dev);
     }
@@ -439,6 +571,90 @@ impl Syncer {
     /// records the set - a caller that registered something on the strength
     /// of this write has to know, because an entry in the card that no note
     /// names would never be removed again.
+    /// The note's bytes onto disk: a temporary file, then a rename.
+    ///
+    /// Through a temporary file because a note truncated by a crash
+    /// mid-write would read as "we own nothing". The name is a hidden
+    /// prefix, not a suffix - "eth0.new" is a perfectly legal interface
+    /// name whose own note would otherwise be this file - and it carries
+    /// the process id, because the daemon is not the only thing that writes
+    /// these: `--once` and `--flush` are run by hand while it is running,
+    /// and two of them sharing one temporary file means one truncates what
+    /// the other is writing and then renames it into place.
+    ///
+    /// 0600 rather than what `fs::write` asks for, which is 0666 with the
+    /// process umask taken off it: the note the rename leaves behind keeps
+    /// the mode of the temporary file it came from, and a note other users
+    /// may write is a note that decides what this daemon takes out of a
+    /// card. The directory is 0700 as well; this is the second lock on the
+    /// same door, for the case where the directory was made by something
+    /// else.
+    fn put_note(&self, dev: &str, text: &str) -> io::Result<()> {
+        let put = |tmp: &PathBuf| -> io::Result<()> {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(tmp)?
+                .write_all(text.as_bytes())
+        };
+        let tmp = self
+            .state_dir
+            .join(format!(".{dev}.owned.{}.tmp", std::process::id()));
+        if let Err(e) = put(&tmp) {
+            // The directory is created by the unit and survives a restart;
+            // asking for it on every write was a syscall per write for a
+            // thing that is already there.
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+            self.ensure_state_dir()?;
+            put(&tmp)?;
+        }
+        fs::rename(&tmp, self.state_path(dev)).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            e
+        })
+    }
+
+    /// Take one address out of a note without touching the rest of it.
+    ///
+    /// The whole-set write sorts, and a `--check` that reordered a note it
+    /// had no business changing is a trace where the point was to leave
+    /// none. The lines that stay keep their bytes and their order; only the
+    /// one line goes. Under the caller's lock.
+    pub(super) fn drop_line_locked(&self, dev: &str, mac: &Mac) -> bool {
+        let Ok(text) = fs::read_to_string(self.state_path(dev)) else {
+            return false;
+        };
+        let wanted = format_mac(mac);
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim() != wanted && !l.trim().is_empty())
+            .collect();
+        if kept.is_empty() {
+            // The note existed for this address alone - it came into being
+            // with the probe and goes with it, index record and all.
+            self.remove_note(dev);
+            return true;
+        }
+        let text = kept.join("\n") + "\n";
+        match self.put_note(dev, &text) {
+            Ok(()) => {
+                // The remembered copy is about a file that just changed.
+                self.notes.borrow_mut().remove(dev);
+                true
+            }
+            Err(e) => {
+                self.notes.borrow_mut().remove(dev);
+                eprintln!("warning: cannot write the ownership note for {dev}: {e}");
+                false
+            }
+        }
+    }
+
     pub(super) fn write_owned(&self, dev: &str, set: &Set<Mac>) -> bool {
         if !self.note_is_readable(dev) {
             eprintln!(
@@ -486,36 +702,7 @@ impl Syncer {
         // card. The directory is 0700 as well; this is the second lock on the
         // same door, for the case where the directory was made by something
         // else.
-        let put = |tmp: &PathBuf| -> io::Result<()> {
-            use std::io::Write;
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(tmp)?
-                .write_all(text.as_bytes())
-        };
-        let write = || -> io::Result<()> {
-            let tmp = self
-                .state_dir
-                .join(format!(".{dev}.owned.{}.tmp", std::process::id()));
-            if let Err(e) = put(&tmp) {
-                // The directory is created by the unit and survives a
-                // restart; asking for it on every write was a syscall per
-                // write for a thing that is already there.
-                if e.kind() != io::ErrorKind::NotFound {
-                    return Err(e);
-                }
-                self.ensure_state_dir()?;
-                put(&tmp)?;
-            }
-            fs::rename(&tmp, self.state_path(dev)).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                e
-            })
-        };
-        match write() {
+        match self.put_note(dev, &text) {
             Ok(()) => {
                 self.remember(dev, set);
                 true
