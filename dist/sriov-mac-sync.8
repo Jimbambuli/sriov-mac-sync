@@ -80,8 +80,9 @@ the mechanism: addresses are registered the moment the kernel reports them.
 .TP
 .BI \-\-max " NUM"
 The filter capacity to respect (default 128): warn above it, and surrender
-kept quiet addresses, longest\-missing first, as the list nears nine tenths
-of it \(em lowering this releases keeps. The vport list on a ConnectX\-4 Lx
+kept quiet addresses, longest\-missing first, as the measured list \(em
+foreign entries included, read back from the card each pass \(em comes
+within a few slots of it. Lowering this releases keeps. The vport list on a ConnectX\-4 Lx
 holds 128; other hardware differs. Where the card reports its capacity
 through the devlink parameter
 .B max_macs

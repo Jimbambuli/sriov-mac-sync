@@ -156,7 +156,10 @@ hardware are welcome; those four steps are the whole test.
   news about the device. The entry goes when its port goes, when the
   address moves out to the wire, or under filter pressure: as the list
   nears its capacity the longest-missing entries are released first, and
-  every fresh learn makes an entry young again. What the daemon remembers
+  every fresh learn makes an entry young again. Pressure is measured, not
+  assumed - the card's own list is read back each pass, so foreign entries
+  count, and a burst on the event path surrenders a keep synchronously
+  rather than overflowing the card for even a moment. What the daemon remembers
   is written down beside its notes, so an update or a restart hands the
   keeps to the next process instead of unregistering every quiet guest on
   its first pass. A reboot does start from nothing - `/run` is a tmpfs, and

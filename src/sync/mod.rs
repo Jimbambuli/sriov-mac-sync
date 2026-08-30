@@ -84,6 +84,14 @@ pub enum Urgency {
 /// help text both read it.
 pub const DEFAULT_MAX_MACS: usize = 128;
 
+/// Slots deliberately left free below `max_macs`: an allowance for counting
+/// drift, not a working reserve. The occupancy the valve and the fast path
+/// act on is read back from the card's own list each pass and carried
+/// between passes, so the old blind tenth shrank to a few slots that cover
+/// what a count can still miss - a parallel writer's entries between two
+/// passes, an add in flight while a batch decides.
+const CAPACITY_HEADROOM: usize = 4;
+
 pub struct Report {
     pub dev: String,
     pub bridge: String,
@@ -252,6 +260,12 @@ pub struct Syncer {
     /// quiet-keep is announced once per entry into that state rather than
     /// once per pass forever.
     noted_quiet: Map<String, Set<Mac>>,
+    /// The unicast slots each uplink's filter held at the end of the last
+    /// pass - measured from the card's own list, foreign entries included,
+    /// then carried forward by the fast path's own adds and removals. What
+    /// makes the event path capacity-aware without paying a dump per batch;
+    /// corrected against the read-back every pass.
+    carried_occupancy: Map<String, usize>,
     /// Uplinks already warned about exceeding the filter capacity, re-armed
     /// when the count drops back under: an overloaded bridge buys passes at
     /// the event rate, and the same warning five times a second is how an
@@ -416,6 +430,7 @@ impl Syncer {
             max_macs: DEFAULT_MAX_MACS,
             noted_quiet: crate::hash::map(),
             warned_over: crate::hash::set(),
+            carried_occupancy: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
             indices: std::cell::RefCell::new(crate::hash::map()),
@@ -529,6 +544,9 @@ impl Syncer {
                         if self.warned_over.remove(&dev) {
                             self.warned_over.insert(new_name.clone());
                         }
+                        if let Some(occ) = self.carried_occupancy.remove(&dev) {
+                            self.carried_occupancy.insert(new_name.clone(), occ);
+                        }
                         // And onto disk under the new name at once: the old
                         // file went with the old note, and a crash before
                         // the pair's next pass would otherwise forget the
@@ -610,6 +628,7 @@ impl Syncer {
             // greets a device that returns.
             self.carried_wire.remove(&dev);
             self.warned_over.remove(&dev);
+            self.carried_occupancy.remove(&dev);
             // remove_note took the file; a device that returns as a pair
             // reads afresh rather than believing this run's leftovers.
             self.ports_loaded.remove(&dev);
@@ -895,6 +914,76 @@ impl Syncer {
             self.locked(dev, || self.write_ports(dev, &lines));
         }
         self.ports_written.insert(dev.to_string(), lines);
+    }
+
+    /// Surrender up to `need` kept addresses, longest-missing first -
+    /// card, note and memory in the same breath, under the note's lock
+    /// like every other removal. The fast path's arm of the pressure
+    /// valve: a burst that would overflow the card cannot wait the 200 ms
+    /// for a pass, because past its limit the card drops arbitrarily -
+    /// possibly the very guest that is speaking. Returns how many slots
+    /// were really freed.
+    fn shed_keeps(
+        &mut self,
+        sock: &mut dyn FdbWriter,
+        dev: &str,
+        index: u32,
+        need: usize,
+        topo: &Topology,
+    ) -> usize {
+        let Some(ports) = self.carried_ports.get(dev) else {
+            return 0;
+        };
+        let mut cands: Vec<(u64, Mac)> = ports
+            .iter()
+            .filter_map(|(m, &(_, t))| t.map(|t| (t, *m)))
+            .collect();
+        // Smallest stamp = missing longest; the address is the tiebreak,
+        // as in the pass's valve.
+        cands.sort_unstable();
+        cands.truncate(need);
+        if cands.is_empty() {
+            return 0;
+        }
+        let mut dropped: Vec<Mac> = Vec::new();
+        self.locked(dev, || {
+            for (_, mac) in &cands {
+                match sock.set_self_fdb(index, mac, false) {
+                    Ok(()) => dropped.push(*mac),
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => dropped.push(*mac),
+                    Err(e) => eprintln!(
+                        "warning: {dev}: cannot release quiet {}: {e}",
+                        format_mac(mac)
+                    ),
+                }
+            }
+            if !dropped.is_empty() {
+                let mut fin = self.read_owned(dev);
+                for mac in &dropped {
+                    fin.remove(mac);
+                }
+                self.write_owned(dev, &fin);
+            }
+        });
+        if dropped.is_empty() {
+            return 0;
+        }
+        if let Some(ports) = self.carried_ports.get_mut(dev) {
+            for mac in &dropped {
+                ports.remove(mac);
+            }
+        }
+        self.save_ports(dev, topo);
+        if let Some(est) = self.carried_occupancy.get_mut(dev) {
+            *est = est.saturating_sub(dropped.len());
+        }
+        note!(
+            "{dev}: filter nearing its {} limit, released {} quiet \
+             address(es) [pressure]",
+            self.max_macs,
+            dropped.len()
+        );
+        dropped.len()
     }
 
     /// One spelling of "what the filter should hold": the desired set with
@@ -1360,7 +1449,18 @@ impl Syncer {
             // first: every fresh learn makes an entry young again, so what
             // goes is what has not been heard from for the longest. A
             // surrendered keep is exactly the old behaviour, never worse.
-            if !kept.is_empty() && want.len() * 10 >= self.max_macs * 9 {
+            //
+            // The limit is measured, not assumed: the pass reads the card's
+            // own unicast list back anyway, so foreign entries occupy real
+            // slots HERE too, instead of eating an invisible margin. What
+            // the pass will leave behind is `want` plus the present entries
+            // that are neither wanted nor ours to remove.
+            let foreign_extra = present
+                .iter()
+                .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
+                .count();
+            let mut occupied = want.len() + foreign_extra;
+            if !kept.is_empty() && occupied + CAPACITY_HEADROOM > self.max_macs {
                 let ports = self.carried_ports.get(&pair.dev);
                 let now = Self::boot_millis();
                 let mut order: Vec<(u64, Mac)> = kept
@@ -1380,11 +1480,15 @@ impl Syncer {
                 order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let mut shed = 0usize;
                 for (_, m) in order {
-                    if want.len() * 10 < self.max_macs * 9 {
+                    if occupied + CAPACITY_HEADROOM <= self.max_macs {
                         break;
                     }
+                    // A shed keep leaves `want`; the stale loop below takes
+                    // it out of the card in this same pass, so the slot
+                    // really frees.
                     want.remove(&m);
                     kept.remove(&m);
+                    occupied -= 1;
                     shed += 1;
                 }
                 if apply && shed > 0 {
@@ -1655,22 +1759,21 @@ impl Syncer {
             // a --status predicting the same number is not the daemon's
             // journal line.
             if apply {
-                if want.len() > self.max_macs {
+                if occupied > self.max_macs {
                     if self.warned_over.insert(pair.dev.clone()) {
                         eprintln!(
-                            "warning: {}: {} addresses behind {}, above the {} the \
-                             vport list is assumed to hold - some will be dropped \
-                             silently",
-                            pair.dev,
-                            want.len(),
-                            pair.bridge,
-                            self.max_macs
+                            "warning: {}: {} unicast entries against the {} the \
+                             vport list holds - some will be dropped silently, \
+                             and not by choice",
+                            pair.dev, occupied, self.max_macs
                         );
                     }
                 } else {
                     self.warned_over.remove(&pair.dev);
                 }
             }
+            // What the fast path counts from until the next pass corrects it.
+            self.carried_occupancy.insert(pair.dev.clone(), occupied);
 
             // Unsorted on purpose: outside --status only its length is read,
             // and the status page sorts for display itself.
@@ -1939,6 +2042,10 @@ impl Syncer {
                         ports.remove(mac);
                     }
                 }
+                // Slots the Ok-arm really freed leave the carried count too.
+                if let Some(est) = self.carried_occupancy.get_mut(&fp.dev) {
+                    *est = est.saturating_sub(taken_back.len());
+                }
                 // And out of the written-down memory too: an eviction that
                 // lived only in RAM could come back through the file after
                 // a crash, once the wire evidence has aged - re-registering
@@ -2068,10 +2175,20 @@ impl Syncer {
             let Some(fp) = pairs.iter().find(|f| f.dev == dev) else {
                 continue;
             };
+            // The batch counts against the occupancy the last pass measured
+            // plus this process's own effect since. A burst that would not
+            // fit surrenders keeps first - new learns outrank the quiet.
+            let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);
+            let est = self.carried_occupancy.get(&dev).copied().unwrap_or(0);
+            let over = (est + macs.len()).saturating_sub(allowed);
+            if over > 0 {
+                self.shed_keeps(sock, &dev, fp.index, over, topo);
+            }
             self.note_index(&dev, fp.index);
             // Under the note's lock, like the pass: an intent appended
             // outside it can be settled away by a concurrent --flush before
             // the add lands, and the add then lands owned by nobody.
+            let mut put = 0usize;
             self.locked(&dev, || {
                 let Some(fresh) = self.append_owned_locked(&dev, &macs) else {
                     // A batch of ours already bought the pass, which says
@@ -2087,7 +2204,7 @@ impl Syncer {
                 let mut unclaim: Vec<Mac> = Vec::new();
                 for mac in &macs {
                     match sock.set_self_fdb(fp.index, mac, true) {
-                        Ok(()) => {}
+                        Ok(()) => put += 1,
                         // Somebody else put it there first; claiming it
                         // would mean deleting their entry later. The intent
                         // this batch noted comes back out, and the next full
@@ -2115,6 +2232,11 @@ impl Syncer {
                     );
                 }
             });
+            // The card really holds `put` more slots now; the next pass's
+            // read-back corrects any drift.
+            if put > 0 {
+                *self.carried_occupancy.entry(dev.clone()).or_insert(0) += put;
+            }
         }
         Ok(urgency)
     }

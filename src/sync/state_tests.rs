@@ -2860,7 +2860,7 @@ fn the_missing_clock_survives_a_restart() {
     // `old`; a process that restamped both on the way in would see a tie
     // and fall back to the addresses themselves, which names `young`.
     let mut restarted = br0_syncer(&dir);
-    restarted.max_macs = 3;
+    restarted.max_macs = 6;
     let mut sock4 = FakeSock {
         fdb: vec![card_holds(2, old), card_holds(2, young)],
         vf: vec![(2, VF_ADMIN)],
@@ -3149,8 +3149,9 @@ fn the_pressure_valve_sheds_keeps_first() {
     };
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
-    // All three age out; the limit leaves no room for all of them.
-    s.max_macs = 4;
+    // All three age out; with the bridge's own address that is four
+    // occupied slots against allowed = max - headroom = 3: one must yield.
+    s.max_macs = 7;
     let mut sock2 = FakeSock {
         fdb: vec![card_holds(2, m1), card_holds(2, m2), card_holds(2, m3)],
         vf: vec![(2, VF_ADMIN)],
@@ -3198,7 +3199,7 @@ fn the_pressure_valve_sheds_the_longest_missing_first() {
 
     // Now both are quiet, and the limit leaves room for only some of the
     // list: the longest-missing - `old` - is the one surrendered.
-    s.max_macs = 3;
+    s.max_macs = 6;
     let mut sock3 = FakeSock {
         fdb: vec![card_holds(2, old), card_holds(2, young)],
         vf: vec![(2, VF_ADMIN)],
@@ -3546,11 +3547,11 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The valve opens AT nine tenths, not past it: with the equality case
-/// off by one, a filter sitting exactly at the line would take one more
-/// learn and overflow the card in silence.
+/// The valve opens exactly when the measured occupancy no longer fits
+/// above the headroom, and not one slot earlier: off by one in either
+/// direction means a needless shed or a silent overflow on the next learn.
 #[test]
-fn the_pressure_valve_opens_exactly_at_nine_tenths() {
+fn the_pressure_valve_opens_exactly_at_its_margin() {
     let dir = scratch("quiet-pressure-edge");
     let topo = small_host();
     let mut s = br0_syncer(&dir);
@@ -3563,19 +3564,34 @@ fn the_pressure_valve_opens_exactly_at_nine_tenths() {
     };
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
-    // All eight age; 9 * 10 >= 10 * 9 holds with equality and nothing to
-    // spare - exactly one keep has to yield.
-    s.max_macs = 10;
+    // All eight age: nine occupied slots. At max 13 they sit exactly on
+    // the margin (9 + 4 == 13) and nothing may yield yet.
+    s.max_macs = 13;
     let mut sock2 = FakeSock {
         fdb: learns.iter().map(|m| card_holds(2, *m)).collect(),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.is_empty(),
+        "exactly on the margin nothing yields (quiet={})",
+        reports[0].quiet
+    );
+    assert_eq!(reports[0].quiet, 8);
+
+    // One slot tighter, and exactly one keep has to go.
+    s.max_macs = 12;
+    let mut sock3 = FakeSock {
+        fdb: learns.iter().map(|m| card_holds(2, *m)).collect(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert_eq!(
-        sock2.removed.len(),
+        sock3.removed.len(),
         1,
-        "at the nine-tenths line exactly one keep yields (quiet={})",
+        "one past the margin exactly one keep yields (quiet={})",
         reports[0].quiet
     );
     assert_eq!(reports[0].quiet, 7);
@@ -3621,7 +3637,7 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
     std::thread::sleep(Dur::from_millis(20));
 
     // Pass 4, under pressure: the one shed has to be `old`.
-    s.max_macs = 3;
+    s.max_macs = 6;
     let mut sock4 = FakeSock {
         fdb: both,
         vf: vec![(2, VF_ADMIN)],
@@ -3926,7 +3942,7 @@ fn a_future_stamp_is_clamped_not_believed() {
     // load itself does not panic and `bogus` is NOT shed first despite a
     // stamp that, taken at face value, dwarfs every honest one.
     let mut restarted = br0_syncer(&dir);
-    restarted.max_macs = 3;
+    restarted.max_macs = 6;
     let mut sock3 = FakeSock {
         fdb: vec![card_holds(2, honest), card_holds(2, bogus)],
         vf: vec![(2, VF_ADMIN)],
@@ -3992,4 +4008,108 @@ fn filetime_backdate(path: &std::path::Path) -> (i64, i64) {
     let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
     assert_eq!(rc, 0, "utimensat failed");
     (old, 0)
+}
+
+/// Foreign entries occupy real slots, and the valve counts them: the card
+/// is read back anyway, so somebody's hand-added entries must press on
+/// the keeps instead of eating an invisible margin.
+#[test]
+fn the_pressure_valve_counts_foreign_entries() {
+    let dir = scratch("quiet-pressure-foreign");
+    let m1: Mac = [0x02, 0xe8, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, m1)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // m1 ages; two slots are wanted (bridge + keep). Alone that fits a
+    // max of 6 - but four foreign entries sit in the card, and 2 + 4 + 4
+    // headroom crosses 6: the keep has to yield to reality.
+    s.max_macs = 6;
+    let foreign: Vec<crate::netlink::FdbEntry> = (1..=4u8)
+        .map(|i| card_holds(2, [0xaa, 0xee, 0, 0, 0, i]))
+        .collect();
+    let mut fdb2 = vec![card_holds(2, m1)];
+    fdb2.extend(foreign.clone());
+    let mut sock2 = FakeSock {
+        fdb: fdb2,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == m1),
+        "foreign entries went uncounted; the keep stayed past the margin"
+    );
+    assert!(
+        !sock2
+            .removed
+            .iter()
+            .any(|(_, m)| m[0] == 0xaa && m[1] == 0xee),
+        "foreign entries are pressed against, never touched"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The fast path is capacity-aware: a learn that would not fit surrenders
+/// the longest-missing keep synchronously - card, note and memory in one
+/// breath - because 200 ms of overflow is 200 ms of the card dropping
+/// arbitrarily, possibly the very guest that is speaking.
+#[test]
+fn a_burst_over_capacity_sheds_a_keep_on_the_fast_path() {
+    let dir = scratch("quiet-fast-shed");
+    let old: Mac = [0x02, 0xe9, 0, 0, 0, 1];
+    let newcomer: Mac = [0x02, 0xe9, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, old)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // `old` goes quiet; occupancy is 2 (bridge + keep) with max 6, i.e.
+    // exactly at allowed = max - headroom.
+    s.max_macs = 6;
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, old)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&old));
+
+    // A new guest speaks. The batch would make three against allowed two:
+    // the keep leaves in the same batch, the newcomer gets its slot.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == old),
+        "the keep did not yield to the newcomer on the fast path"
+    );
+    assert!(
+        sock3.added.iter().any(|(_, m)| *m == newcomer),
+        "the newcomer was not registered"
+    );
+    assert!(
+        !s.load_owned("nic1").contains(&old),
+        "the shed keep stayed on the note - an orphan in the making"
+    );
+    assert!(s.load_owned("nic1").contains(&newcomer));
+    let _ = fs::remove_dir_all(&dir);
 }

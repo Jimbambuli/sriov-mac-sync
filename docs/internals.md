@@ -33,8 +33,14 @@ or tap with its endpoint, so the port existing is the guest existing, and a
 device behind a physical port in the bridge is blackholed by ageing all the
 same. What bounds the keep is capacity, not time: nearing the filter's limit,
 the longest-missing entries are released first, and every fresh learn makes
-an entry young again. The entry also goes when its port goes or the address
-moves out to the wire.
+an entry young again. The pressure is measured against the card's own
+unicast list, read back each pass - foreign entries occupy real slots and
+count - and the event path carries that count between passes, surrendering
+the longest-missing keep synchronously when a burst would not fit: past its
+limit the card drops arbitrarily, and 200 ms of overflow is 200 ms of
+somebody unreachable. What stays free below the limit is a few slots of
+counting drift, not the blind tenth it once was. The entry also goes when
+its port goes or the address moves out to the wire.
 
 That memory outlives the process. It is written to `.<dev>.owned.ports`
 beside the note, under the same lock and through the same temp-and-rename,
