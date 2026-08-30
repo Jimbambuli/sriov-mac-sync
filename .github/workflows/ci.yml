@@ -137,6 +137,10 @@ jobs:
             echo "the upgrade cleared the state directory"; exit 1
           fi
           test "$(systemctl is-enabled sriov-mac-sync)" = enabled
+          # The unit that would actually run is the packaged one, not a
+          # leftover in /etc that would shadow it.
+          test "$(systemctl show -p FragmentPath --value sriov-mac-sync)" \
+            = /usr/lib/systemd/system/sriov-mac-sync.service
           sudo dpkg --purge sriov-mac-sync
           # Not `! test -e`: errexit exempts !-pipelines, and a leftover
           # would have sailed through green.

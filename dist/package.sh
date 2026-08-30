@@ -4,7 +4,7 @@
 # for Alpine: it ships the procd init and OpenWrt arch names. Everything
 # lands in dist/out/, for x86_64 and aarch64.
 #
-#   ./dist/package.sh [version]
+#   [APK=/path/to/apk.static] ./dist/package.sh
 #
 # Needs cargo with the two musl targets installed, plus ar, tar, gzip and
 # dpkg-deb. The binaries are static, so the packages depend on nothing at all -
@@ -35,13 +35,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
-CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-VERSION=${1:-$CARGO_VERSION}
-# A caller-supplied version that disagrees with Cargo.toml would stamp the
-# control files with a number the binary's --version contradicts.
-if [ "$VERSION" != "$CARGO_VERSION" ]; then
-	echo "error: version argument $VERSION does not match Cargo.toml's $CARGO_VERSION" >&2
-	echo "       bump Cargo.toml first; the packages and the binary must agree" >&2
+# Cargo.toml is the one place a version lives: the binary reports it from
+# there, so a number from anywhere else would stamp control files the
+# binary's --version contradicts.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+if [ -n "${1:-}" ]; then
+	echo "error: this takes no arguments - the version comes from Cargo.toml" >&2
 	exit 2
 fi
 # Reproducibility: dpkg-deb clamps its mtimes to this natively; the ipk tar
@@ -122,6 +121,14 @@ if [ "$1" = configure ]; then
 	if [ -x /usr/bin/deb-systemd-helper ]; then
 		deb-systemd-helper unmask sriov-mac-sync.service >/dev/null || true
 		deb-systemd-helper enable sriov-mac-sync.service >/dev/null || true
+	fi
+	# A source install puts the unit in /etc/systemd/system, which wins
+	# over the packaged one for good: dpkg would report the new version
+	# while the machine goes on running whatever that unit points at.
+	if [ -e /etc/systemd/system/sriov-mac-sync.service ]; then
+		echo "warning: /etc/systemd/system/sriov-mac-sync.service shadows this" >&2
+		echo "         package's unit - remove it, or the packaged binary" >&2
+		echo "         will not be the one that runs." >&2
 	fi
 	if [ -d /run/systemd/system ]; then
 		systemctl daemon-reload || true
@@ -214,6 +221,11 @@ EOF
 # runs until reboot: the very bug the .deb postinst names. The restart is
 # safe now precisely because the quiet-keep memory is handed over.
 if [ "${PKG_UPGRADE:-0}" = 1 ]; then
+	# Re-enable only what was enabled: the START level may move between
+	# versions, leaving the old rc.d symlink behind - but a service the
+	# operator switched off deliberately stays off.
+	ls /etc/rc.d/[SK]??sriov-mac-sync >/dev/null 2>&1 &&
+		/etc/init.d/sriov-mac-sync enable
 	/etc/init.d/sriov-mac-sync restart 2>/dev/null
 	echo "sriov-mac-sync restarted on the new binary."
 	exit 0
@@ -241,6 +253,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 	pgrep -x sriov-mac-sync >/dev/null 2>&1 || break
 	sleep 0.5
 done
+# Still up? Then --flush would take entries out from under a live daemon,
+# which puts them straight back - and the package is gone by then, so
+# nothing owns what stays in the card. Say so and leave it alone.
+if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
+	echo "sriov-mac-sync did not stop; not flushing - run" >&2
+	echo "  sriov-mac-sync --flush" >&2
+	echo "once it is down, or its entries stay in the card." >&2
+	exit 0
+fi
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 exit 0
@@ -268,7 +289,10 @@ apk() {    # arch-suffix apk-arch
 	fi
 	echo "== .apk for $2"
 	root=$(mktemp -d)
-	TMPROOTS="$TMPROOTS $root"
+	# The maintainer scripts live beside the root, not in it, so the trap
+	# has to name them too or a failed mkpkg scatters three files per
+	# architecture.
+	TMPROOTS="$TMPROOTS $root $root.post-install $root.pre-deinstall $root.post-upgrade"
 	chmod 755 "$root"
 	mkdir -p "$root/usr/sbin" "$root/etc/init.d"
 
@@ -293,6 +317,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 	pgrep -x sriov-mac-sync >/dev/null 2>&1 || break
 	sleep 0.5
 done
+# Still up? Then --flush would take entries out from under a live daemon,
+# which puts them straight back - and the package is gone by then, so
+# nothing owns what stays in the card. Say so and leave it alone.
+if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
+	echo "sriov-mac-sync did not stop; not flushing - run" >&2
+	echo "  sriov-mac-sync --flush" >&2
+	echo "once it is down, or its entries stay in the card." >&2
+	exit 0
+fi
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 exit 0
@@ -302,6 +335,8 @@ EOF
 	# running until reboot - the .deb postinst restart, spelled apk.
 	cat > "$root.post-upgrade" <<'EOF'
 #!/bin/sh
+ls /etc/rc.d/[SK]??sriov-mac-sync >/dev/null 2>&1 &&
+	/etc/init.d/sriov-mac-sync enable
 /etc/init.d/sriov-mac-sync restart 2>/dev/null
 exit 0
 EOF

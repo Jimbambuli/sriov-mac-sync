@@ -429,15 +429,20 @@ def free_virtual_function(uplink):
             base = f"/sys/class/net/{name}"
             if os.path.exists(f"{base}/master"):
                 continue  # in a bridge
+            # An interface can be unbound between the listdir above and
+            # any of these reads - the scan is a survey of a live host, and
+            # OSError here used to kill the whole trial mid-run rather than
+            # skip one candidate. ValueError covers a flags file that is
+            # not hex; TypeError cannot happen (read returns str or raises).
             try:
                 if int(read(f"{base}/flags"), 16) & 1:
                     continue  # administratively up - somebody prepared it
-            except (TypeError, ValueError):
-                pass
-            if read(f"{base}/operstate") == "up":
-                continue  # carrying traffic for somebody
-            if any(e.startswith("upper_") for e in os.listdir(base)):
-                continue  # a macvtap or vlan sits on it
+                if read(f"{base}/operstate") == "up":
+                    continue  # carrying traffic for somebody
+                if any(e.startswith("upper_") for e in os.listdir(base)):
+                    continue  # a macvtap or vlan sits on it
+            except (OSError, ValueError):
+                continue  # gone or unreadable while we looked; not a candidate
             if run(["ip", "-j", "addr", "show", "dev", name]).stdout.count('"local"'):
                 continue  # it answers on an address of its own
             return pf, index, name, admin_vf_address(pf, index)

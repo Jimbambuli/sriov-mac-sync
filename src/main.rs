@@ -34,20 +34,24 @@ use sysfs::Topology;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONF: &str = "/etc/sriov-mac-sync.conf";
 const STATE_DIR: &str = "/run/sriov-mac-sync";
+/// The same directory where the system keeps its runtime state elsewhere.
+const STATE_DIR_FALLBACK: &str = "/var/run/sriov-mac-sync";
 
 /// Where the notes live on THIS system.
 ///
-/// `/run` is the tmpfs on every systemd platform - but OpenWrt has no
-/// `/run` at all, and creating it there puts the state on the overlay:
+/// `/run` is the tmpfs on every systemd platform. OpenWrt up to 23.05 has
+/// no `/run` at all, and creating it there puts the state on the overlay:
 /// persistent flash, worn by every note write, and a "reboot starts from
 /// nothing" story that quietly stops being true. `/var/run` is OpenWrt's
-/// spelling of the same tmpfs (a symlink into /tmp). Decided by what the
-/// system provides, not by a build flag, so one binary is right on both.
+/// spelling of the same tmpfs (a symlink into /tmp); 24.10 symlinks `/run`
+/// to it as well, where this simply takes the first spelling. Decided by
+/// what the system provides, not by a build flag, so one binary is right
+/// on all of them.
 fn state_dir() -> PathBuf {
     if std::path::Path::new("/run").is_dir() {
         PathBuf::from(STATE_DIR)
     } else {
-        PathBuf::from("/var/run/sriov-mac-sync")
+        PathBuf::from(STATE_DIR_FALLBACK)
     }
 }
 
@@ -381,7 +385,7 @@ fn clamp_interval(v: u64) -> Result<u64, String> {
     Ok(v)
 }
 
-/// A warning threshold of zero says the filter is always nine tenths full,
+/// A capacity of zero says the filter is always full,
 /// which schedules the fast pass rate for ever - a typo that turns a quiet
 /// host into a busy one. And a threshold near usize::MAX overflows the
 /// arithmetic that asks "are we at nine tenths of it" - an abort in a debug
@@ -1129,14 +1133,9 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
             }
         };
 
-        if let Some((due, trigger)) = handle_batch(
-            world,
-            syncer,
-            &mut picture,
-            &events,
-            schedule.last_pass,
-            syncer.max_macs,
-        ) {
+        if let Some((due, trigger)) =
+            handle_batch(world, syncer, &mut picture, &events, schedule.last_pass)
+        {
             schedule.bring_forward(due, trigger);
         }
     }
@@ -1227,8 +1226,11 @@ fn run_pass<W: World>(
     // --max (it is initialised from exactly those two and only ever
     // cleared), so it carries the gate alone.
     if reloaded && state.capacity_pending {
+        // Non-empty by construction: capacity_pending is only set when the
+        // operator wrote pairs down, and resolve_pairs keeps every one of
+        // them even before its interface exists.
         let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-        if !devs.is_empty() {
+        {
             let answers = world.filter_capacities(&devs);
             // Settled only when EVERY written-down device has answered: the
             // first card's answer must not orphan a second, later-appearing
@@ -1278,7 +1280,6 @@ fn handle_batch<W: World>(
     picture: &mut Picture,
     events: &netlink::Events,
     last_pass: Instant,
-    max_macs: usize,
 ) -> Option<(Instant, &'static str)> {
     if events.fdb.is_empty() && !events.links_changed {
         return None; // something else's neighbour, not a bridge's
@@ -1352,7 +1353,7 @@ fn handle_batch<W: World>(
     // gone are taking room from entries that should be there. Asked lazily:
     // at Urgency::Now the wait is already decided, and registered() lists the
     // state directory and reads every note.
-    let wait = if urgency == sync::Urgency::Now || syncer.registered() * 10 >= max_macs * 9 {
+    let wait = if urgency == sync::Urgency::Now || syncer.registered() * 10 >= syncer.max_macs * 9 {
         Duration::from_millis(200)
     } else {
         AGEING_SETTLE
@@ -1430,8 +1431,9 @@ fn adopt_reported_capacity(
         return None;
     }
     note!(
-        "{dev} says its filter holds {value} addresses; warning above that \
-         instead of the assumed {assumed}"
+        "{dev} says its filter holds {value} addresses instead of the assumed \
+         {assumed}; warning above that, and releasing quiet addresses as the \
+         list comes near it"
     );
     Some(value)
 }
@@ -1453,10 +1455,15 @@ fn run() -> Result<bool, String> {
     // and worse than an instruction.
     if !opts.max_macs_set && matches!(opts.mode, Mode::Daemon | Mode::Once | Mode::Status) {
         let devs: Vec<String> = pairs.iter().map(|p| p.dev.clone()).collect();
-        if let Some(v) =
-            adopt_reported_capacity(capacities_via_devlink(&devs), opts.verbose, opts.max_macs)
-        {
-            opts.max_macs = v;
+        // Nothing to ask about is the ordinary state of a host whose
+        // uplink is not in a bridge yet, and a devlink dump for an empty
+        // list is a syscall round trip for a guaranteed empty answer.
+        if !devs.is_empty() {
+            if let Some(v) =
+                adopt_reported_capacity(capacities_via_devlink(&devs), opts.verbose, opts.max_macs)
+            {
+                opts.max_macs = v;
+            }
         }
     }
 
@@ -2482,7 +2489,7 @@ mod tests {
     #[test]
     fn the_man_page_carries_the_files_it_claims() {
         let page = include_str!("../dist/sriov-mac-sync.8");
-        for path in [CONF, STATE_DIR] {
+        for path in [CONF, STATE_DIR, STATE_DIR_FALLBACK] {
             let escaped = path.replace('-', "\\-");
             assert!(
                 page.contains(&escaped),

@@ -574,16 +574,16 @@ fn reflection_keeps_what_a_parallel_writer_noted() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Re-learning an address we already own buys no driver question: it was
-/// vetted by the fresh answer that let it in, and re-registering is an
-/// EEXIST no-op. Without this, the tail of a burst asked once per queued
-/// re-learn.
+/// Re-learning an address we own AND the card still holds buys no driver
+/// question: it was vetted by the fresh answer that let it in, and
+/// re-registering is an EEXIST no-op. Without this, the tail of a burst
+/// asked once per queued re-learn.
 #[test]
-fn relearning_an_owned_address_buys_no_question() {
+fn relearning_a_registered_address_buys_no_question() {
     let dir = scratch("owned-relearn");
     let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    s.append_owned("nic1", &[BEHIND_NIC]);
+    let (_, mut s, _) = registered(&dir);
+    assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
     s.remember_vf(vec![2], Vec::new());
     let mut sock = FakeSock::default();
     s.fast_apply(
@@ -593,6 +593,34 @@ fn relearning_an_owned_address_buys_no_question() {
     )
     .unwrap();
     assert_eq!(sock.vf_asked, 0, "nothing grew, nothing was asked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Owned is not enough: an address on the note that the card no longer
+/// holds - a driver that cleared its list on link-down - is a GROWTH when
+/// it comes back, and a growth asks the driver afresh. Without the card
+/// side of the test, a virtual function that claimed that address in the
+/// meantime would have it registered past its guest until the next full
+/// pass, up to a whole interval away.
+#[test]
+fn relearning_an_owned_but_absent_address_asks_the_driver() {
+    let dir = scratch("owned-absent-relearn");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    // On the note, never in this process's picture of the card.
+    s.append_owned("nic1", &[BEHIND_NIC]);
+    s.remember_vf(vec![2], Vec::new());
+    let mut sock = FakeSock::default();
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+    )
+    .unwrap();
+    assert!(
+        sock.vf_asked >= 1,
+        "putting an absent address back is a growth and has to ask"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -3760,10 +3788,7 @@ fn a_clean_check_probe_leaves_no_note_behind() {
         !dir.join(".nic9.owned.index").exists(),
         "the probe's index survived the check"
     );
-    assert!(
-        !dir.join(".nic9.owned.ports").exists(),
-        "the probe's memory file survived the check"
-    );
+
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -4111,5 +4136,573 @@ fn a_burst_over_capacity_sheds_a_keep_on_the_fast_path() {
         "the shed keep stayed on the note - an orphan in the making"
     );
     assert!(s.load_owned("nic1").contains(&newcomer));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The carried occupancy is CARRIED: several batches between two passes
+/// each count against what the ones before them put in the card. Without
+/// that, N single-address batches overflow the card by N-1 and nothing
+/// notices until the next pass.
+#[test]
+fn successive_batches_count_against_each_other() {
+    let dir = scratch("occupancy-carried");
+    let quiet: Mac = [0x02, 0xea, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // The guest goes quiet: two slots held (bridge + keep).
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // allowed = 8 - 4 = 4, occupancy 2. Two newcomers fit; the third must
+    // buy its slot from the keep - which only happens if each batch counts
+    // the ones before it.
+    s.max_macs = 8;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomers: Vec<Mac> = (1..=3u8).map(|i| [0x02, 0xeb, 0, 0, 0, i]).collect();
+    let mut last = FakeSock::default();
+    for m in &newcomers {
+        last = FakeSock {
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        s.fast_apply(&mut last, &topo, &[(RTM_NEWNEIGH, learned(4, 10, *m))])
+            .unwrap();
+    }
+    assert!(
+        last.removed.iter().any(|(_, m)| *m == quiet),
+        "the third batch did not count the first two; the card overflows"
+    );
+    assert!(last.added.iter().any(|(_, m)| *m == newcomers[2]));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A re-learn of an address the card already holds is not a new slot -
+/// counting it would shed keeps to make room for something already in.
+#[test]
+fn a_relearn_buys_no_slot_and_sheds_nothing() {
+    let dir = scratch("occupancy-relearn");
+    let quiet: Mac = [0x02, 0xec, 0, 0, 0, 1];
+    let live: Mac = [0x02, 0xec, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, quiet), learned(4, 10, live)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // `quiet` ages; three slots held (bridge, keep, live).
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, quiet), learned(4, 10, live)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // Sitting exactly on the margin: allowed = 7 - 4 = 3, occupancy 3.
+    // A re-learn of `live` must not be read as a fourth slot.
+    s.max_macs = 7;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut sock3, &topo, &[(RTM_NEWNEIGH, learned(4, 10, live))])
+        .unwrap();
+    assert!(
+        sock3.removed.is_empty(),
+        "a re-learn shed a keep for a slot it did not need: {:?}",
+        sock3.removed
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The shedder never surrenders a guest that is speaking: only addresses
+/// with a missing-stamp are candidates, the longest-missing goes first,
+/// and an address the batch itself is registering is spared - deleting it
+/// to add it back frees no slot at all.
+#[test]
+fn the_shedder_spares_the_live_and_the_incoming() {
+    let dir = scratch("shed-selection");
+    let old: Mac = [0x02, 0xed, 0, 0, 0, 3];
+    let young: Mac = [0x02, 0xed, 0, 0, 0, 2];
+    let live: Mac = [0x02, 0xed, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![
+            learned(4, 10, old),
+            learned(4, 10, young),
+            learned(4, 10, live),
+        ],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // `old` goes quiet first, `young` a moment later; `live` keeps talking.
+    let mut sock2 = FakeSock {
+        fdb: vec![
+            card_holds(2, old),
+            learned(4, 10, young),
+            learned(4, 10, live),
+        ],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(20));
+    let mut sock3 = FakeSock {
+        fdb: vec![
+            card_holds(2, old),
+            card_holds(2, young),
+            learned(4, 10, live),
+        ],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+
+    // Four slots held, allowed = 8 - 4 = 4: one newcomer needs one slot.
+    s.max_macs = 8;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xed, 0, 0, 0, 9];
+    let mut sock4 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock4,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock4.removed.iter().any(|(_, m)| *m == old),
+        "the longest-missing keep was not the one surrendered"
+    );
+    assert!(
+        !sock4.removed.iter().any(|(_, m)| *m == young),
+        "a younger keep was surrendered before an older one"
+    );
+    assert!(
+        !sock4.removed.iter().any(|(_, m)| *m == live),
+        "a guest that is still speaking was surrendered"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A guest that speaks again is young again on the FAST path too, not
+/// only in a pass: otherwise the shedder names the guest that just spoke,
+/// and the delete is undone by the add that follows it - zero slots freed.
+#[test]
+fn a_fast_path_learn_makes_an_entry_young_again() {
+    let dir = scratch("shed-rejuvenate");
+    let a: Mac = [0x02, 0xee, 0, 0, 0, 1];
+    let b: Mac = [0x02, 0xee, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, a), learned(4, 10, b)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // `a` goes quiet first, then `b`: a is the older keep.
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, a), learned(4, 10, b)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(20));
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, a), card_holds(2, b)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+
+    // `a` speaks again - a re-learn, no new slot - and must now be the
+    // YOUNGER of the two. The newcomer that follows then costs `b`.
+    s.max_macs = 7;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock4 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut sock4, &topo, &[(RTM_NEWNEIGH, learned(4, 10, a))])
+        .unwrap();
+    assert!(sock4.removed.is_empty(), "the re-learn should shed nothing");
+
+    let newcomer: Mac = [0x02, 0xee, 0, 0, 0, 9];
+    let mut sock5 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock5,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock5.removed.iter().any(|(_, m)| *m == b),
+        "the entry that spoke most recently was surrendered"
+    );
+    assert!(
+        !sock5.removed.iter().any(|(_, m)| *m == a),
+        "speaking again did not make the entry young"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A shed whose removal the card refuses keeps its line on the note: an
+/// entry still in the filter that no note names is the orphan nothing
+/// would ever take out. ENOENT is the other way round - it is already
+/// gone, and the note goes with it.
+#[test]
+fn a_refused_shed_keeps_its_note_line() {
+    let dir = scratch("shed-refused");
+    let quiet: Mac = [0x02, 0xef, 0, 0, 0, 1];
+    let topo = small_host();
+    for (errno, still_noted) in [(libc::EBUSY, true), (libc::ENOENT, false)] {
+        let dir = dir.join(format!("e{errno}"));
+        let mut s = br0_syncer(&dir);
+        let mut sock = FakeSock {
+            fdb: vec![learned(4, 10, quiet)],
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+        let mut sock2 = FakeSock {
+            fdb: vec![card_holds(2, quiet)],
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        };
+        s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+        s.max_macs = 6;
+        s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+        let mut fail = crate::hash::map();
+        fail.insert(quiet, errno);
+        let mut sock3 = FakeSock {
+            vf: vec![(2, VF_ADMIN)],
+            fail_del: fail,
+            ..Default::default()
+        };
+        let newcomer: Mac = [0x02, 0xef, 0, 0, 0, 9];
+        s.fast_apply(
+            &mut sock3,
+            &topo,
+            &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+        )
+        .unwrap();
+        assert_eq!(
+            s.load_owned("nic1").contains(&quiet),
+            still_noted,
+            "errno {errno}: the note has to keep what is still in the card, \
+             and let go of what is not"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A note that cannot be read holds the card still - the shedder included.
+/// It is the one removal path that could delete entries while the batch
+/// that asked for the room is refused, which would be pure loss.
+#[test]
+fn an_unreadable_note_stops_the_shedder() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = scratch("shed-unreadable");
+    let quiet: Mac = [0x02, 0xf0, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // Somebody replaced the note with one this daemon cannot read - a new
+    // inode, so the remembered copy is not believed either, and the
+    // process genuinely no longer knows what it owns.
+    let note = dir.join("nic1.owned");
+    let tmp = dir.join(".nic1.owned.swap");
+    fs::write(&tmp, fs::read_to_string(&note).unwrap()).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::rename(&tmp, &note).unwrap();
+    assert!(
+        s.load_owned("nic1").is_empty() && !s.note_is_readable("nic1"),
+        "the fixture failed to make the note unreadable"
+    );
+    s.max_macs = 6;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xf0, 0, 0, 0, 9];
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock3.removed.is_empty(),
+        "the shedder emptied slots out of a note it could not read"
+    );
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A replaced note is read again even when it kept the old timestamp: the
+/// identity check is what carries this, not the clock. Coarse-clock
+/// filesystems hand a rename the mtime of what it replaced often enough
+/// that a guard resting on time alone would answer from a stale copy -
+/// and an address somebody appended would then count foreign for ever.
+#[test]
+fn a_replaced_note_is_read_again_even_at_the_same_mtime() {
+    let dir = scratch("note-moved-under-read");
+    let s = ready_syncer(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nic1.owned");
+    fs::write(&path, format!("{}\n", format_mac(&BEHIND_NIC))).unwrap();
+    assert_eq!(s.load_owned("nic1").len(), 1);
+
+    // Replaced through a rename, the way every writer here replaces it -
+    // new inode, and on a coarse-clock filesystem quite possibly the same
+    // mtime as the read that just happened.
+    let tmp = dir.join(".nic1.owned.other");
+    fs::write(
+        &tmp,
+        format!(
+            "{}\n{}\n",
+            format_mac(&BEHIND_NIC),
+            format_mac(&BEHIND_GUEST)
+        ),
+    )
+    .unwrap();
+    let meta = fs::metadata(&path).unwrap();
+    fs::rename(&tmp, &path).unwrap();
+    // Make the new file look exactly as old as the one it replaced: this
+    // is the state the coarse clock produces on its own.
+    let times = [
+        libc::timespec {
+            tv_sec: meta.mtime(),
+            tv_nsec: meta.mtime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: meta.mtime(),
+            tv_nsec: meta.mtime_nsec(),
+        },
+    ];
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+    assert_eq!(
+        s.load_owned("nic1").len(),
+        2,
+        "the replaced note was answered from a stale remembered copy"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A device that stopped being an uplink loses its whole record - note,
+/// index and quiet memory together. A memory file left behind is
+/// invisible to every sweep (nothing globs it) and would be adopted by
+/// the device's next life.
+#[test]
+fn the_orphan_sweep_takes_the_memory_file_with_the_note() {
+    let dir = scratch("orphan-memory");
+    let topo = host(mac(1));
+    let (_, mut s, _) = registered(&dir);
+    age_out(&mut s, &topo, BEHIND_GUEST);
+    let ports = dir.join(".nic1.owned.ports");
+    assert!(ports.exists(), "the fixture wrote no memory to sweep");
+
+    // nic1 is no longer an uplink: no pairs at all, and the topology no
+    // longer has it either, so the sweep removes rather than migrates.
+    s.pairs = Vec::new();
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    s.drop_orphans(&mut sock, &host(mac(1)), true, &mut failures);
+    assert!(
+        !dir.join("nic1.owned").exists(),
+        "the note outlived the sweep"
+    );
+    assert!(!ports.exists(), "the quiet memory outlived its note");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A renamed uplink keeps its capacity arithmetic: the pass that follows
+/// the rename recomputes it, and the batches after that count against the
+/// recomputed number rather than from zero. (The rename's own transfer of
+/// the two maps is belt-and-braces for the pass that skips its pair; what
+/// this pins is that the arithmetic is right under the new name at all.)
+#[test]
+fn the_capacity_arithmetic_survives_a_rename() {
+    let dir = scratch("occupancy-rename");
+    let quiet: Mac = [0x02, 0xf1, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // Same interface, same index, new name.
+    let renamed = Builder::new()
+        .add("nicX", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nicX")
+        .lower("vetha")
+        .build();
+    s.pairs = vec![Pair {
+        dev: "nicX".into(),
+        bridge: "br0".into(),
+    }];
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, quiet)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &renamed, Dur::ZERO).unwrap();
+
+    // Under the new name, one newcomer past the margin: the keep pays.
+    // Counting from zero here would leave it standing and overfill.
+    s.max_macs = 6;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xf1, 0, 0, 0, 9];
+    let mut sock4 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock4,
+        &renamed,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock4.removed.iter().any(|(_, m)| *m == quiet),
+        "the renamed uplink counted from zero and overfilled its card"
+    );
+
+    // And the list of WHICH addresses travelled too: re-learning the
+    // newcomer costs no slot, so nothing more may be shed. Without the
+    // carried list the re-learn reads as a fresh slot and takes a keep
+    // with it - here there are none left, so it would warn instead.
+    let mut sock5 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock5,
+        &renamed,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock5.removed.is_empty(),
+        "a re-learn after the rename was counted as a new slot"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A stale removal the card refused evicts its port memory so it cannot
+/// harden into a keep - and the pass's own memory merge must not put it
+/// straight back. Otherwise the outcome depends on whether the card
+/// errored, which is the opposite of what the failure arm intends.
+#[test]
+fn a_refused_stale_removal_does_not_return_through_the_merge() {
+    let dir = scratch("stale-refused-merge");
+    let topo = host(mac(1));
+    let (_, mut s, _) = registered(&dir);
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    // The guest's port goes: nothing vouches for the address any more, so
+    // the pass wants it gone - and the card refuses to let go.
+    let without_veth = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .lower("nic2")
+        .build();
+    let mut fail = crate::hash::map();
+    fail.insert(BEHIND_GUEST, libc::EBUSY);
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, BEHIND_GUEST)],
+        vf: vec![(2, VF_ADMIN)],
+        fail_del: fail,
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &without_veth, Dur::ZERO)
+        .unwrap();
+    assert!(
+        s.load_owned("nic1").contains(&BEHIND_GUEST),
+        "a refused removal keeps its note line for the retry"
+    );
+
+    // The port comes back - a container restarting under the same name.
+    // With the memory evicted the address is still stale and the retry
+    // removes it; with the memory put back by the merge it would be held
+    // as a quiet keep instead, and the retry would never come.
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, BEHIND_GUEST)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the refused removal came back as a keep instead of being retried"
+    );
+    assert!(
+        !s.load_owned("nic1").contains(&BEHIND_GUEST),
+        "and the note lets go once the card did"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

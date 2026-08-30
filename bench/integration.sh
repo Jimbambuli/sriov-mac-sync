@@ -46,6 +46,15 @@ bad() {
   echo "   FAIL: $*"
 }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+# Same, but give an event-driven daemon up to five seconds to get there.
+# A fixed sleep either flakes or slows every run down to the worst case.
+check_soon() {
+  for _ in $(seq 1 50); do
+    eval "$2" && break
+    sleep 0.1
+  done
+  check "$1" "$2"
+}
 # A self entry is a line carrying the self flag; a master entry for the same
 # address does not, and `bridge fdb show dev X self` prints both.
 has_self() { $NS bridge fdb show dev veth-up | grep "$1" | grep -q self; }
@@ -264,6 +273,47 @@ sleep 3
 check "M2 gone once its port is" "! has_self $M2"
 stop_daemon
 restore_guest_port
+
+say "S6f: the filter fills up and a keep buys the newcomer its slot"
+# The valve, end to end - unit tests aside, nothing has ever driven it on a
+# real kernel. A veth uplink answers no devlink max_macs, so --max alone
+# opens it. The limit is derived from what is registered right now rather
+# than assumed: whatever the scenarios before this one left behind, the
+# room is exactly the two keeps, and the newcomer is one too many.
+M7="02:be:5c:00:00:77"
+M8="02:be:5c:00:00:78"
+M9="02:be:5c:00:00:79"
+BASE=$($NS "$BIN" --status --pair veth-up:br0 | awk '/registered by us/ {print $NF}')
+MAX=$((BASE + 2 + 4))  # allowed = MAX - headroom(4) = BASE + 2
+$NS "$BIN" --pair veth-up:br0 --interval 1 --max $MAX >/tmp/sms-it-s6f.log 2>&1 &
+DPID=$!
+sleep 1
+$NS bridge fdb replace $M7 dev veth-g1 master dynamic
+sleep 1
+$NS bridge fdb replace $M8 dev veth-g1 master dynamic
+sleep 2
+check "both registered while learnt" "has_self $M7 && has_self $M8"
+# M7 goes quiet first, M8 a moment later: M7 is the older keep.
+$NS bridge fdb del $M7 dev veth-g1 master
+sleep 2
+$NS bridge fdb del $M8 dev veth-g1 master
+sleep 2
+check "both kept while their port lives" "has_self $M7 && has_self $M8"
+# A third guest speaks. There is no room: the longest-missing keep pays.
+$NS bridge fdb replace $M9 dev veth-g1 master dynamic
+sleep 2
+check_soon "the newcomer got its slot" "has_self $M9"
+check_soon "the longest-missing keep paid for it" "! has_self $M7"
+check "the younger keep was left alone" "has_self $M8"
+check_soon "the release is said" "grep -q 'released .* \[pressure\]' /tmp/sms-it-s6f.log"
+check "the limit was derived, not guessed" "[ \"$BASE\" -ge 1 ]"
+# The port was never deleted here, so only the test addresses go; M1 is
+# re-registered by the --once the next scenario's daemon start follows.
+$NS bridge fdb del $M9 dev veth-g1 master 2>/dev/null
+$NS bridge fdb del $M8 dev veth-g1 master 2>/dev/null
+stop_daemon
+$NS bridge fdb replace $M1 dev veth-g1 master dynamic
+$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
 
 say "S6e: an update hands the keeps to the next process"
 # The scenario the persistence exists for: a quiet guest whose daemon is

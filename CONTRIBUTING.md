@@ -5,10 +5,16 @@
 ```
 cargo build --release
 install -m 755 target/release/sriov-mac-sync    /usr/local/sbin/
-install -m 644 dist/sriov-mac-sync.service      /etc/systemd/system/
+install -m 644 dist/sriov-mac-sync.service      /etc/systemd/system/  # see below
 install -m 644 dist/sriov-mac-sync.conf.example /etc/sriov-mac-sync.conf  # optional
 systemctl enable --now sriov-mac-sync
 ```
+
+A unit in `/etc/systemd/system/` takes precedence over the packaged one in
+`/usr/lib/systemd/system/` for good: install a `.deb` later and `dpkg -l`
+reports the new version while the machine goes on running whatever the
+`/etc` unit points at. Remove it before switching to packages — the
+postinst says so too.
 
 One dependency, `libc`. For a binary that runs on an older distribution than the
 one you built on, `RUSTFLAGS="-C target-feature=+crt-static" cargo build
@@ -21,7 +27,7 @@ architectures — from a machine with the two musl targets installed:
 
 ```
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-./dist/package.sh
+APK=/path/to/apk.static ./dist/package.sh
 ```
 
 The result lands in `dist/out`. Nothing is cross-compiled against a sysroot or a

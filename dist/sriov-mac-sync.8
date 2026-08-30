@@ -96,7 +96,10 @@ Addresses to register unconditionally, for a device that never speaks first. The
 wire\-side and own\-address rules still override this.
 .TP
 .BR \-v ", " \-\-verbose
-Explain what is skipped and why.
+Explain what is skipped and why. With
+.B \-\-status
+it also lists every wanted address, marking the ones held through a silence
+with how long they have been missing.
 .TP
 .BR \-h ", " \-\-help
 Print the usage text.
@@ -121,7 +124,8 @@ pairs. Empty means autodetect.
 Seconds between full reconciliations.
 .TP
 .B MAX_MACS
-Warning threshold per uplink.
+The filter capacity to respect, as
+.BR \-\-max .
 .TP
 .B EXCLUDE
 Addresses never to register. \fB\-\-exclude\fR on the command line adds to
@@ -165,9 +169,11 @@ so an update hands the keeps to the next process. Kept across a restart on
 purpose; a reboot clears it, which is right, because the card's filter is
 empty by then too. On OpenWrt, which has no
 .IR /run ,
-the same directory lives under
-.IR /var/run ,
-the tmpfs there - never the overlay.
+the same directory is
+.IR /var/run/sriov\-mac\-sync ,
+on the tmpfs there - never the overlay. OpenWrt 24.10 symlinks
+.I /run
+to it, so both spellings reach the same files there.
 .TP
 .I /usr/lib/systemd/system/sriov\-mac\-sync.service
 The service, as installed by the Debian package.

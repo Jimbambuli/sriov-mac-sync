@@ -133,7 +133,7 @@ impl Syncer {
     /// Precondition: `lines` sorted and non-empty - the one caller sorts
     /// for its change comparison anyway, and hands the empty case to the
     /// file's removal instead.
-    pub(super) fn write_ports(&self, dev: &str, lines: &[String]) {
+    pub(super) fn write_ports(&self, dev: &str, lines: &[String]) -> bool {
         let text = lines.join("\n") + "\n";
         if let Err(e) = self.put_file(&self.ports_path(dev), &text) {
             if self.ports_warned.borrow_mut().insert(dev.to_string()) {
@@ -143,7 +143,9 @@ impl Syncer {
                      this daemon restarts"
                 );
             }
+            return false;
         }
+        true
     }
 
     /// Record which interface a device's note is about - beside the note,
@@ -224,8 +226,10 @@ impl Syncer {
     ///
     /// What is narrowed is a directory another user may *write*, which is the
     /// one that decides what a root daemon does. One others may only read is
-    /// left alone: that is what `RuntimeDirectory=` in the unit produces -
-    /// 0755, made by systemd, reset by it on every start - and a daemon that
+    /// left alone: that is what a source install produces, where systemd
+    /// makes the directory 0755 for a unit that names no
+    /// `RuntimeDirectoryMode=` (the packaged one sets 0700) - and a daemon
+    /// that
     /// changed it back on every start would be a warning a day and an
     /// argument it cannot win. The notes themselves are 0600 either way, so
     /// there is nothing to read through it.
@@ -287,9 +291,36 @@ impl Syncer {
             Err(_) => false,
         };
         if !usable {
+            // Stat, read, stat again - and believe the copy only when the
+            // file did not move under the read. Without it, a note
+            // replaced between the read and `remember` was cached with
+            // the NEW file's identity and the OLD file's contents, and
+            // believed until something changed it again; the timestamp
+            // guard cannot see that, because inode mtimes come from the
+            // coarse clock and lag a fine-clock sample by milliseconds.
+            // Not unit-pinned: the window needs a second writer landing
+            // inside one read, which no deterministic test can arrange -
+            // what the suite does pin is that a replaced file is read
+            // again even when it kept the old timestamp.
+            let before = fs::metadata(self.state_path(dev)).ok();
             let set = self.read_owned(dev);
-            if self.note_is_readable(dev) {
+            let after = fs::metadata(self.state_path(dev)).ok();
+            let steady = match (&before, &after) {
+                (Some(a), Some(b)) => {
+                    a.ino() == b.ino()
+                        && a.len() == b.len()
+                        && (a.mtime(), a.mtime_nsec()) == (b.mtime(), b.mtime_nsec())
+                }
+                _ => false,
+            };
+            if self.note_is_readable(dev) && steady {
                 self.remember(dev, &set);
+            } else if self.note_is_readable(dev) {
+                // Readable, but it moved while we read it. The set is
+                // whatever we got; the next look reads again rather than
+                // trusting it.
+                self.notes.borrow_mut().remove(dev);
+                return f(&set);
             } else {
                 // The read failed, and what `read_owned` returns then is an
                 // empty set that means "could not tell", not "owns nothing".
@@ -305,6 +336,13 @@ impl Syncer {
                 // Nothing on record instead, so the next look reads the file
                 // again and the device comes back the moment it can be read.
                 self.notes.borrow_mut().remove(dev);
+                // The index record lives beside the note and goes with it -
+                // a --flush from a second terminal unlinks both. Without
+                // this the cached index short-circuits every later write,
+                // the record is never recreated, and rename-following
+                // stays dead for the life of the process: a renamed uplink
+                // then keeps its entries with no note that can reach them.
+                self.indices.borrow_mut().remove(dev);
             }
         }
         // The shared borrow of `notes` is held while `f` runs. Nothing `f`
@@ -800,6 +838,13 @@ impl Syncer {
     /// named twice - which the next sweep settles, the append deduplicates -
     /// rather than named nowhere.
     pub(super) fn migrate_note(&self, old: &str, new: &str, index: u32) -> bool {
+        // Two locked() sections on one name would block on the second
+        // descriptor and hang the single-threaded daemon for good. The
+        // caller cannot reach this today - renamed_target answers None for
+        // an unchanged name - but the guard belongs where the hazard is.
+        if old == new {
+            return true;
+        }
         let (first, second) = if old <= new { (old, new) } else { (new, old) };
         self.locked(first, || {
             self.locked(second, || {

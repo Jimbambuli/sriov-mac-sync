@@ -13,8 +13,8 @@ That 128 was arrived at by experiment, and this file used to say the size could
 not be queried. It can, on the drivers that register the generic devlink
 parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
 function and its VFs, which is exactly the experimental figure. The daemon asks
-over devlink at startup - and again when a pair appears at runtime - and warns
-against what the card says; `--max` or
+over devlink at startup - and again when a pair appears at runtime - and both
+warns above what the card says and releases quiet addresses to stay under it; `--max` or
 `MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
 place. `-v` reports which of the three happened.
 

@@ -266,6 +266,15 @@ pub struct Syncer {
     /// makes the event path capacity-aware without paying a dump per batch;
     /// corrected against the read-back every pass.
     carried_occupancy: Map<String, usize>,
+    /// WHICH addresses the card held at the end of the last pass, carried
+    /// forward the same way. The note is not a substitute: it says what is
+    /// ours, the card says what is in it, and the two part company exactly
+    /// where it hurts - a driver that cleared its list on link-down leaves
+    /// addresses noted but absent, and re-registering one is a growth that
+    /// must ask the driver afresh, not a re-learn that may skip the
+    /// question. It also keeps a burst of re-learns from counting as new
+    /// slots and shedding keeps for nothing.
+    carried_present: Map<String, Set<Mac>>,
     /// Uplinks already warned about exceeding the filter capacity, re-armed
     /// when the count drops back under: an overloaded bridge buys passes at
     /// the event rate, and the same warning five times a second is how an
@@ -431,6 +440,7 @@ impl Syncer {
             noted_quiet: crate::hash::map(),
             warned_over: crate::hash::set(),
             carried_occupancy: crate::hash::map(),
+            carried_present: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
             indices: std::cell::RefCell::new(crate::hash::map()),
@@ -544,8 +554,17 @@ impl Syncer {
                         if self.warned_over.remove(&dev) {
                             self.warned_over.insert(new_name.clone());
                         }
+                        // The capacity arithmetic follows too. Usually
+                        // moot - the pass that migrates the note also
+                        // reconciles the new name and writes both of these
+                        // fresh - but not when that pass skips the pair
+                        // (no bridge, no port in this reading) while the
+                        // event path keeps registering for it.
                         if let Some(occ) = self.carried_occupancy.remove(&dev) {
                             self.carried_occupancy.insert(new_name.clone(), occ);
+                        }
+                        if let Some(p) = self.carried_present.remove(&dev) {
+                            self.carried_present.insert(new_name.clone(), p);
                         }
                         // And onto disk under the new name at once: the old
                         // file went with the old note, and a crash before
@@ -629,6 +648,7 @@ impl Syncer {
             self.carried_wire.remove(&dev);
             self.warned_over.remove(&dev);
             self.carried_occupancy.remove(&dev);
+            self.carried_present.remove(&dev);
             // remove_note took the file; a device that returns as a pair
             // reads afresh rather than believing this run's leftovers.
             self.ports_loaded.remove(&dev);
@@ -851,7 +871,7 @@ impl Syncer {
         // or dry run beside the daemon takes nothing over. And counted
         // honestly: the file carries a line per owned learnt address, but
         // what an update must not drop is the quiet ones.
-        if apply {
+        if apply && !self.dry_run {
             let quiet = ports.values().filter(|(_, t)| t.is_some()).count();
             note!(
                 "{dev}: took over the last run's memory of {} address(es), \
@@ -881,8 +901,8 @@ impl Syncer {
     fn save_ports(&mut self, dev: &str, topo: &Topology) {
         // A dry run changes nothing on disk - the memory stays in RAM for
         // an honest report, the file belongs to whoever actually manages
-        // the card. (--status never even reaches this: its pass carries
-        // apply=false, which gates the one call site.)
+        // the card. (--status never even reaches this: every caller is
+        // behind an `apply` gate, and its pass carries apply=false.)
         if self.dry_run {
             return;
         }
@@ -900,20 +920,33 @@ impl Syncer {
             None => Vec::new(),
         };
         lines.sort();
-        if self.ports_written.get(dev) == Some(&lines) {
+        // The memo is only as good as the file it describes: a --flush from
+        // a second terminal unlinks it, and believing the memo then freezes
+        // this uplink's memory for the life of the process - the next
+        // restart, which is usually an update, would unregister every quiet
+        // guest on its first pass. One stat says whether the file is still
+        // the shape the memo claims.
+        let on_disk = self.ports_path(dev).exists();
+        if self.ports_written.get(dev) == Some(&lines) && on_disk != lines.is_empty() {
             return;
         }
         // Nothing to remember is no file: an uplink with no quiet addresses
         // would otherwise keep an empty one around for the next process to
         // read nothing out of.
-        if lines.is_empty() {
-            self.locked(dev, || {
-                let _ = fs::remove_file(self.ports_path(dev));
-            });
+        let wrote = if lines.is_empty() {
+            self.locked(dev, || fs::remove_file(self.ports_path(dev)).is_ok())
+                || !self.ports_path(dev).exists()
         } else {
-            self.locked(dev, || self.write_ports(dev, &lines));
+            self.locked(dev, || self.write_ports(dev, &lines))
+        };
+        // Memoised only when the file really says this. A failed write that
+        // counted as done would leave the running process believing a stale
+        // file, and every later pass skipping the correction.
+        if wrote {
+            self.ports_written.insert(dev.to_string(), lines);
+        } else {
+            self.ports_written.remove(dev);
         }
-        self.ports_written.insert(dev.to_string(), lines);
     }
 
     /// Surrender up to `need` kept addresses, longest-missing first -
@@ -931,11 +964,28 @@ impl Syncer {
         need: usize,
         topo: &Topology,
     ) -> usize {
+        // A note that cannot be read is a device to leave alone - every
+        // other removal path says so, and this one would otherwise delete
+        // entries while the batch that asked for the room is refused.
+        // Asked by reading, not by consulting the mark: the mark is only
+        // set once a read has failed, and on the fast path this may be the
+        // first read of the pass.
+        self.load_owned(dev);
+        if !self.note_is_readable(dev) {
+            return 0;
+        }
         let Some(ports) = self.carried_ports.get(dev) else {
             return 0;
         };
         let mut cands: Vec<(u64, Mac)> = ports
             .iter()
+            // Only the quiet: an address with no missing-stamp is one the
+            // bridge still knows, and shedding a live guest to make room
+            // for another is not a trade this daemon makes. The batch's
+            // own addresses are covered by this and need no second guard:
+            // the caller clears their stamps first, so an address being
+            // registered right now is never a candidate - deleting it to
+            // add it back would free no slot at all.
             .filter_map(|(m, &(_, t))| t.map(|t| (t, *m)))
             .collect();
         // Smallest stamp = missing longest; the address is the tiebreak,
@@ -976,6 +1026,11 @@ impl Syncer {
         self.save_ports(dev, topo);
         if let Some(est) = self.carried_occupancy.get_mut(dev) {
             *est = est.saturating_sub(dropped.len());
+        }
+        if let Some(p) = self.carried_present.get_mut(dev) {
+            for mac in &dropped {
+                p.remove(mac);
+            }
         }
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
@@ -1772,8 +1827,20 @@ impl Syncer {
                     self.warned_over.remove(&pair.dev);
                 }
             }
-            // What the fast path counts from until the next pass corrects it.
+            // What the fast path counts from until the next pass corrects
+            // it: how many slots, and which addresses fill them. `want` is
+            // what this pass leaves behind - the additions below land, the
+            // stale loop above took its removals out - plus the foreign
+            // entries nobody here may touch.
             self.carried_occupancy.insert(pair.dev.clone(), occupied);
+            let mut holds: Set<Mac> = want.iter().copied().collect();
+            holds.extend(
+                present
+                    .iter()
+                    .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
+                    .copied(),
+            );
+            self.carried_present.insert(pair.dev.clone(), holds);
 
             // Unsorted on purpose: outside --status only its length is read,
             // and the status page sorts for display itself.
@@ -2046,6 +2113,11 @@ impl Syncer {
                 if let Some(est) = self.carried_occupancy.get_mut(&fp.dev) {
                     *est = est.saturating_sub(taken_back.len());
                 }
+                if let Some(p) = self.carried_present.get_mut(&fp.dev) {
+                    for mac in &taken_back {
+                        p.remove(mac);
+                    }
+                }
                 // And out of the written-down memory too: an eviction that
                 // lived only in RAM could come back through the file after
                 // a crash, once the wire evidence has aged - re-registering
@@ -2094,14 +2166,22 @@ impl Syncer {
                 }
                 self.fast_add(topo, entry, &pairs, &mut would, FastPhase::Decide);
             }
-            // An address already registered and ours was vetted by the
-            // fresh answer that let it in; re-learning it grows nothing.
-            // Without this, the tail of a burst - the prompt pass has long
-            // registered everything, the queued learns arrive one by one -
-            // bought one driver question per re-learn, invisible to every
-            // latency figure because the addresses were already in.
+            // An address that is ours AND still in the card was vetted by
+            // the fresh answer that let it in; re-learning it grows
+            // nothing. Without this, the tail of a burst - the prompt pass
+            // has long registered everything, the queued learns arrive one
+            // by one - bought one driver question per re-learn, invisible
+            // to every latency figure because the addresses were already
+            // in. Owned alone is not enough: a driver that cleared its
+            // list on link-down leaves addresses noted but gone, and
+            // putting one back IS a growth - it must ask the driver, or a
+            // VF that meanwhile claimed that address gets it registered
+            // past its guest, for as long as the interval.
             for (dev, macs) in would.iter_mut() {
-                self.with_owned(dev, |o| macs.retain(|m| !o.contains(m)));
+                let present = self.carried_present.get(dev);
+                self.with_owned(dev, |o| {
+                    macs.retain(|m| !(o.contains(m) && present.is_some_and(|p| p.contains(m))))
+                });
             }
             would.retain(|_, macs| !macs.is_empty());
             if !would.is_empty() {
@@ -2178,11 +2258,43 @@ impl Syncer {
             // The batch counts against the occupancy the last pass measured
             // plus this process's own effect since. A burst that would not
             // fit surrenders keeps first - new learns outrank the quiet.
+            // Every fresh learn makes an entry young again - the rule the
+            // valve's ordering rests on, and until now only a full pass
+            // kept it: a guest that spoke seconds ago still carried the
+            // stamp from its last silence, and the shedder would name it
+            // first, deleting an entry the very next line puts back.
+            if let Some(ports) = self.carried_ports.get_mut(&dev) {
+                for mac in &macs {
+                    if let Some(slot) = ports.get_mut(mac) {
+                        slot.1 = None;
+                    }
+                }
+            }
             let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);
             let est = self.carried_occupancy.get(&dev).copied().unwrap_or(0);
-            let over = (est + macs.len()).saturating_sub(allowed);
-            if over > 0 {
-                self.shed_keeps(sock, &dev, fp.index, over, topo);
+            // Only what would take a NEW slot. An address the card already
+            // holds costs nothing to re-register - counting it would shed
+            // keeps to make room for something that is already in.
+            let fresh_slots = match self.carried_present.get(&dev) {
+                Some(p) => macs.iter().filter(|m| !p.contains(*m)).count(),
+                None => macs.len(),
+            };
+            let over = (est + fresh_slots).saturating_sub(allowed);
+            if over > 0 && self.shed_keeps(sock, &dev, fp.index, over, topo) < over {
+                // The one moment the daemon knowingly writes past the
+                // filter's limit. Said once per uplink per stay: past the
+                // limit the card drops silently and arbitrarily, and an
+                // operator who never hears about it looks for the fault in
+                // the guest.
+                if self.warned_over.insert(dev.clone()) {
+                    eprintln!(
+                        "warning: {dev}: no room for {} new address(es) and no \
+                         quiet ones left to release - the card is at its {} \
+                         limit and drops silently past it",
+                        macs.len(),
+                        self.max_macs
+                    );
+                }
             }
             self.note_index(&dev, fp.index);
             // Under the note's lock, like the pass: an intent appended
@@ -2237,6 +2349,13 @@ impl Syncer {
             if put > 0 {
                 *self.carried_occupancy.entry(dev.clone()).or_insert(0) += put;
             }
+            // What the card holds now, for the next batch's arithmetic.
+            // EEXIST counts too: the address is in the card either way,
+            // and the next batch must not treat it as a new slot.
+            self.carried_present
+                .entry(dev.clone())
+                .or_default()
+                .extend(macs.iter().copied());
         }
         Ok(urgency)
     }
