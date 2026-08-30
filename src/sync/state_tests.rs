@@ -2457,3 +2457,1323 @@ fn an_unknowable_virtual_function_is_reported_once() {
     assert!(!quiet.warned_unknown_vf.contains("pf0"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------- quiet keep
+
+/// The forwarding table as the fixture knows it, minus one address - the
+/// shape a dump takes after the bridge aged that address out.
+fn fdb_without(mac: Mac) -> Vec<crate::netlink::FdbEntry> {
+    fdb().into_iter().filter(|e| e.mac != mac).collect()
+}
+
+/// A `self` entry as the card would report it: the address is in the
+/// uplink's own filter list.
+fn card_holds(dev: u32, mac: Mac) -> crate::netlink::FdbEntry {
+    crate::netlink::FdbEntry {
+        ifindex: dev,
+        master: None,
+        mac,
+        state: 0,
+        flags: 0x02, // NTF_SELF
+    }
+}
+
+/// A guest that goes quiet stays registered while its port lives. The
+/// container behind the IOT vnet ages out of the bridge; its veth still
+/// exists, so the address is neither removed nor re-added - it is simply
+/// kept, and the report says so. This is also the stacked-vnet arm of the
+/// reachability walk: veth0 hangs under IOT, which leads down to vmbr1.
+#[test]
+fn an_aged_guest_behind_a_living_port_stays_registered() {
+    let dir = scratch("quiet-kept");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.push(card_holds(2, BEHIND_GUEST));
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the quiet guest was unregistered although its port lives"
+    );
+    assert!(
+        !sock2.added.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the card already held it; re-adding is churn"
+    );
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+    assert_eq!(reports[0].quiet, 1, "the report has to say what is held");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A pass against the aged forwarding table, after the first pass of
+/// `syncer` registered everything - the shape the quiet tests share.
+fn age_out(s: &mut Syncer, topo: &crate::sysfs::Topology, m: Mac) -> Vec<Report> {
+    let mut aged = fdb_without(m);
+    aged.push(card_holds(2, m));
+    let mut sock = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock, true, topo, Dur::ZERO).unwrap();
+    for (_, gone) in sock.removed {
+        assert_ne!(gone, m, "removed although its port still lives");
+    }
+    reports
+}
+
+/// A device behind a physical NIC in the bridge is bitten by ageing exactly
+/// like a guest - the frame must cross the bridge either way - so it is
+/// kept the same way: while the port lives, without a clock. Time passing
+/// changes nothing; only pressure, a move or the port going do.
+#[test]
+fn an_aged_address_on_a_physical_port_is_kept_while_the_port_lives() {
+    let dir = scratch("quiet-lan-kept");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
+
+    let reports = age_out(&mut s, &topo, BEHIND_NIC);
+    assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
+    assert_eq!(reports[0].quiet, 1, "the quiet device counts as held");
+
+    // And again, later: there is no window to run out of.
+    std::thread::sleep(Dur::from_millis(30));
+    let reports = age_out(&mut s, &topo, BEHIND_NIC);
+    assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
+    assert_eq!(reports[0].quiet, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The physical port disappearing takes its whole segment with it: the
+/// kept address goes, exactly as a guest's does when its veth dies.
+#[test]
+fn a_kept_lan_address_leaves_when_its_nic_does() {
+    let dir = scratch("quiet-lan-port-gone");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    age_out(&mut s, &topo, BEHIND_NIC);
+
+    // nic2 is unplugged from the picture entirely.
+    let smaller = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .build();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, BEHIND_NIC)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &smaller, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "the NIC is gone; its addresses have to go with it"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The port going is the guest going: the keep ends with the veth.
+#[test]
+fn a_kept_address_leaves_when_its_port_does() {
+    let dir = scratch("quiet-port-gone");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The container stopped: veth0 is gone from the picture.
+    let vethless = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .lower("nic2")
+        .add("vmbr1.44", 11, Some(mac(1)))
+        .master("IOT")
+        .lower("vmbr1")
+        .add("IOT", 12, Some(mac(1)))
+        .bridge()
+        .lower("vmbr1.44")
+        .build();
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &vethless, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the port is gone, the keep has to end"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The wire still has the last word: an address that reappears on the
+/// uplink's own port is removed even while its old veth lives on.
+#[test]
+fn the_wire_wins_over_a_quiet_keep() {
+    let dir = scratch("quiet-wire");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The guest moved to another host: gone behind the bridge, learnt on
+    // the uplink port instead.
+    let mut moved = fdb_without(BEHIND_GUEST);
+    moved.push(learned(2, 10, BEHIND_GUEST));
+    let mut sock2 = FakeSock {
+        fdb: moved,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "an address out on the wire must not be kept alive"
+    );
+    assert!(!s.load_owned("nic1").contains(&BEHIND_GUEST));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The reflection evicts the port memory along with the entry. Mandatory,
+/// not tidiness: if its note write fails, the address stays on the note,
+/// and a later pass whose dump no longer shows the wire entry would
+/// otherwise keep alive the very address the reflection took out.
+#[test]
+fn a_reflection_evicts_the_port_memory() {
+    let dir = scratch("quiet-reflection");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The batch that says the guest moved out onto the wire.
+    s.fast_apply(
+        &mut sock,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
+    )
+    .unwrap();
+    assert!(sock.removed.iter().any(|(_, m)| *m == BEHIND_GUEST));
+
+    // A pass whose dump shows neither the wire entry nor the guest, with
+    // the old veth still alive: nothing may come back.
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock2.added.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the reflected address rose from the dead"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The memory lives with the process, on purpose. A fresh syncer over the
+/// same notes treats what has already aged the way it always was.
+#[test]
+fn a_fresh_syncer_has_no_quiet_memory() {
+    let dir = scratch("quiet-restart");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    drop(s);
+
+    let mut restarted = ready_syncer(&dir);
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = restarted
+        .reconcile(&mut sock2, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "a restart must fall back to the old behaviour"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A kept address missing from the filter is a growth, and a growth on a
+/// carried VF answer is the bug class the grow-refresh exists for: the
+/// fresh answer may call it a VF's own address, and then it must not come
+/// back. The card holds everything else, so the kept address is the ONLY
+/// thing that can trip the trigger - a pass that puts the survivors into
+/// `want` after the trigger decided would sail past it and register on
+/// the carried answer.
+#[test]
+fn a_kept_absent_address_triggers_the_grow_refresh() {
+    let dir = scratch("quiet-grow");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Everything the first pass registered is in the card.
+    let holds: Vec<crate::netlink::FdbEntry> =
+        sock.added.iter().map(|&(_, m)| card_holds(2, m)).collect();
+
+    // Pass 2: aged out of the bridge, the card still whole - entering the
+    // kept state buys its own fresh question, and the answer is clean.
+    let mut aged: Vec<crate::netlink::FdbEntry> = fdb_without(BEHIND_GUEST);
+    aged.extend(holds.iter().cloned());
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.vf_asked >= 1,
+        "entering the kept state has to buy a fresh driver question"
+    );
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    // Pass 3: long quiet now, and the card lost the entry (a driver that
+    // cleared its list on link-down). Meanwhile a guest claimed the
+    // address over the mailbox: the driver's current truth calls it a
+    // VF's own. Healing it back in would be a growth - the carried answer
+    // must not decide it.
+    let mut lost: Vec<crate::netlink::FdbEntry> = fdb_without(BEHIND_GUEST);
+    lost.extend(holds.iter().filter(|e| e.mac != BEHIND_GUEST).cloned());
+    let mut sock3 = FakeSock {
+        fdb: lost,
+        vf: vec![(2, VF_ADMIN), (2, BEHIND_GUEST)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock3.vf_asked >= 1,
+        "a growing pass on a carried answer has to ask the driver"
+    );
+    assert!(
+        !sock3.added.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "a VF's own address was kept alive past its guest"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The quiet state's entry ticket, on its own: a guest can claim an aged
+/// address over the driver mailbox without any link message, so the pass
+/// that begins keeping an address asks the driver afresh even when the
+/// card already holds it and nothing else grows.
+#[test]
+fn entering_the_kept_state_buys_a_fresh_driver_question() {
+    let dir = scratch("quiet-entry-ask");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let holds: Vec<crate::netlink::FdbEntry> =
+        sock.added.iter().map(|&(_, m)| card_holds(2, m)).collect();
+
+    // Aged, card whole, and the fresh answer says: that is a VF's own
+    // address now. The keep must yield to it on the spot.
+    let mut aged: Vec<crate::netlink::FdbEntry> = fdb_without(BEHIND_GUEST);
+    aged.extend(holds);
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN), (2, BEHIND_GUEST)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.vf_asked >= 1,
+        "the entry into quietness has to ask the driver"
+    );
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "an address the fresh answer calls a VF's own has to leave the card"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Crash healing: a kept address that is missing from the card is
+/// re-registered - the keep holds the claim, the pass repairs the filter.
+#[test]
+fn a_kept_address_missing_from_the_card_is_reregistered() {
+    let dir = scratch("quiet-heal");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Aged AND absent from the card (no self entry in the dump).
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.added.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "a kept address missing from the filter has to be healed back in"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An operator's EXCLUDE outranks the keep, and a pinned EXTRA is wanted
+/// outright - quiet counts neither.
+#[test]
+fn exclusions_and_extras_outrank_the_keep() {
+    let dir = scratch("quiet-exclude");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Excluded after the fact: the keep must not override the operator.
+    s.exclude.insert(BEHIND_GUEST);
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST));
+    assert_eq!(reports[0].quiet, 0);
+
+    // Pinned instead: wanted through EXTRA, not counted as quiet.
+    s.exclude.remove(&BEHIND_GUEST);
+    s.extra.insert(BEHIND_NIC);
+    let mut sock3 = FakeSock {
+        fdb: fdb_without(BEHIND_NIC),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == BEHIND_NIC),
+        "a pinned address fell out"
+    );
+    assert_eq!(reports[0].quiet, 0, "extra is want, not quiet");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An unreadable note stalls the keep but must not erase its memory: when
+/// the note heals, the quiet guest is still known.
+#[test]
+fn an_unreadable_note_does_not_erase_the_port_memory() {
+    // Unreadability is only reachable as somebody who is not root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = scratch("quiet-unreadable");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    let note = dir.join("nic1.owned");
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut sock2 = FakeSock {
+        fdb: fdb_without(BEHIND_GUEST),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.is_empty(),
+        "an unreadable note must hold the card still"
+    );
+
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.push(card_holds(2, BEHIND_GUEST));
+    let mut sock3 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the memory did not survive the unreadable window"
+    );
+    assert_eq!(reports[0].quiet, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Kept addresses cost filter slots and are the first surrendered as the
+/// list nears its capacity - a surrendered keep is exactly the old
+/// behaviour. The wanted core stays untouched.
+#[test]
+fn the_pressure_valve_sheds_keeps_first() {
+    let dir = scratch("quiet-pressure");
+    let m1: Mac = [0x02, 0xdd, 0, 0, 0, 1];
+    let m2: Mac = [0x02, 0xdd, 0, 0, 0, 2];
+    let m3: Mac = [0x02, 0xdd, 0, 0, 0, 3];
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, m1), learned(4, 10, m2), learned(4, 10, m3)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // All three age out; the limit leaves no room for all of them.
+    s.max_macs = 4;
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, m1), card_holds(2, m2), card_holds(2, m3)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(
+        reports[0].quiet, 2,
+        "the shed count is deterministic: one keep yields, two stand"
+    );
+    assert!(
+        !sock2.removed.is_empty(),
+        "a surrendered keep has to leave the card"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Under pressure the longest-missing entry yields first, and a fresh
+/// learn makes an entry young again: what goes is what has not been heard
+/// from for the longest, not whoever happens to sort first.
+#[test]
+fn the_pressure_valve_sheds_the_longest_missing_first() {
+    let dir = scratch("quiet-pressure-order");
+    let old: Mac = [0x02, 0xde, 0, 0, 0, 2];
+    let young: Mac = [0x02, 0xde, 0, 0, 0, 1];
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // `old` ages out first and its clock starts; `young` is still learnt.
+    // `young` sorts before `old` by address, so a valve that ignored the
+    // clock would shed `young` - only the clock names `old`.
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(30));
+
+    // Now both are quiet, and the limit leaves room for only some of the
+    // list: the longest-missing - `old` - is the one surrendered.
+    s.max_macs = 3;
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, old), card_holds(2, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == old),
+        "pressure has to cost the longest-missing entry"
+    );
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == young),
+        "the recently heard-from entry was shed although an older one stood"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A behind-the-bridge learn buys the pass that records the port - the
+/// reason the fast path needs no recording of its own.
+#[test]
+fn a_learn_buys_the_pass_that_records() {
+    let dir = scratch("quiet-learn-pass");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
+        )
+        .unwrap();
+    assert_eq!(
+        urgency,
+        Urgency::Now,
+        "the learn did not buy the pass whose dump records the port"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The memory follows the latest learn: a guest that moved to another
+/// veth is kept by the port it lives behind now, not the one it left.
+#[test]
+fn the_memory_follows_the_latest_learn() {
+    let dir = scratch("quiet-moved-port");
+    let m: Mac = [0x02, 0xee, 0, 0, 0, 1];
+    let build = |with_a: bool| {
+        let mut b = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("br0")
+            .vfs(1);
+        if with_a {
+            b = b.add("vetha", 4, Some(mac(4))).master("br0");
+        }
+        b = b.add("vethb", 5, Some(mac(5))).master("br0");
+        let mut br = b.add("br0", 10, Some(mac(3))).bridge().lower("nic1");
+        if with_a {
+            br = br.lower("vetha");
+        }
+        br.lower("vethb").build()
+    };
+    let topo = build(true);
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+
+    // Learnt behind vetha first, then behind vethb.
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let mut sock2 = FakeSock {
+        fdb: vec![learned(5, 10, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // vetha dies, the address ages - vethb is what keeps it.
+    let gone_a = build(false);
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &gone_a, Dur::ZERO).unwrap();
+    assert!(
+        !sock3.removed.iter().any(|(_, mm)| *mm == m),
+        "the memory clung to the port the guest left"
+    );
+    assert_eq!(reports[0].quiet, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The pass-start read is the one the memory prune must be judged by. A
+/// note unreadable at the start but readable again mid-pass (a parallel
+/// writer healed it while the grow-refresh ran) makes `note_is_readable`
+/// true while `owned` still descends from the could-not-tell empty set -
+/// pruning against that erased the very memory the gate protects.
+struct FlipSock {
+    inner: FakeSock,
+    heal: Option<PathBuf>,
+}
+impl FdbWriter for FlipSock {
+    fn dump_fdb(&mut self) -> io::Result<Vec<crate::netlink::FdbEntry>> {
+        self.inner.dump_fdb()
+    }
+    fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
+        self.inner.dump_links()
+    }
+    fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
+        if let Some(p) = self.heal.take() {
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        self.inner.vf_macs_of(indices)
+    }
+    fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
+        self.inner.set_self_fdb(ifindex, mac, add)
+    }
+}
+
+#[test]
+fn a_note_turning_readable_mid_pass_keeps_the_memory() {
+    // Unreadability is only reachable as somebody who is not root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = scratch("quiet-flip");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    // A parallel --once rewrote the note (same content, new inode), and
+    // right after, the file is momentarily unreadable. The stat cache is
+    // invalid, so the pass really reads - and fails.
+    let note = dir.join("nic1.owned");
+    let text = fs::read_to_string(&note).unwrap();
+    let tmp = dir.join(".nic1.owned.flip.tmp");
+    fs::write(&tmp, &text).unwrap();
+    fs::rename(&tmp, &note).unwrap();
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // BEHIND_GUEST has aged (still in the card), and a NEW address is
+    // learnt - the growth that triggers the vf refresh, during which the
+    // note becomes readable again; the append then re-reads it fine.
+    let newmac: Mac = [0x02, 0x77, 0, 0, 0, 9];
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.push(card_holds(2, BEHIND_GUEST));
+    aged.push(learned(3, 10, newmac));
+    let mut sock2 = FlipSock {
+        inner: FakeSock {
+            fdb: aged.clone(),
+            vf: vec![(2, VF_ADMIN)],
+            ..Default::default()
+        },
+        heal: Some(note.clone()),
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock2.inner.added.iter().any(|(_, m)| *m == newmac),
+        "the new learn was registered (the flip really happened)"
+    );
+
+    // Everything readable again: the quiet guest's port still lives, so
+    // the keep must hold - which it only can if the memory survived.
+    let mut aged3 = fdb_without(BEHIND_GUEST);
+    aged3.push(card_holds(2, BEHIND_GUEST));
+    aged3.push(learned(3, 10, newmac));
+    aged3.push(card_holds(2, newmac));
+    let mut sock3 = FakeSock {
+        fdb: aged3,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the unreadable window erased the port memory"
+    );
+    assert_eq!(reports[0].quiet, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A failed unregister keeps the note for the retry - the memory it must
+/// not keep: with the port memory alive, the quiet keep would re-adopt the
+/// moved-out address as soon as its wire evidence fades (an ifreload
+/// flushed the bridge's table), and a one-off EBUSY would harden into a
+/// permanent keep the stale loop can never reach.
+#[test]
+fn a_failed_reflection_removal_does_not_become_a_keep() {
+    let dir = scratch("quiet-reflect-err");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    // The guest's address fails over to the wire; the reflection's removal
+    // hits a transient error (rtnl contention during the very ifreload).
+    let mut fail = crate::hash::map();
+    fail.insert(BEHIND_GUEST, libc::EBUSY);
+    let mut sock2 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_del: fail,
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock2,
+        &topo,
+        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
+    )
+    .unwrap();
+    assert!(sock2.removed.is_empty(), "the removal really failed");
+
+    // The ifreload flushed the bridge's table: the next pass's dump shows
+    // neither the wire entry nor the guest - only the card still holding
+    // the address. The removal must now happen, not a keep.
+    let mut flushed = fdb_without(BEHIND_GUEST);
+    flushed.push(card_holds(2, BEHIND_GUEST));
+    let mut sock3 = FakeSock {
+        fdb: flushed,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the moved-out address was held as a quiet keep (quiet={})",
+        reports[0].quiet
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A living port is not enough - it has to still lead to this bridge. A
+/// veth re-enslaved to an unrelated bridge keeps existing, but its guest
+/// is no longer behind the uplink, and holding its address would steer
+/// that MAC into the wrong bridge for ever.
+#[test]
+fn a_port_moved_to_another_bridge_ends_the_keep() {
+    let dir = scratch("quiet-moved-bridge");
+    let m: Mac = [0x02, 0xdf, 0, 0, 0, 1];
+    let before = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &before, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&m));
+
+    // The veth lives on - under br9 now. The address has aged.
+    let after = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br9")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .add("br9", 11, Some(mac(9)))
+        .bridge()
+        .lower("vetha")
+        .build();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &after, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, r)| *r == m),
+        "the port left this bridge; the keep has to end"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A learn-port folded in under the uplink is the wire's side of the
+/// fence now: two NICs joined into a bond uplink carry their old peers
+/// out, not in, and keeping those addresses would steer wire traffic
+/// into the bridge.
+#[test]
+fn a_port_folded_under_the_uplink_ends_the_keep() {
+    let dir = scratch("quiet-bonded-away");
+    let m: Mac = [0x02, 0xdf, 0, 0, 0, 2];
+    let before = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("nic2", 5, Some(mac(5)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("nic2")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(5, 10, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &before, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&m));
+
+    // Re-plumbed: nic1 and nic2 are members of bond0, bond0 the sole
+    // bridge port; the re-enslavement flushed the bridge's table.
+    let after = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("bond0")
+        .vfs(1)
+        .add("nic2", 5, Some(mac(5)))
+        .master("bond0")
+        .add("bond0", 7, Some(mac(1)))
+        .master("br0")
+        .lower("nic1")
+        .lower("nic2")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("bond0")
+        .build();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, m)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &after, Dur::ZERO).unwrap();
+    assert!(
+        sock2.removed.iter().any(|(_, r)| *r == m),
+        "the learn-port now lies under the uplink; its address is the wire's"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The valve opens AT nine tenths, not past it: with the equality case
+/// off by one, a filter sitting exactly at the line would take one more
+/// learn and overflow the card in silence.
+#[test]
+fn the_pressure_valve_opens_exactly_at_nine_tenths() {
+    let dir = scratch("quiet-pressure-edge");
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    // Eight learns plus the bridge's own address: want is exactly 9.
+    let learns: Vec<Mac> = (1..=8u8).map(|i| [0x02, 0xe0, 0, 0, 0, i]).collect();
+    let mut sock = FakeSock {
+        fdb: learns.iter().map(|m| learned(4, 10, *m)).collect(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // All eight age; 9 * 10 >= 10 * 9 holds with equality and nothing to
+    // spare - exactly one keep has to yield.
+    s.max_macs = 10;
+    let mut sock2 = FakeSock {
+        fdb: learns.iter().map(|m| card_holds(2, *m)).collect(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(
+        sock2.removed.len(),
+        1,
+        "at the nine-tenths line exactly one keep yields (quiet={})",
+        reports[0].quiet
+    );
+    assert_eq!(reports[0].quiet, 7);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The missing-clock keeps its start across passes: re-stamped on every
+/// quiet pass, all entries would look equally young and the valve would
+/// degenerate to shedding by address order.
+#[test]
+fn the_missing_clock_is_not_wound_up_by_later_passes() {
+    let dir = scratch("quiet-clock-start");
+    // `old` sorts after `young` by address, so only a preserved clock can
+    // name it as the one to shed.
+    let old: Mac = [0x02, 0xe1, 0, 0, 0, 2];
+    let young: Mac = [0x02, 0xe1, 0, 0, 0, 1];
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Pass 2: `old` ages, `young` still speaks.
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, old), learned(4, 10, young)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(20));
+
+    // Pass 3: both quiet now - `old`'s clock must keep its earlier start.
+    let both = vec![card_holds(2, old), card_holds(2, young)];
+    let mut sock3 = FakeSock {
+        fdb: both.clone(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(20));
+
+    // Pass 4, under pressure: the one shed has to be `old`.
+    s.max_macs = 3;
+    let mut sock4 = FakeSock {
+        fdb: both,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock4, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        sock4.removed.iter().any(|(_, m)| *m == old),
+        "the longest-missing entry has to be the one shed"
+    );
+    assert!(
+        !sock4.removed.iter().any(|(_, m)| *m == young),
+        "a rewound clock shed by address order instead"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The port memory follows the note through a rename, or an ifupdown
+/// moment that renames the uplink silently forgets exactly the quiet
+/// guests it was carrying.
+#[test]
+fn a_rename_carries_the_quiet_memory_along() {
+    let dir = scratch("quiet-rename");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The guest goes quiet while still called nic1.
+    age_out(&mut s, &topo, BEHIND_GUEST);
+    assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
+
+    // Same interface, same index, new name - and the guest still quiet.
+    let renamed = Builder::new()
+        .add("nicX", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nicX")
+        .lower("nic2")
+        .add("vmbr1.44", 11, Some(mac(1)))
+        .lower("vmbr1")
+        .add("IOT", 12, Some(mac(0x12)))
+        .bridge()
+        .lower("vmbr1.44")
+        .lower("veth0")
+        .add("veth0", 13, Some(mac(0x13)))
+        .master("IOT")
+        .build();
+    s.pairs = vec![Pair {
+        dev: "nicX".into(),
+        bridge: "vmbr1".into(),
+    }];
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.retain(|e| !e.is_self());
+    aged.push(card_holds(2, BEHIND_GUEST));
+    let mut sock2 = FakeSock {
+        fdb: aged,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let reports = s.reconcile(&mut sock2, true, &renamed, Dur::ZERO).unwrap();
+    assert!(
+        !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "the rename lost the quiet guest's memory"
+    );
+    assert!(
+        reports.iter().any(|r| r.dev == "nicX" && r.quiet >= 1),
+        "the keep did not survive under the new name"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A dry-run daemon reports, it does not write - the fast path included.
+/// The guard is the early return; without it a --dry-run daemon would put
+/// real entries into a live filter the moment a guest speaks.
+#[test]
+fn dry_run_gates_the_fast_path() {
+    let dir = scratch("dry-fast");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    s.dry_run = true;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    let urgency = s
+        .fast_apply(
+            &mut sock,
+            &topo,
+            &[(crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
+        )
+        .unwrap();
+    assert!(sock.added.is_empty(), "a dry run wrote to the filter");
+    assert_eq!(
+        urgency,
+        Urgency::Now,
+        "the pass is where a dry run reports; the batch has to buy one"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A successful --check leaves nothing behind: when the probe was the
+/// note's only line, note and index go with it - an empty leftover reads
+/// as a managed device to --flush and to anyone listing the directory.
+#[test]
+fn a_clean_check_probe_leaves_no_note_behind() {
+    let dir = scratch("check-traceless");
+    let s = ready_syncer(&dir);
+    const PROBE: Mac = [0x02, 0xe3, 0, 0, 0, 0x60];
+    assert!(s.note_check_probe("nic9", 2, &PROBE));
+    assert!(dir.join("nic9.owned").exists());
+    s.forget_check_probe("nic9", &PROBE);
+    assert!(
+        !dir.join("nic9.owned").exists(),
+        "the probe's note survived the check"
+    );
+    assert!(
+        !dir.join("nic9.index").exists(),
+        "the probe's index survived the check"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An orphan sweep that cannot take an entry out has to say so in the
+/// failures it hands the oneshot - a --once that exits 0 over entries it
+/// left in the card is how orphans become permanent in silence.
+#[test]
+fn an_unremovable_orphan_fails_the_sweep_out_loud() {
+    let dir = scratch("orphan-fail");
+    let orphan: Mac = [0x02, 0xe4, 0, 0, 0, 1];
+    // A note for an interface that still exists but stopped being an
+    // uplink - its entries are still in a live card, so a failed removal
+    // is an orphan left behind, not dust settled.
+    let mut set = crate::hash::set();
+    set.insert(orphan);
+    let mut s = Syncer::new(Vec::new(), dir.clone());
+    s.authoritative = true;
+    s.save_owned("nic2", &set);
+
+    let topo = host(mac(1));
+    let mut fail = crate::hash::map();
+    fail.insert(orphan, libc::EBUSY);
+    let mut sock = FakeSock {
+        fail_del: fail,
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    s.drop_orphans(&mut sock, &topo, true, &mut failures);
+    assert!(
+        !failures.is_empty(),
+        "the failed removal has to reach the oneshot's exit code"
+    );
+    assert!(
+        dir.join("nic2.owned").exists(),
+        "the note has to stay for the retry"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Invariant 2's third leg: a virtual function still bound on the host -
+/// no admin MAC set, so absent from the driver's answer - is recognised
+/// by its netdev, and its address must never be registered past it.
+#[test]
+fn a_bound_sister_vf_is_excluded_by_its_netdev() {
+    let dir = scratch("vf-netdev-excl");
+    let vf_mac: Mac = [0x02, 0xe5, 0, 0, 0, 1];
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(2)
+        .vf_netdev("nic1v1")
+        .add("nic1v1", 6, Some(vf_mac))
+        .physfn("nic1")
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    // The bridge learns the VF's own address behind a guest port - the
+    // reflection case the exclusion set exists to refuse. The driver's
+    // answer does NOT name it: no admin MAC was ever set.
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, vf_mac)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock.added.iter().any(|(_, m)| *m == vf_mac),
+        "a bound VF's own address was registered past its function"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

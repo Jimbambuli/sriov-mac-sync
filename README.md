@@ -142,8 +142,20 @@ hardware are welcome; those four steps are the whole test.
 - **It knows nothing about VLANs.** One entry covers a MAC in every VLAN. So
   registering is all-or-nothing, and an address learnt on the uplink in *any*
   VLAN is left out entirely.
-- **Idle devices fall out and come back by themselves** as bridge entries age
-  out. Harmless: the next ARP or ND is broadcast and repopulates both.
+- **A quiet guest stays registered.** Bridge entries age out, 300 s by
+  default, but a router that caches ARP longer keeps sending unicast without
+  asking again (FreeBSD holds it 1200 s), and those frames went out on the
+  wire. A miss is a delivery only for peers on the uplink port's own wire;
+  everywhere the bridge would have carried the frame, it is a blackhole. So
+  an aged-out address is simply kept while the port it was learnt behind
+  still hangs in the bridge - ageing is the bridge managing its table, not
+  news about the device. The entry goes when its port goes, when the
+  address moves out to the wire, or under filter pressure: as the list
+  nears its capacity the longest-missing entries are released first, and
+  every fresh learn makes an entry young again. The memory lives in the
+  daemon: after a restart, or beside a hand-run `--once`, an already-aged
+  address falls back to the old behaviour until the next ARP. `EXTRA` still
+  pins an address outright.
 - **Stopping the daemon leaves the filter as it is**, which is what makes a
   restart invisible to every guest. `--flush` clears the card.
 - **It only removes what it added**, from a note in `/run/sriov-mac-sync/`.

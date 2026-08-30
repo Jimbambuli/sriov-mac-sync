@@ -114,6 +114,36 @@ finishes — the address stays `tentative` and IPv6 on that interface is dead. S
 both to `0`. Nothing to do with this daemon, but you will hit it in the same
 afternoon.
 
+## A router that caches ARP longer than the bridge ages will blackhole quiet guests
+
+Measured on an OPNsense (FreeBSD) living on a VF in front of a Proxmox host -
+which is much of this project's audience. FreeBSD holds ARP entries for
+1200 s (`net.link.ether.inet.max_age`); the Linux bridge forgets a silent
+MAC after 300 s (`ageing_time`). A guest that stays quiet for five minutes
+ages out of the bridge, the filter entry rightly goes with it - and the
+router then keeps sending unicast for another fifteen minutes without asking
+again. The eSwitch misses, the frame leaves on the wire, and every
+connection attempt dies in a dial timeout. Observed as 259 reverse-proxy 502s
+over four weeks, alternating with successes exactly as the 15-minute poll
+beat against the 20-minute ARP lifetime.
+
+Who is bitten depends on where the miss lands. A missed frame leaves on the
+uplink port's own wire - for a peer on that wire (a printer on the same
+switch) the miss *is* the delivery: the path degrades to the physical switch
+and heals itself, and such wire-learnt addresses are never registered anyway.
+Every destination the bridge would have to carry the frame to is blackholed:
+guests behind the bridge, and just as much a device behind another NIC in
+the same bridge - the frame leaves on the uplink's wire, not on that NIC's.
+
+The quiet-keep covers the bitten set whole: an aged-out address is kept
+while the port it was learnt behind still hangs in the bridge - ageing is
+the bridge managing its own table, not news about the device. The entry
+goes when its port goes, when the address moves out to the wire, or under
+filter pressure, longest-missing first. Where that does not help - an older
+build, a `--once` cron beside the daemon - either pin the address with
+`EXTRA`, or align the one pair of numbers this hinges on: the router's ARP
+lifetime against the bridge's `ageing_time`.
+
 ## The first registration after a topology change can wait on the host
 
 Writing a filter entry takes the kernel's rtnl lock, and so does everything else

@@ -25,9 +25,17 @@ and the graph carries both directions of each edge, so "what sits on top of this
 bridge" is one walk rather than one per interface.
 
 The daemon works from notifications. An address is registered as soon as the
-kernel says a bridge learnt it, dropped when the bridge ages it out, and the
-whole picture rebuilt whenever an interface appears, disappears or is
-reconfigured. What notifications do *not* cover is a VF's address changing
+kernel says a bridge learnt it, dropped when the bridge ages it out - unless
+its port testifies otherwise: the pass remembers, in memory, which bridge port
+each owned address was last learnt behind, and an aged-out address whose port
+still exists in the bridge is kept - for a guest the kernel deletes the veth
+or tap with its endpoint, so the port existing is the guest existing, and a
+device behind a physical port in the bridge is blackholed by ageing all the
+same. What bounds the keep is capacity, not time: nearing the filter's limit,
+the longest-missing entries are released first, and every fresh learn makes
+an entry young again. The entry also goes when its port goes or the address
+moves out to the wire. The whole picture is rebuilt whenever an
+interface appears, disappears or is reconfigured. What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever
 reaching rtnetlink — an "up PFs announce" gate built on the opposite
@@ -166,7 +174,9 @@ If a failed run leaves test entries behind (prefixes `02:be:5c` and
 `bridge fdb del <mac> dev <uplink> self permanent` and leave the note files
 alone: the daemon heals its own notes through the ENOENT path on the next pass.
 After a hard kill the bridge entries age out within 300 s and the daemon takes
-the registrations back by itself.
+the registrations back by itself - except those whose guest port lives on,
+which is the point of the quiet-keep; the trial's own veth goes with the
+teardown, so its entries do come back out.
 
 How a pass scales with the size of the forwarding table is a question for
 `cargo test --release scaling -- --ignored --nocapture`: an SDN-shaped topology,

@@ -181,8 +181,11 @@ pub(crate) fn desired_named(
         .index_of(&pair.dev)
         .expect("fixture has no such device");
     let bridge = topo.index_of(&pair.bridge).unwrap_or(0);
-    let port = topo.index_of(port).unwrap_or(dev);
-    s.desired(topo, bridge, dev, port, fdb, vf_macs)
+    let port = topo
+        .index_of(port)
+        .unwrap_or_else(|| panic!("fixture: no interface named {port}"));
+    let (want, stacked, wire, _) = s.desired(topo, bridge, dev, port, fdb, vf_macs);
+    (want, stacked, wire)
 }
 
 pub(crate) fn syncer() -> Syncer {

@@ -19,12 +19,24 @@ set -u
 BIN="${1:?usage: integration.sh <path-to-binary>}"
 NS="ip netns exec sms-it"
 STATE=/run/sriov-mac-sync
-SNAP=$(mktemp)
 PASS=0
 FAIL=0
 DPID=""
 
 say() { echo "== $*"; }
+
+# Bounded stop for scenario daemons: S6 proves prompt termination once;
+# the others must not hang the whole suite if that ever regresses.
+stop_daemon() {
+  kill -TERM "$DPID" 2>/dev/null
+  for _ in $(seq 1 30); do
+    kill -0 "$DPID" 2>/dev/null || { wait "$DPID" 2>/dev/null; DPID=""; return; }
+    sleep 0.1
+  done
+  kill -9 "$DPID" 2>/dev/null
+  wait "$DPID" 2>/dev/null
+  DPID=""
+}
 ok() {
   PASS=$((PASS + 1))
   echo "   PASS: $*"
@@ -84,6 +96,7 @@ fi
 }
 BIN=$(readlink -f "$BIN")
 
+SNAP=$(mktemp)
 trap cleanup EXIT
 ip -br link >"$SNAP"
 ip netns del sms-it 2>/dev/null
@@ -212,9 +225,65 @@ $NS bridge fdb del $M1 dev veth-up self permanent
 sleep 2.5
 check "M1 restored" "has_self $M1"
 check "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
-kill -TERM $DPID
-wait $DPID 2>/dev/null
-DPID=""
+stop_daemon
+
+say "S6c: a quiet guest outlives the bridge's ageing while its port does"
+$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6c.log 2>&1 &
+DPID=$!
+sleep 1
+$NS bridge fdb replace $M2 dev veth-g1 master dynamic
+sleep 2
+check "M2 registered while learnt" "has_self $M2"
+# The bridge forgets - the kernel announces it exactly as ageing does -
+# while veth-g1 lives on. The keep must hold the entry.
+$NS bridge fdb del $M2 dev veth-g1 master
+sleep 3
+check "M2 kept after ageing (port lives)" "has_self $M2"
+check "the keep is said" "grep -q 'kept \[quiet\]' /tmp/sms-it-s6c.log"
+# The guest actually stops: the veth goes, and the entry must follow.
+$NS ip link del veth-g1
+sleep 3
+check "M2 gone once its port is" "! has_self $M2"
+stop_daemon
+# Restore the guest port and M1's registration for the scenarios that
+# follow: deleting veth-g1 rightly ended M1's keep too.
+$NS ip link add veth-g1 type veth peer name veth-g1P
+$NS ip link set veth-g1 master br0
+$NS sh -c 'ip link set veth-g1 up; ip link set veth-g1P up'
+# The port sits in state disabled until linkwatch runs; a dynamic entry on
+# a disabled port earns EPERM and the restore silently never happens -
+# the same race trial.py guards against.
+for _ in $(seq 1 50); do
+  $NS bridge link show dev veth-g1 2>/dev/null | grep -q "state forwarding" && break
+  sleep 0.1
+done
+$NS bridge fdb replace $M1 dev veth-g1 master dynamic
+$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
+
+say "S6d: an aged address on a physical-style port is kept, and goes with the port"
+# A dummy port is the netns stand-in for a physical NIC in the bridge: its
+# aged addresses are kept exactly like a guest's - until the port goes.
+$NS ip link add dum0 type dummy
+$NS ip link set dum0 master br0
+$NS ip link set dum0 up
+M5="02:be:5c:00:00:55"
+$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6d.log 2>&1 &
+DPID=$!
+sleep 1
+$NS bridge fdb replace $M5 dev dum0 master dynamic
+sleep 2
+check "M5 registered while learnt" "has_self $M5"
+$NS bridge fdb del $M5 dev dum0 master
+sleep 3
+check "M5 kept after ageing (port lives)" "has_self $M5"
+$NS ip link del dum0
+sleep 3
+check "M5 gone once its port is" "! has_self $M5"
+check "the keep is said" "grep -q 'kept \[quiet\]' /tmp/sms-it-s6d.log"
+stop_daemon
+# M1 again for the scenarios that follow.
+$NS bridge fdb replace $M1 dev veth-g1 master dynamic
+$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
 
 say "S7: --status reads without writing"
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)

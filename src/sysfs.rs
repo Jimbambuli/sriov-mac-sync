@@ -674,6 +674,7 @@ pub(crate) mod fixture {
         lowers: Vec<String>,
         physfn: Option<String>,
         pf_netdevs: Vec<String>,
+        vf_netdevs: Vec<String>,
     }
 
     impl Builder {
@@ -737,6 +738,13 @@ pub(crate) mod fixture {
             self
         }
 
+        /// A virtual function's netdev still bound on the host, hanging
+        /// off this PF - the `virtfn*/net` reading.
+        pub fn vf_netdev(mut self, vf: &str) -> Self {
+            self.last_names().vf_netdevs.push(vf.to_string());
+            self
+        }
+
         pub fn build(self) -> Topology {
             let by_name: Map<String, u32> = self
                 .links
@@ -767,6 +775,7 @@ pub(crate) mod fixture {
                     if let Some(&first) = l.pf_netdevs.first() {
                         l.physfn = Some(first);
                     }
+                    l.vf_netdevs = n.vf_netdevs.iter().filter_map(idx).collect();
                     l
                 })
                 .collect();

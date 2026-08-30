@@ -457,7 +457,15 @@ impl Syncer {
         }
         let mut lines: Vec<String> = set.iter().map(format_mac).collect();
         lines.sort();
-        let text = lines.join("\n") + "\n";
+        // An empty set is an empty file. `join + newline` wrote a lone
+        // newline for it, and the next append then produced a note with a
+        // phantom blank first line - harmless to the parser, but visible to
+        // anything comparing note contents.
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        };
         // A note that cannot be written strands every entry it should have
         // named: the next pass reads nothing and counts them as foreign,
         // forever. That must not happen in silence.

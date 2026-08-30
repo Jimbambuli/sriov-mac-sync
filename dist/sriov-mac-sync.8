@@ -23,7 +23,12 @@ is broadcast and gets flooded, while the unicast reply never arrives.
 .B sriov\-mac\-sync
 watches the bridge's forwarding database over rtnetlink and writes what the
 bridge has learnt into the uplink's unicast filter, adding addresses as they
-appear and removing them as the bridge ages them out. It works out which
+appear and removing them as the bridge ages them out \(em unless the port an
+address was learnt behind still exists in the bridge: such a device is merely
+quiet and stays registered while its port lives, and when the filter nears
+its capacity the longest\-missing entries are released first.
+That memory is the daemon's own; a hand-run \fB--once\fR beside it, or a
+restart, falls back to plain ageing until the next ARP. It works out which
 interface is the uplink structurally \(em an interface with virtual functions, or
 one that is a virtual function \(em following bonds and stacked bridges, so a card
 sitting under a VLAN\-aware bridge or an SDN vnet is found too.

@@ -18,6 +18,7 @@
 # devlink the daemon uses that instead, and setting this overrides both.
 #MAX_MACS=128
 
+
 # Addresses never to register, separated by commas or whitespace.
 #EXCLUDE=""
 

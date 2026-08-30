@@ -642,6 +642,15 @@ fn report_changes(
                     r.removed,
                     r.wanted.len()
                 );
+            } else if r.quiet > 0 {
+                note!(
+                    "{}: +{} -{}, {} address(es) registered, {} held quiet [{trigger}]",
+                    r.dev,
+                    r.added,
+                    r.removed,
+                    r.wanted.len(),
+                    r.quiet
+                );
             } else {
                 note!(
                     "{}: +{} -{}, {} address(es) registered [{trigger}]",
@@ -1076,6 +1085,9 @@ fn run_pass<W: World>(
                 let answers = world.filter_capacities(&devs);
                 if let Some(v) = adopt_reported_capacity(answers, opts.verbose, *max_macs) {
                     *max_macs = v;
+                    // The quiet-keep's pressure valve measures against the
+                    // same limit the warnings do.
+                    syncer.max_macs = v;
                 }
             }
         }
@@ -1318,6 +1330,7 @@ fn run() -> Result<bool, String> {
     // Only autodetection sees every uplink, so only autodetection may conclude
     // that a leftover note belongs to none of them.
     syncer.authoritative = opts.pairs.is_empty();
+    syncer.max_macs = opts.max_macs;
     syncer.exclude = macs("--exclude", &opts.exclude);
     syncer.extra = macs("--extra", &opts.extra);
 

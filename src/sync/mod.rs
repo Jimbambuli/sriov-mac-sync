@@ -91,6 +91,8 @@ pub struct Report {
     pub added: usize,
     pub removed: usize,
     pub foreign: usize,
+    /// aged out of the bridge, kept because their guest ports live on
+    pub quiet: usize,
 }
 
 /// What the syncer needs from the kernel, as a trait so the bookkeeping can
@@ -200,6 +202,28 @@ pub struct Syncer {
     /// that lives on the wire in one VLAN and behind the bridge in another
     /// must not flap in and out of the filter on every learning event.
     carried_wire: Map<String, Set<Mac>>,
+    /// The bridge port each owned address was last learnt behind, per
+    /// uplink. What it buys: a guest that goes quiet outlives the bridge's
+    /// ageing as long as its port does - the kernel deletes a veth or a tap
+    /// with its endpoint, so the port existing is the guest existing. A
+    /// router that caches ARP longer than the bridge ages (FreeBSD holds
+    /// 1200 s against the bridge's 300) keeps sending unicast without asking
+    /// again, and without this those frames went out on the wire.
+    ///
+    /// Only in memory, on purpose: after a restart, what has already aged is
+    /// treated the way it always was, and heals on the next ARP.
+    ///
+    /// The value is the port and, once the address goes missing from the
+    /// dump, when that was first noticed - the age the pressure valve evicts by.
+    carried_ports: Map<String, Map<Mac, (u32, Option<Instant>)>>,
+    /// The filter capacity the quiet-keep must respect. Kept addresses cost
+    /// filter slots, and past its capacity the card drops entries silently -
+    /// so keeps are the first surrendered as the list nears this limit.
+    pub max_macs: usize,
+    /// Which addresses each uplink was last said to be keeping, so the
+    /// quiet-keep is announced once per entry into that state rather than
+    /// once per pass forever.
+    noted_quiet: Map<String, Set<Mac>>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -360,6 +384,9 @@ impl Syncer {
             dir_checked: std::cell::Cell::new(false),
             dir_list_warned: std::cell::Cell::new(false),
             carried_wire: crate::hash::map(),
+            carried_ports: crate::hash::map(),
+            max_macs: 128,
+            noted_quiet: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
             indices: std::cell::RefCell::new(crate::hash::map()),
@@ -446,6 +473,16 @@ impl Syncer {
                         note!("{dev}: now called {new_name}; its note would follow");
                     } else if self.migrate_note(&dev, &new_name, index) {
                         note!("{dev}: now called {new_name}, its note follows the interface");
+                        // The port memory follows the note, or a rename
+                        // would silently forget exactly the quiet guests.
+                        if let Some(ports) = self.carried_ports.remove(&dev) {
+                            self.carried_ports.insert(new_name.clone(), ports);
+                        }
+                        // The said-once mark travels too, or the same keeps
+                        // are announced a second time under the new name.
+                        if let Some(said) = self.noted_quiet.remove(&dev) {
+                            self.noted_quiet.insert(new_name.clone(), said);
+                        }
                     }
                     // Worked, or waits (an unreadable note, an unwritable
                     // new one - both said out loud where they happened, and
@@ -512,6 +549,12 @@ impl Syncer {
                     let _ = self.write_owned(&dev, &kept);
                 }
             });
+            // Whatever the sweep decided, the port memory of a device that
+            // stopped being an uplink is over; a device that returns as a
+            // pair records afresh from its first dump. The said-once mark
+            // goes with it, so a return also announces afresh.
+            self.carried_ports.remove(&dev);
+            self.noted_quiet.remove(&dev);
         }
     }
 
@@ -613,15 +656,25 @@ impl Syncer {
     }
 
     pub fn forget_check_probe(&self, dev: &str, mac: &Mac) {
-        let before = self.load_owned(dev);
-        if !before.contains(mac) {
+        if !self.load_owned(dev).contains(mac) {
             return;
         }
-        let mut after = before.clone();
-        after.remove(mac);
-        // As a difference, so whatever a parallel writer noted meanwhile
-        // survives - same rule as every other write-back.
-        self.save_owned_merged(dev, &before, &after);
+        // Under the lock and against the current file, so whatever a
+        // parallel writer noted meanwhile survives - same rule as every
+        // other write-back. And no trace: when the probe was the note's
+        // only line, note and index came into being for the probe and go
+        // with it - an empty leftover would read as a managed device to
+        // --flush and to anyone listing the state directory.
+        self.locked(dev, || {
+            let mut merged = self.read_owned(dev);
+            merged.remove(mac);
+            if merged.is_empty() {
+                self.remove_note(dev);
+                true
+            } else {
+                self.write_owned(dev, &merged)
+            }
+        });
     }
 
     /// Say so when a virtual function's address cannot be known.
@@ -680,6 +733,86 @@ impl Syncer {
         }
     }
 
+    /// The owned addresses that aged out of the bridge but should stay:
+    /// those whose learn-port still exists and still hangs under this
+    /// bridge. Ageing is the bridge managing its own table, not news about
+    /// the device - a router that caches ARP longer than the bridge ages
+    /// keeps sending unicast without asking again, and a miss only delivers
+    /// to the uplink port's own wire. Anything the bridge must carry - a
+    /// device on another NIC as much as a guest - blackholes. So an aged
+    /// address is simply kept; the honest limit is filter capacity, and the
+    /// pressure valve collects it from the longest-missing entries first.
+    ///
+    /// A port that is GONE keeps nothing: the kernel deletes a veth or tap
+    /// with its endpoint, and a vanished physical port took its segment
+    /// with it. An address that moved to the wire is not asked here at all
+    /// - the wire set wins before this runs.
+    ///
+    /// Pure over its inputs, because the grow-refresh recomputes `desired`
+    /// and this has to be askable twice with a straight face.
+    #[allow(clippy::too_many_arguments)]
+    fn quiet_survivors(
+        &self,
+        topo: &Topology,
+        bridge: u32,
+        dev: u32,
+        port: u32,
+        want: &Set<Mac>,
+        wire: &Set<Mac>,
+        vf_macs: &[(u32, Mac)],
+        owned_before: &Set<Mac>,
+    ) -> Set<Mac> {
+        let mut kept = crate::hash::set();
+        let Some(name) = topo.name_of(dev) else {
+            return kept;
+        };
+        let Some(ports) = self.carried_ports.get(name) else {
+            return kept;
+        };
+        if ports.is_empty() {
+            return kept;
+        }
+        // The one canonical exclusion set, asked again rather than re-spelt.
+        let skip = self.exclusions(topo, dev, port, vf_macs);
+        // Everything under the uplink port is the wire's side of the fence,
+        // the port itself included: a learn-port later re-enslaved beneath
+        // the uplink (two NICs folded into a bond uplink) now leads out,
+        // and keeping its addresses would steer wire traffic into the
+        // bridge.
+        let wireward = topo.subtree_of(&[port]);
+        for m in owned_before {
+            if want.contains(m) || wire.contains(m) || skip.contains(m) {
+                continue;
+            }
+            if !is_registerable(m) {
+                continue;
+            }
+            let Some(&(p, _)) = ports.get(m) else {
+                continue;
+            };
+            if wireward.contains(&p) {
+                continue;
+            }
+            if topo.at(p).is_none() {
+                continue;
+            }
+            // Still a port of this bridge, or of a vnet stacked above it:
+            // the inverse walk of the same edges desired() takes downward
+            // through `uplink_ward` and `relevant`.
+            let reachable = match topo.bridge_above(p) {
+                Some((br, _)) => topo.leads_to(br, bridge),
+                None => false,
+            };
+            if !reachable {
+                continue;
+            }
+            kept.insert(*m);
+        }
+        kept
+    }
+
+    /// The addresses that belong in `pair`'s filter list, and the ones that
+    /// must stay out of it.
     fn desired(
         &self,
         topo: &Topology,
@@ -688,9 +821,14 @@ impl Syncer {
         port: u32,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
-    ) -> (Set<Mac>, Vec<String>, Set<Mac>) {
+    ) -> (Set<Mac>, Vec<String>, Set<Mac>, Map<Mac, u32>) {
         let Some(bridge_link) = topo.at(bridge) else {
-            return (crate::hash::set(), Vec::new(), crate::hash::set());
+            return (
+                crate::hash::set(),
+                Vec::new(),
+                crate::hash::set(),
+                crate::hash::map(),
+            );
         };
 
         // Which interfaces sit on top of the uplink bridge. One walk up from
@@ -718,6 +856,12 @@ impl Syncer {
         let mut wire: Set<Mac> = crate::hash::set();
         let mut want: Set<Mac> = crate::hash::set();
 
+        // Where each learnt address was seen, alongside what is wanted. The
+        // structural entries below - the bridge's own address, the uplink-ward
+        // interfaces, the pinned extras - record no port on purpose: they do
+        // not age out of `want` while the topology knows them, so there is
+        // nothing for the quiet-keep to remember.
+        let mut learnt_at: Map<Mac, u32> = crate::hash::map();
         for e in fdb {
             if !e.is_learned() || !e.is_unicast() {
                 continue;
@@ -731,9 +875,11 @@ impl Syncer {
                     wire.insert(e.mac);
                 } else {
                     want.insert(e.mac);
+                    learnt_at.insert(e.mac, e.ifindex);
                 }
             } else if relevant.contains_key(&master) && !uplink_ward.contains(&e.ifindex) {
                 want.insert(e.mac);
+                learnt_at.insert(e.mac, e.ifindex);
             }
         }
 
@@ -767,7 +913,7 @@ impl Syncer {
 
         let mut stacked: Vec<String> = relevant.into_values().collect();
         stacked.sort();
-        (want, stacked, wire)
+        (want, stacked, wire, learnt_at)
     }
 
     /// Bring the filter in line with the bridge.
@@ -920,8 +1066,32 @@ impl Syncer {
                 continue;
             };
             let port_name = topo.name_of(port).unwrap_or(&pair.dev).to_string();
-            let (mut want, mut stacked, mut wire) =
+            let (mut want, mut stacked, mut wire, mut learnt_at) =
                 self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
+
+            // Loaded before the grow-refresh decides, because the quiet
+            // survivors have to be in `want` by then: a kept address missing
+            // from the filter is a growth, and growing on a carried VF
+            // answer is exactly the bug class the refresh exists for.
+            let owned_before = self.load_owned(&pair.dev);
+            // The readability that matters for the memory prune below is the
+            // one at THIS read: a note that turns readable again mid-pass
+            // (a parallel writer healed it) makes `note_is_readable` true
+            // while `owned` still descends from the could-not-tell empty
+            // set - and pruning against that would erase the very memory
+            // the gate exists to protect.
+            let owned_was_readable = self.note_is_readable(&pair.dev);
+            let mut kept = self.quiet_survivors(
+                topo,
+                bridge_index,
+                dev_index,
+                port,
+                &want,
+                &wire,
+                &vf_macs,
+                &owned_before,
+            );
+            want.extend(kept.iter().copied());
 
             let present: Set<Mac> = fdb
                 .iter()
@@ -937,7 +1107,21 @@ impl Syncer {
             // can have changed without any link message in the meantime. One
             // fresh question per growth-bearing pass, exactly the fast
             // path's price.
-            if vf_carried && want.iter().any(|m| !present.contains(m)) {
+            //
+            // An address ENTERING the kept state buys the question too, even
+            // when the card already holds it: the keep re-asserts an address
+            // the bridge no longer vouches for, and a guest may meanwhile
+            // have claimed it as its VF's own over the driver mailbox - the
+            // path that emits no link message. A clock already running means
+            // the question was asked when the keep began; between entries
+            // the timed refresh bounds the window.
+            let newly_quiet = kept.iter().any(|m| {
+                self.carried_ports
+                    .get(&pair.dev)
+                    .and_then(|ps| ps.get(m))
+                    .is_some_and(|&(_, missing)| missing.is_none())
+            });
+            if vf_carried && (newly_quiet || want.iter().any(|m| !present.contains(m))) {
                 // If the question fails, the next pass must not trust the
                 // carried answer either; remember_vf clears this on success.
                 self.vf_stale = true;
@@ -949,10 +1133,25 @@ impl Syncer {
                 vf_carried = false;
                 timings.vf_carried = false;
                 timings.vf_addresses = vf_macs.len();
-                let (w, st, wi) = self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
+                let (w, st, wi, la) =
+                    self.desired(topo, bridge_index, dev_index, port, &fdb, &vf_macs);
                 want = w;
                 stacked = st;
                 wire = wi;
+                learnt_at = la;
+                // The survivors again, against the fresh answer: an address
+                // the driver now calls a VF's own must not be kept.
+                kept = self.quiet_survivors(
+                    topo,
+                    bridge_index,
+                    dev_index,
+                    port,
+                    &want,
+                    &wire,
+                    &vf_macs,
+                    &owned_before,
+                );
+                want.extend(kept.iter().copied());
             }
             self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
 
@@ -978,7 +1177,62 @@ impl Syncer {
 
             self.carried_wire.insert(pair.dev.clone(), wire);
 
-            let owned_before = self.load_owned(&pair.dev);
+            // Kept addresses cost filter slots, and past its capacity the
+            // card drops entries silently - so they are the first
+            // surrendered as the list nears the limit, longest-missing
+            // first: every fresh learn makes an entry young again, so what
+            // goes is what has not been heard from for the longest. A
+            // surrendered keep is exactly the old behaviour, never worse.
+            if !kept.is_empty() && want.len() * 10 >= self.max_macs * 9 {
+                let ports = self.carried_ports.get(&pair.dev);
+                let now = Instant::now();
+                let mut order: Vec<(Duration, Mac)> = kept
+                    .iter()
+                    .map(|m| {
+                        // No clock yet means missed this very pass - the
+                        // youngest there is, surrendered last.
+                        let missing = ports
+                            .and_then(|ps| ps.get(m))
+                            .and_then(|&(_, t)| t)
+                            .map_or(Duration::ZERO, |t| now.duration_since(t));
+                        (missing, *m)
+                    })
+                    .collect();
+                order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                let mut shed = 0usize;
+                for (_, m) in order {
+                    if want.len() * 10 < self.max_macs * 9 {
+                        break;
+                    }
+                    want.remove(&m);
+                    kept.remove(&m);
+                    shed += 1;
+                }
+                if shed > 0 {
+                    note!(
+                        "{}: filter nearing its {} limit, released {shed} quiet \
+                         address(es) [pressure]",
+                        pair.dev,
+                        self.max_macs
+                    );
+                }
+            }
+
+            // Said once per entry into the quiet state, not once per pass
+            // forever - ageing comes in bursts, and seventeen thousand
+            // identical journal lines a day teach an operator to stop
+            // reading.
+            let said = self.noted_quiet.entry(pair.dev.clone()).or_default();
+            let fresh_quiet = kept.iter().filter(|m| !said.contains(*m)).count();
+            if fresh_quiet > 0 {
+                note!(
+                    "{}: {fresh_quiet} address(es) aged out of the bridge but \
+                     their ports live on; kept [quiet]",
+                    pair.dev
+                );
+            }
+            *said = kept.clone();
+
             let mut owned = owned_before.clone();
             let mut added = 0usize;
             let mut removed = 0usize;
@@ -1115,6 +1369,16 @@ impl Syncer {
                             owned.remove(&mac);
                         }
                         Err(e) => {
+                            // The note stays for the retry - the memory must
+                            // not: an address pending removal whose port
+                            // memory survives would be re-adopted by the
+                            // quiet keep once its wire evidence fades, and a
+                            // one-off EBUSY would harden into a permanent
+                            // keep. Losing memory is always the old
+                            // behaviour, never worse.
+                            if let Some(ports) = self.carried_ports.get_mut(&pair.dev) {
+                                ports.remove(&mac);
+                            }
                             eprintln!(
                                 "warning: {}: cannot unregister {}: {e}",
                                 pair.dev,
@@ -1144,6 +1408,31 @@ impl Syncer {
                 self.save_owned_merged(&pair.dev, &owned_before, &owned);
             }
 
+            // The memory follows the pass, under the same readability rule
+            // the notes live by: while the note cannot be read, `owned` is
+            // the empty could-not-tell set, and pruning against it would
+            // erase the whole memory of this uplink - the quiet guests with
+            // it. Judged by the readability of the read `owned` came from,
+            // not by now. Merge what this dump saw, keep only what is still
+            // owned.
+            if owned_was_readable {
+                let ports = self.carried_ports.entry(pair.dev.clone()).or_default();
+                let seen: Set<Mac> = learnt_at.keys().copied().collect();
+                for (m, p) in learnt_at {
+                    ports.insert(m, (p, None));
+                }
+                ports.retain(|m, _| owned.contains(m));
+                // What the dump no longer shows starts its missing-clock;
+                // a clock already running keeps its start - the age the
+                // pressure valve evicts by measures from the first miss.
+                let now = Instant::now();
+                for (m, slot) in ports.iter_mut() {
+                    if slot.1.is_none() && !seen.contains(m) {
+                        slot.1 = Some(now);
+                    }
+                }
+            }
+
             // Unsorted on purpose: outside --status only its length is read,
             // and the status page sorts for display itself.
             let wanted: Vec<Mac> = want.into_iter().collect();
@@ -1159,6 +1448,7 @@ impl Syncer {
                 added,
                 removed,
                 foreign,
+                quiet: kept.len(),
             });
         }
         timings.pairs = mark.elapsed();
@@ -1326,9 +1616,17 @@ impl Syncer {
                 if !owned.contains(mac) {
                     continue;
                 }
+                // The port memory goes with the entry - mandatory, not
+                // tidiness: should the note write below fail, the address
+                // stays on the note, and a later pass whose dump no longer
+                // shows the wire entry would otherwise keep alive the very
+                // address this reflection just took out.
                 match sock.set_self_fdb(fp.index, mac, false) {
                     Ok(()) => {
                         owned.remove(mac);
+                        if let Some(ports) = self.carried_ports.get_mut(&fp.dev) {
+                            ports.remove(mac);
+                        }
                         changed = true;
                         urgency = Urgency::Now;
                         taken_back.push(*mac);
@@ -1341,14 +1639,25 @@ impl Syncer {
                     // Already gone. The point was for it not to be there.
                     Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                         owned.remove(mac);
+                        if let Some(ports) = self.carried_ports.get_mut(&fp.dev) {
+                            ports.remove(mac);
+                        }
                         changed = true;
                     }
                     // Keep the note: an entry still in the card that nothing
-                    // owns is the orphan the notes exist to prevent. And buy
-                    // a pass: the guest's traffic is being misdirected right
-                    // now, and a batch made only of this failure would
-                    // otherwise end quiet and retry nothing.
+                    // owns is the orphan the notes exist to prevent. Evict
+                    // the memory anyway - the eviction is what the Ok arm
+                    // calls mandatory, and here it re-arms the stale-removal
+                    // retry: with the memory alive, the quiet keep would
+                    // re-adopt this address as soon as its wire entry ages,
+                    // and a one-off failure would harden into a permanent
+                    // keep. And buy a pass: the guest's traffic is being
+                    // misdirected right now, and a batch made only of this
+                    // failure would otherwise end quiet and retry nothing.
                     Err(e) => {
+                        if let Some(ports) = self.carried_ports.get_mut(&fp.dev) {
+                            ports.remove(mac);
+                        }
                         urgency = Urgency::Now;
                         eprintln!(
                             "warning: {}: cannot unregister {}: {e}",
