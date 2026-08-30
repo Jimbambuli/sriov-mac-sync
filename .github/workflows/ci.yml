@@ -24,11 +24,11 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Lints
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
       - name: Release build
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: The binary answers at all
         run: |
           ./target/release/sriov-mac-sync --version
@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install 1.74 --profile minimal
-      - run: cargo +1.74 test
+      - run: cargo +1.74 test --locked
 
   integration:
     # The tests above drive the code against a fake socket. This drives the
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Release build
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Against a real kernel
         run: sudo bench/integration.sh target/release/sriov-mac-sync
 
@@ -77,9 +77,11 @@ jobs:
           # The GitHub mirror, not gitlab.alpinelinux.org: the runner reaches
           # the former reliably and the latter sometimes not at all (exit 128,
           # twice). Retried anyway, because one clone is one thing that can go
-          # wrong in every run.
+          # wrong in every run. Pinned to a release tag: a master that renames
+          # a meson option or changes the mkpkg CLI must not decide whether
+          # this repository's CI is green.
           for i in 1 2 3; do
-            git clone -q --depth 1 https://github.com/alpinelinux/apk-tools.git /tmp/apk-tools && break
+            git clone -q --depth 1 --branch v3.0.7 https://github.com/alpinelinux/apk-tools.git /tmp/apk-tools && break
             echo "clone attempt $i failed"; rm -rf /tmp/apk-tools; sleep 5
           done
           test -d /tmp/apk-tools/src
@@ -124,9 +126,17 @@ jobs:
           test "$(systemctl is-enabled sriov-mac-sync)" = enabled
           systemctl is-active sriov-mac-sync || echo "(not running here, fine)"
           sudo dpkg --purge sriov-mac-sync
-          ! test -e /usr/sbin/sriov-mac-sync
-          ! test -e /etc/sriov-mac-sync.conf
-          ! systemctl is-enabled sriov-mac-sync 2>/dev/null
+          # Not `! test -e`: errexit exempts !-pipelines, and a leftover
+          # would have sailed through green.
+          if test -e /usr/sbin/sriov-mac-sync; then
+            echo "purge left the binary behind"; exit 1
+          fi
+          if test -e /etc/sriov-mac-sync.conf; then
+            echo "purge left the conffile behind"; exit 1
+          fi
+          if systemctl is-enabled sriov-mac-sync 2>/dev/null; then
+            echo "purge left the unit enabled"; exit 1
+          fi
       - name: The .ipk is one opkg would take
         run: |
           for f in dist/out/*.ipk; do

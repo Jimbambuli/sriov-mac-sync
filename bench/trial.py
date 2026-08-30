@@ -34,6 +34,7 @@ Honesty notes, so the numbers are read for what they are:
 """
 
 import argparse
+import errno
 import glob
 import atexit
 import json
@@ -62,6 +63,8 @@ NTF_SELF = 0x02
 NDA_LLADDR = 2
 SO_RCVBUFFORCE = 33
 
+DEFAULT_BINARY = "/usr/sbin/sriov-mac-sync"  # where the packages install it
+
 FILTER_CAPACITY = 128  # ConnectX-4 Lx vport list; the README's measured limit
 TEST_MACS_TOTAL = 8 + 8 + 16 + 2  # S1 + S2 + S3, and one each for S5 and S6
 CAPACITY_MARGIN = 16
@@ -74,6 +77,23 @@ def run(cmd, **kw):
 def fail(msg):
     print(f"REFUSED: {msg}", file=sys.stderr)
     sys.exit(2)
+
+
+def filter_capacity(dev):
+    """The card's own number where devlink offers it, the CX-4 constant
+    where it does not - the same order of trust the daemon applies. A VF
+    uplink usually cannot answer; the constant then errs on the careful
+    side."""
+    try:
+        pci = os.path.basename(os.readlink(f"/sys/class/net/{dev}/device"))
+        out = run(["devlink", "dev", "param", "show", f"pci/{pci}",
+                   "name", "max_macs", "-j"]).stdout
+        vals = re.findall(r'"value":\s*(\d+)', out)
+        if vals:
+            return int(vals[0])
+    except (OSError, ValueError):
+        pass
+    return FILTER_CAPACITY
 
 
 def read(path):
@@ -234,6 +254,16 @@ class Monitor:
                 data = self.sock.recv(1 << 16)
             except BlockingIOError:
                 continue
+            except OSError as e:
+                if e.errno == errno.ENOBUFS:
+                    # The kernel dropped notifications while nobody pumped
+                    # (S4 runs for tens of seconds). The monitor is a
+                    # measurement aid, not the verdict - note it and keep
+                    # listening rather than dying without an evaluation.
+                    print("(note: the event monitor lost notifications "
+                          "under load; timing gaps are possible)")
+                    continue
+                raise
             t = time.monotonic_ns()
             off = 0
             while off + 16 <= len(data):
@@ -441,10 +471,16 @@ def preflight(args, binary):
 
     if not os.path.isfile(binary):
         fail(f"{binary} does not exist - say --binary /path/to/sriov-mac-sync")
+    stray = "/usr/local/sbin/sriov-mac-sync"
+    if (binary == DEFAULT_BINARY and os.path.isfile(stray)
+            and os.path.realpath(stray) != os.path.realpath(binary)):
+        fail(f"{stray} exists beside the packaged binary - an old hand-copied "
+             f"build would poison the measurement; name the one you mean with "
+             f"--binary")
     m = re.search(r"path=(\S+)", execstart)
     if m and os.path.realpath(m.group(1)) != os.path.realpath(binary):
-        print(f"(note: the service runs {m.group(1)}; --status, S4 and --check "
-              f"below use {binary})")
+        print(f"(note: the service runs {m.group(1)}; --status and the "
+              f"S4 passes use {binary})")
 
     pairs = watched_pairs(binary)
     uplinks = [dev for (dev, br) in pairs if br == args.bridge]
@@ -494,9 +530,10 @@ def preflight(args, binary):
         # multicast self entries do not live in the UC vport list the
         # 128-entry limit is about
         occupied = sum(1 for m in self_macs(up) if int(m[:2], 16) & 1 == 0)
-        if occupied + TEST_MACS_TOTAL + CAPACITY_MARGIN > FILTER_CAPACITY:
+        capacity = filter_capacity(up)
+        if occupied + TEST_MACS_TOTAL + CAPACITY_MARGIN > capacity:
             fail(f"{up} holds {occupied} entries; adding {TEST_MACS_TOTAL} would "
-                 f"come within {CAPACITY_MARGIN} of the {FILTER_CAPACITY}-entry "
+                 f"come within {CAPACITY_MARGIN} of the {capacity}-entry "
                  f"filter, which drops addresses silently past its limit")
     return uplinks
 
@@ -905,7 +942,10 @@ def main():
     ap.add_argument("--vlan", type=int)
     ap.add_argument("--rounds", type=int, default=100,
                     help="cold --once passes for the statistics section")
-    ap.add_argument("--binary", default="/usr/local/sbin/sriov-mac-sync")
+    ap.add_argument("--binary", default=DEFAULT_BINARY,
+                    help="the binary to measure (default: the packaged path; "
+                         "a stray copy in /usr/local/sbin is refused unless "
+                         "named explicitly)")
     ap.add_argument("--governor", default="performance",
                     help="CPU governor to pin for the run, restored at the end; "
                          "'leave' measures the machine as it is (default: "

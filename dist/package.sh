@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build the release artefacts: a static binary, a .deb and an OpenWrt .ipk,
-# for x86_64 and aarch64. Everything lands in dist/out/.
+# Build the release artefacts: a static binary, a .deb, an OpenWrt .ipk and
+# (with APK= set) an Alpine .apk, for x86_64 and aarch64. Everything lands in
+# dist/out/.
 #
 #   ./dist/package.sh [version]
 #
@@ -16,8 +17,35 @@ umask 022
 
 cd "$(dirname "$0")/.."
 
-VERSION=${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}
+# A failed run must not leave half a dist/out that an operator uploads, nor
+# scatter mktemp roots. SHA256SUMS is written last, so its absence marks an
+# incomplete set - remove the set with it.
+TMPROOTS=""
 OUT=dist/out
+on_exit() {
+	st=$?
+	# Word splitting is the point: TMPROOTS is a space-joined list.
+	# shellcheck disable=SC2086
+	rm -rf $TMPROOTS
+	if [ "$st" -ne 0 ] && [ ! -f "$OUT/SHA256SUMS" ]; then
+		rm -rf "$OUT"
+	fi
+	exit "$st"
+}
+trap on_exit EXIT
+
+CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+VERSION=${1:-$CARGO_VERSION}
+# A caller-supplied version that disagrees with Cargo.toml would stamp the
+# control files with a number the binary's --version contradicts.
+if [ "$VERSION" != "$CARGO_VERSION" ]; then
+	echo "error: version argument $VERSION does not match Cargo.toml's $CARGO_VERSION" >&2
+	echo "       bump Cargo.toml first; the packages and the binary must agree" >&2
+	exit 2
+fi
+# Reproducibility: dpkg-deb clamps its mtimes to this natively; the ipk tar
+# invocations pin it explicitly below.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
 MAINT="Jimbambuli <30672094+Jimbambuli@users.noreply.github.com>"
 DESC="Make hosts behind a Linux bridge reachable from an SR-IOV virtual function"
 LONG=" A NIC in SR-IOV mode forwards between its functions with a table it is
@@ -48,6 +76,7 @@ unit_for_package() {
 deb() {     # arch-suffix debian-arch
 	echo "== .deb for $2"
 	root=$(mktemp -d)
+	TMPROOTS="$TMPROOTS $root"
 	chmod 755 "$root"   # mktemp makes it 0700, and in a .deb that is the mode of /
 	mkdir -p "$root/DEBIAN" "$root/usr/sbin" "$root/usr/lib/systemd/system" \
 		"$root/etc" "$root/usr/share/doc/sriov-mac-sync"
@@ -153,6 +182,7 @@ EOF
 ipk() {     # arch-suffix opkg-arch
 	echo "== .ipk for $2"
 	root=$(mktemp -d)
+	TMPROOTS="$TMPROOTS $root"
 	chmod 755 "$root"
 	mkdir -p "$root/data/usr/sbin" "$root/data/etc/init.d" "$root/data/etc" "$root/control"
 
@@ -190,6 +220,10 @@ EOF
 	cat > "$root/control/prerm" <<'EOF'
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+# On an upgrade opkg runs the OLD package's prerm too - and flushing there
+# would blackhole every guest for the takeover window, exactly the outage
+# the init script's comment forbids. opkg exports PKG_UPGRADE=1 for it.
+[ "${PKG_UPGRADE:-0}" = 1 ] && exit 0
 /etc/init.d/sriov-mac-sync stop 2>/dev/null
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
@@ -197,8 +231,12 @@ exit 0
 EOF
 	chmod 755 "$root/control/prerm"
 
-	( cd "$root/data" && tar --owner=root --group=root -czf ../data.tar.gz ./* )
-	( cd "$root/control" && tar --owner=root --group=root -czf ../control.tar.gz ./* )
+	# Pinned mtimes, sorted names, no gzip timestamp: two builds of the same
+	# source agree byte for byte, so SHA256SUMS can be confirmed by rebuilding.
+	( cd "$root/data" && tar --owner=root --group=root --sort=name \
+		--mtime="@$SOURCE_DATE_EPOCH" -cf - ./* | gzip -9n > ../data.tar.gz )
+	( cd "$root/control" && tar --owner=root --group=root --sort=name \
+		--mtime="@$SOURCE_DATE_EPOCH" -cf - ./* | gzip -9n > ../control.tar.gz )
 	echo "2.0" > "$root/debian-binary"
 	# opkg reads the members in order, so debian-binary has to come first.
 	( cd "$root" && ar rc "sriov-mac-sync_$2.ipk" \
@@ -214,6 +252,7 @@ apk() {    # arch-suffix apk-arch
 	fi
 	echo "== .apk for $2"
 	root=$(mktemp -d)
+	TMPROOTS="$TMPROOTS $root"
 	chmod 755 "$root"
 	mkdir -p "$root/usr/sbin" "$root/etc/init.d"
 
@@ -238,6 +277,14 @@ EOF
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 exit 0
 EOF
+	# apk runs the upgrade scripts on upgrade, not install/deinstall: without
+	# this, an upgrade would replace the binary and leave the old daemon
+	# running until reboot - the .deb postinst restart, spelled apk.
+	cat > "$root.post-upgrade" <<'EOF'
+#!/bin/sh
+/etc/init.d/sriov-mac-sync restart 2>/dev/null
+exit 0
+EOF
 
 	# apk records the ownership it finds on disk, and a package whose files
 	# belong to whoever happened to build it installs them as nobody:nogroup.
@@ -254,23 +301,16 @@ EOF
 			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
 			--script post-install:'$root.post-install' \
 			--script pre-deinstall:'$root.pre-deinstall' \
+			--script post-upgrade:'$root.post-upgrade' \
 			--files '$root' \
 			--output '$OUT/sriov-mac-sync_$2.apk'"
 	else
-		echo "   WARNING: no fakeroot, files will not be owned by root"
-		"$APK" mkpkg \
-			--info name:sriov-mac-sync \
-			--info version:"$VERSION-r0" \
-			--info description:"$DESC" \
-			--info arch:"$2" \
-			--info license:MIT \
-			--info url:https://github.com/Jimbambuli/sriov-mac-sync \
-			--script post-install:"$root.post-install" \
-			--script pre-deinstall:"$root.pre-deinstall" \
-			--files "$root" \
-			--output "$OUT/sriov-mac-sync_$2.apk"
+		echo "== .apk for $2 SKIPPED (no fakeroot - the files would install \
+owned by the build user, and a release checksum must not cover a wrong build)"
+		rm -rf "$root" "$root.post-install" "$root.pre-deinstall" "$root.post-upgrade"
+		return 0
 	fi
-	rm -rf "$root" "$root.post-install" "$root.pre-deinstall"
+	rm -rf "$root" "$root.post-install" "$root.pre-deinstall" "$root.post-upgrade"
 }
 
 build x86_64-unknown-linux-musl  x86_64

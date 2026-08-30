@@ -21,6 +21,7 @@ mod sync;
 mod sysfs;
 
 use crate::hash::Set;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,9 +110,21 @@ impl Default for Options {
 /// Set by the signal handler, read by the daemon loop.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// The write end of the stop pipe, or -1 before `catch_signals` made one.
+/// The flag alone leaves a race: a signal that lands between the loop's
+/// `stopping()` check and its poll has already been consumed, and the poll
+/// then sleeps toward the full interval - systemd's stop timeout turns
+/// that into a SIGKILL. The byte in the pipe is what wakes the poll.
+static STOP_PIPE_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 extern "C" fn note_signal(_sig: libc::c_int) {
-    // The only thing a signal handler may safely do here.
+    // A store and a write(2) - the whole async-signal-safe vocabulary
+    // this handler needs.
     STOPPING.store(true, Ordering::Relaxed);
+    let fd = STOP_PIPE_W.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
 }
 
 fn stopping() -> bool {
@@ -132,7 +145,18 @@ fn stopping() -> bool {
 /// `sigaction` without SA_RESTART, so the poll the daemon spends its life in
 /// returns instead of being restarted under us - with SA_RESTART a stop would
 /// wait out the full reconciliation interval.
-fn catch_signals() {
+fn catch_signals() -> Option<std::os::fd::OwnedFd> {
+    // The pipe before the handlers, so no caught signal can find fd -1.
+    let stop_rx = unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) == 0 {
+            STOP_PIPE_W.store(fds[1], Ordering::Relaxed);
+            Some(std::os::fd::OwnedFd::from_raw_fd(fds[0]))
+        } else {
+            // The flag still works; only the mid-pass wake-up is lost.
+            None
+        }
+    };
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     // `sa_sigaction` is the only name libc has for this field on any Linux
     // target - the C struct puts the one-argument handler and the
@@ -154,6 +178,7 @@ fn catch_signals() {
             }
         }
     }
+    stop_rx
 }
 
 fn usage() {
@@ -181,7 +206,8 @@ usage: sriov-mac-sync [options]
                   found, and name anything that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  full reconciliation interval (default 300)
-  --max NUM       warn above this many addresses per uplink (default 128)
+  --max NUM       the filter capacity to respect: warn above it, and shed
+                  quiet keeps as the list nears it (default 128)
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
   -v, --verbose   explain what is skipped and why
@@ -614,17 +640,26 @@ fn report_changes(
     max_macs: usize,
     verbose: bool,
     trigger: &str,
+    warned_over: &mut std::collections::BTreeSet<String>,
 ) {
     for r in reports {
+        // Said once per stay above the limit, re-armed when it clears: an
+        // overloaded bridge buys passes at the event rate, and the same
+        // warning five times a second is how an operator learns to stop
+        // reading exactly the journal that matters.
         if r.wanted.len() > max_macs {
-            eprintln!(
-                "warning: {}: {} addresses behind {}, above the {} the vport list \
-                 is assumed to hold - some will be dropped silently",
-                r.dev,
-                r.wanted.len(),
-                r.bridge,
-                max_macs
-            );
+            if warned_over.insert(r.dev.clone()) {
+                eprintln!(
+                    "warning: {}: {} addresses behind {}, above the {} the vport list \
+                     is assumed to hold - some will be dropped silently",
+                    r.dev,
+                    r.wanted.len(),
+                    r.bridge,
+                    max_macs
+                );
+            }
+        } else {
+            warned_over.remove(&r.dev);
         }
         if verbose && r.foreign > 0 {
             note!(
@@ -634,7 +669,17 @@ fn report_changes(
             );
         }
         if r.added > 0 || r.removed > 0 {
-            if dry_run {
+            if dry_run && r.quiet > 0 {
+                note!(
+                    "{}: would be +{} -{}, {} address(es) in total, {} held \
+                     quiet [{trigger}]",
+                    r.dev,
+                    r.added,
+                    r.removed,
+                    r.wanted.len(),
+                    r.quiet
+                );
+            } else if dry_run {
                 note!(
                     "{}: would be +{} -{}, {} address(es) in total [{trigger}]",
                     r.dev,
@@ -697,6 +742,9 @@ trait World: sync::FdbWriter {
     /// is noticed at the loop's top rather than after the full interval.
     fn wait(&mut self, millis: i32) -> std::io::Result<bool>;
     fn recv_events(&mut self) -> std::io::Result<netlink::Events>;
+    /// Sit out a moment without listening - the brake for error paths
+    /// where even waiting itself is what fails.
+    fn pause(&mut self, wait: Duration);
     fn read_topology(&mut self) -> Result<Topology, String>;
     /// What the cards report their unicast filters hold - one devlink
     /// reading for the whole list, answered per uplink.
@@ -708,6 +756,9 @@ trait World: sync::FdbWriter {
 struct Live {
     sock: Socket,
     mon: Socket,
+    /// The stop pipe's read end; a byte here is a signal that landed
+    /// outside the poll and must still cut the wait short.
+    stop_rx: Option<std::os::fd::OwnedFd>,
 }
 
 impl sync::FdbWriter for Live {
@@ -733,10 +784,44 @@ impl World for Live {
         stopping()
     }
     fn wait(&mut self, millis: i32) -> std::io::Result<bool> {
-        self.mon.wait(millis)
+        let Some(stop_rx) = &self.stop_rx else {
+            return self.mon.wait(millis);
+        };
+        let mut pfds = [
+            libc::pollfd {
+                fd: self.mon.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop_rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, millis.max(0)) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+        if pfds[1].revents != 0 {
+            // Drain, so the next wait sleeps again; the loop's top reads
+            // the flag. "Nothing arrived" is the honest answer - a stop
+            // byte is not an event.
+            let mut sink = [0u8; 16];
+            while unsafe { libc::read(pfds[1].fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+            return Ok(false);
+        }
+        Ok(rc > 0 && pfds[0].revents != 0)
     }
     fn recv_events(&mut self) -> std::io::Result<netlink::Events> {
         self.mon.recv_events()
+    }
+    fn pause(&mut self, wait: Duration) {
+        std::thread::sleep(wait);
     }
     fn read_topology(&mut self) -> Result<Topology, String> {
         read_topology(&mut self.sock)
@@ -897,19 +982,26 @@ impl Picture {
     /// was held and the caller schedules the retry. The cost reported is the
     /// fresh read's, superseding anything an event carried.
     fn for_pass<W: World>(&mut self, world: &mut W) -> Duration {
-        self.replaced_since_pass = false;
         let carried = std::mem::take(&mut self.carried_load);
-        if !self.needs_reading() {
-            return carried;
-        }
-        match self.read(world) {
-            Ok((cost, _)) => cost,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                self.held = None;
-                carried
+        let cost = if !self.needs_reading() {
+            carried
+        } else {
+            match self.read(world) {
+                Ok((cost, _)) => cost,
+                Err(e) => {
+                    eprintln!("warning: {e}");
+                    self.held = None;
+                    carried
+                }
             }
-        }
+        };
+        // Cleared after the read, not before: read() marks the picture
+        // replaced, and a pass that read for itself has consumed that
+        // replacement in the same breath. Cleared first, the flag came
+        // back up and bought every fresh-read pass a redundant
+        // autodetect on its next event.
+        self.replaced_since_pass = false;
+        cost
     }
 
     /// Before the fast path, which **keeps what it had**: answering a batch
@@ -947,12 +1039,18 @@ fn distrust_carried(picture: &mut Picture, syncer: &mut Syncer) {
 /// the world arrives as a parameter - the tests hand in a scripted one and
 /// this function cannot tell.
 fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
-    let mut said_empty = false;
     let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
     let mut picture = Picture::new();
     // The threshold may move when a pair adopted at runtime reports its
     // card's capacity; the operator's --max never moves.
     let mut max_macs = opts.max_macs;
+    let mut wait_failures = 0u32;
+    let mut state = LoopState {
+        said_empty: false,
+        warned_over: std::collections::BTreeSet::new(),
+        // In autodetect mode the adoption rides on pair-set changes instead.
+        capacity_pending: !opts.pairs.is_empty() && !opts.max_macs_set,
+    };
 
     loop {
         if world.stopping() {
@@ -969,7 +1067,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                 opts,
                 &mut max_macs,
                 schedule.trigger,
-                &mut said_empty,
+                &mut state,
             ) {
                 Pass::Done => schedule.completed(world.now()),
                 Pass::Refused => {
@@ -987,9 +1085,21 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
         // at the top.
         let millis = due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
         let woken = match world.wait(millis) {
-            Ok(w) => w,
+            Ok(w) => {
+                wait_failures = 0;
+                w
+            }
             Err(e) => {
                 eprintln!("warning: waiting for events failed: {e}");
+                // The first failure buys a prompt recovery pass. A wait
+                // that KEEPS failing (sustained ENOMEM) must not turn the
+                // daemon into a hot loop of full-table dumps, each paying
+                // a dump to learn nothing - so from the second failure on,
+                // the retry pace applies before the pass.
+                if wait_failures > 0 {
+                    world.pause(RETRY_AFTER);
+                }
+                wait_failures = wait_failures.saturating_add(1);
                 schedule.at_once(world.now(), "recovery");
                 distrust_carried(&mut picture, syncer);
                 continue;
@@ -1036,6 +1146,16 @@ enum Pass {
 
 /// One full pass: read the picture if it can no longer be believed, work out
 /// which pairs there are, and reconcile every one of them against the kernel.
+/// The daemon loop's accumulated say-once and adoption state, threaded
+/// through the passes as one thing because it lives exactly as long as the
+/// loop does.
+struct LoopState {
+    said_empty: bool,
+    warned_over: std::collections::BTreeSet<String>,
+    /// Whether a configured pair's card still owes its capacity answer.
+    capacity_pending: bool,
+}
+
 fn run_pass<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
@@ -1043,7 +1163,7 @@ fn run_pass<W: World>(
     opts: &Options,
     max_macs: &mut usize,
     trigger: &'static str,
-    said_empty: &mut bool,
+    state: &mut LoopState,
 ) -> Pass {
     // One reading serves both the autodetection and the reconciliation: they
     // ask about the same moment, and reading it twice was work nobody asked
@@ -1071,7 +1191,7 @@ fn run_pass<W: World>(
         if pair_names(&found) != pair_names(&syncer.pairs) {
             if !found.is_empty() {
                 note!("now watching {}", pair_names(&found).join(" "));
-                *said_empty = false;
+                state.said_empty = false;
             }
             syncer.pairs = found;
             // A pair adopted at runtime brings its card's capacity with it:
@@ -1092,9 +1212,29 @@ fn run_pass<W: World>(
             }
         }
     }
-    if syncer.pairs.is_empty() && !*said_empty {
+    // The same cure for pairs the operator wrote down: a daemon started
+    // before its configured uplink exists gets no devlink answer at start,
+    // and pairs that never change never re-asked - the warning threshold
+    // and the quiet-keep's pressure valve then measured against the
+    // assumed number for the rest of the process. Asked again on every
+    // reloaded picture until a card answers; the operator's --max still
+    // wins, the gate is the same one.
+    if !auto && reloaded && state.capacity_pending && !opts.max_macs_set {
+        let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
+        if !devs.is_empty() {
+            let answers = world.filter_capacities(&devs);
+            if answers.iter().any(|(_, a)| matches!(a, Ok(Some(_)))) {
+                state.capacity_pending = false;
+            }
+            if let Some(v) = adopt_reported_capacity(answers, opts.verbose, *max_macs) {
+                *max_macs = v;
+                syncer.max_macs = v;
+            }
+        }
+    }
+    if syncer.pairs.is_empty() && !state.said_empty {
         note!("waiting for an SR-IOV interface to appear in a bridge");
-        *said_empty = true;
+        state.said_empty = true;
     }
 
     // Nothing to work from. Fail closed; the caller comes back soon.
@@ -1103,7 +1243,14 @@ fn run_pass<W: World>(
     };
     match syncer.reconcile(world, true, topo, topo_load) {
         Ok(reports) => {
-            report_changes(&reports, opts.dry_run, *max_macs, opts.verbose, trigger);
+            report_changes(
+                &reports,
+                opts.dry_run,
+                *max_macs,
+                opts.verbose,
+                trigger,
+                &mut state.warned_over,
+            );
             if opts.timings {
                 note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
             }
@@ -1331,8 +1478,11 @@ fn run() -> Result<bool, String> {
     // that a leftover note belongs to none of them.
     syncer.authoritative = opts.pairs.is_empty();
     syncer.max_macs = opts.max_macs;
-    syncer.exclude = macs("--exclude", &opts.exclude);
-    syncer.extra = macs("--extra", &opts.extra);
+    // The lists merge CLI values and conf-file values, so the label names
+    // both homes - a tab-mangled EXCLUDE= line must not send its operator
+    // grepping unit files for an --exclude nobody ever passed.
+    syncer.exclude = macs("--exclude/EXCLUDE", &opts.exclude);
+    syncer.extra = macs("--extra/EXTRA", &opts.extra);
 
     match opts.mode {
         Mode::Flush => syncer.flush(&mut sock).map_err(|e| e.to_string()),
@@ -1345,7 +1495,11 @@ fn run() -> Result<bool, String> {
                 if r.port != r.dev {
                     println!("  enslaved through  : {}", r.port);
                 }
-                println!("  behind the bridge : {}", r.wanted.len());
+                // "wanted", not "behind the bridge": EXTRA-pinned
+                // addresses are in this number precisely because they are
+                // NOT in the bridge's table, and the count must not
+                // disagree with `bridge fdb show` over them.
+                println!("  wanted in filter  : {}", r.wanted.len());
                 println!("  registered by us  : {}", r.owned);
                 println!("  unicast list      : {}", r.present);
                 println!(
@@ -1370,7 +1524,14 @@ fn run() -> Result<bool, String> {
             let reports = syncer
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, opts.max_macs, opts.verbose, "once");
+            report_changes(
+                &reports,
+                opts.dry_run,
+                opts.max_macs,
+                opts.verbose,
+                "once",
+                &mut std::collections::BTreeSet::new(),
+            );
             if opts.timings {
                 note!("{}", syncer.timings.report().trim_end());
             }
@@ -1389,7 +1550,7 @@ fn run() -> Result<bool, String> {
                 },
                 opts.interval
             );
-            catch_signals();
+            let stop_rx = catch_signals();
             let mon = Socket::subscribed()
                 .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
             // A device that drops out of one reading is not gone: an
@@ -1399,7 +1560,7 @@ fn run() -> Result<bool, String> {
             // `ifreload -a`, short enough that a bridge genuinely taken apart
             // is tidied up within the interval.
             syncer.orphan_grace = Duration::from_secs(60);
-            let mut world = Live { sock, mon };
+            let mut world = Live { sock, mon, stop_rx };
             daemon_loop(&mut world, &mut syncer, &opts);
 
             // Deliberately without a flush - catch_signals says why. Say how
@@ -1420,7 +1581,10 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            note!("sriov-mac-sync: {e}");
+            // The dying reason is trouble, and trouble goes to stderr - the
+            // one place `--once >/dev/null` and procd's error level both
+            // still show it.
+            eprintln!("sriov-mac-sync: {e}");
             ExitCode::FAILURE
         }
     }
@@ -1615,6 +1779,9 @@ mod tests {
                     None => Ok(Events::default()),
                 }
             }
+            fn pause(&mut self, wait: Duration) {
+                self.offset += wait;
+            }
             fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)> {
                 self.capacity_asks.push(devs.to_vec());
                 devs.iter()
@@ -1791,6 +1958,10 @@ mod tests {
                 !world.capacity_asks.is_empty(),
                 "the adopted pair was never asked for its capacity"
             );
+            assert_eq!(
+                syncer.max_macs, 64,
+                "asking is not adopting - the valve still measures the assumed number"
+            );
             // The operator's word is never moved: the same run with --max
             // set must not ask at all.
             let mut opts = Options {
@@ -1955,6 +2126,37 @@ mod tests {
             );
         }
 
+        /// A configured pair is not second class: a daemon started before
+        /// its written-down uplink exists gets no devlink answer at start,
+        /// and without a re-ask the warning threshold and the quiet-keep's
+        /// pressure valve would measure against the assumed number for the
+        /// life of the process. Autodetection had this cure first; --pair
+        /// was left out.
+        #[test]
+        fn a_configured_pair_brings_its_capacity_when_it_appears() {
+            let (mut syncer, opts) = setup("conf-capacity", 300);
+            let mut world = FakeWorld::new(5);
+            world.bare_until = Duration::from_secs(1);
+            world.capacities.insert("nic1".to_string(), 64);
+            world.script.push_back((
+                Duration::from_secs(2),
+                Ok(Events {
+                    fdb: Vec::new(),
+                    links_changed: true,
+                    changed_links: vec![2],
+                }),
+            ));
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert!(
+                !world.capacity_asks.is_empty(),
+                "the configured pair was never asked for its capacity"
+            );
+            assert_eq!(
+                syncer.max_macs, 64,
+                "the card's answer has to reach the pressure valve"
+            );
+        }
+
         /// When the filter is filling up, even an ageing burst is answered
         /// at the fast rate: entries that should be gone are taking room
         /// from entries that should be there.
@@ -2022,18 +2224,30 @@ mod tests {
         );
     }
 
+    /// Every option a help line offers. "-v, --verbose" is two spellings
+    /// of one option; taking only a line's first token let the long form
+    /// escape every doc check - and the README really had forgotten it.
+    fn help_options(text: &str) -> Vec<String> {
+        text.lines()
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .take_while(|w| w.starts_with('-'))
+                    .map(|w| w.trim_end_matches(',').to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     #[test]
     fn every_documented_option_is_accepted() {
         let text = usage_text();
         // The long options the help offers, minus the two that exit the process.
-        for opt in text
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter(|w| w.starts_with("--"))
-            .filter(|w| !matches!(*w, "--help" | "--version"))
+        for opt in help_options(&text)
+            .iter()
+            .filter(|w| !matches!(w.as_str(), "-h" | "--help" | "--version"))
         {
             let mut o = Options::default();
-            let with_value = match opt {
+            let with_value = match opt.as_str() {
                 "--pair" => Some("nic0:vmbr0"),
                 "--interval" => Some("42"),
                 "--max" => Some("7"),
@@ -2098,6 +2312,27 @@ mod tests {
                 "{value:?} split but did not parse"
             );
         }
+    }
+
+    /// The bare flags really land in their fields - a swapped assignment
+    /// here would pass every parse-ok test.
+    #[test]
+    fn the_bare_flags_reach_their_options() {
+        let mut o = Options::default();
+        parse_args_from(&mut o, args(&["--timings", "--dry-run", "-v"]).into_iter()).unwrap();
+        assert!(o.timings);
+        assert!(o.dry_run);
+        assert!(o.verbose);
+    }
+
+    /// The clamps accept their own boundaries and refuse one past them.
+    #[test]
+    fn the_clamps_hold_exactly_at_their_edges() {
+        const MONTH: u64 = 30 * 24 * 3600;
+        assert_eq!(clamp_interval(MONTH).ok(), Some(MONTH));
+        assert!(clamp_interval(MONTH + 1).is_err());
+        assert_eq!(clamp_max_macs(1 << 20).ok(), Some(1 << 20));
+        assert!(clamp_max_macs((1 << 20) + 1).is_err());
     }
 
     /// Every way a line of the configuration file can be malformed, in one
@@ -2192,9 +2427,8 @@ mod tests {
         // months later, by somebody who cannot check whether it still matches
         // the program. It matches, or this fails.
         let page = include_str!("../dist/sriov-mac-sync.8");
-        for opt in usage_text()
-            .lines()
-            .filter_map(|l| l.split_whitespace().next().map(|w| w.to_string()))
+        for opt in help_options(&usage_text())
+            .into_iter()
             .filter(|w| w.starts_with("--"))
         {
             // roff wants its hyphens escaped, so that is how they appear there.
@@ -2221,10 +2455,11 @@ mod tests {
     #[test]
     fn the_readme_names_every_option_the_help_offers() {
         let readme = include_str!("../README.md");
-        for opt in usage_text()
-            .lines()
-            .filter_map(|l| l.split_whitespace().next().map(|w| w.to_string()))
-            .filter(|w| w.starts_with("--"))
+        // --help explains itself; a README that documented it would be
+        // padding. Everything else the help offers has to be findable.
+        for opt in help_options(&usage_text())
+            .into_iter()
+            .filter(|w| w.starts_with("--") && w != "--help")
         {
             assert!(
                 readme.contains(&opt),

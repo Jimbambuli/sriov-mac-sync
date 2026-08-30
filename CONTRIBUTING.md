@@ -68,18 +68,18 @@ The order matters, and every step has a reason it is where it is.
    build is a release nobody can trust. Tests here guard the README, the manual
    page, the unit file and the example configuration against the code, so even
    a documentation-only change can fail — run `cargo test` before every push.
-2. **Put it on real hardware.** No release goes out without a full
+2. **Bump the version** in `Cargo.toml` (`YEAR.MONTH.N`), commit, push, wait
+   for CI again. The bump comes before the hardware round because any commit
+   after the round voids it.
+3. **Put it on real hardware.** No release goes out without a full
    `bench/trial.py` run on all four driver families — `mlx5`, `mlx4`, `i40e`,
-   `ixgbe` — *with the binary the release will ship*. Any later commit voids
-   those runs, the version bump included, so bump first and test the bumped
-   build.
-3. **Bump the version** in `Cargo.toml` (`YEAR.MONTH.N`), commit, push, wait
-   for CI again.
+   `ixgbe` — *with the bumped binary the release will ship*.
 4. **Build the artefacts:** `APK=/path/to/apk.static ./dist/package.sh`. Without
-   apk-tools v3 the script skips the `.apk` packages *silently*, and the
-   OpenWrt 24.10 install path the README documents then 404s at
-   `/releases/latest/download/`. Debian has no such package; a static
-   `apk.static` from Alpine's `apk-tools-static` does the job.
+   apk-tools v3 the script prints a SKIPPED line for the `.apk` packages but
+   still exits 0 — easy to miss — and the OpenWrt 24.10 install path the README
+   documents then 404s at `/releases/latest/download/`. Debian has no such
+   package; a static `apk.static` from Alpine's `apk-tools-static` does the
+   job.
 5. **Tag and publish:** `git tag -a vYEAR.MONTH.N`, push the tag,
    `gh release create ... dist/out/*`.
 6. **`cargo publish`.** The README advertises `cargo install sriov-mac-sync`,

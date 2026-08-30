@@ -13,7 +13,8 @@ That 128 was arrived at by experiment, and this file used to say the size could
 not be queried. It can, on the drivers that register the generic devlink
 parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
 function and its VFs, which is exactly the experimental figure. The daemon asks
-over devlink when it starts and warns against what the card says; `--max` or
+over devlink at startup - and again when a pair appears at runtime - and warns
+against what the card says; `--max` or
 `MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
 place. `-v` reports which of the three happened.
 
@@ -120,7 +121,7 @@ Measured on an OPNsense (FreeBSD) living on a VF in front of a Proxmox host -
 which is much of this project's audience. FreeBSD holds ARP entries for
 1200 s (`net.link.ether.inet.max_age`); the Linux bridge forgets a silent
 MAC after 300 s (`ageing_time`). A guest that stays quiet for five minutes
-ages out of the bridge, the filter entry rightly goes with it - and the
+ages out of the bridge, the filter entry used to go with it - and the
 router then keeps sending unicast for another fifteen minutes without asking
 again. The eSwitch misses, the frame leaves on the wire, and every
 connection attempt dies in a dial timeout. Observed as 259 reverse-proxy 502s

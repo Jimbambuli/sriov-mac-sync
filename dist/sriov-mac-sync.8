@@ -27,7 +27,7 @@ appear and removing them as the bridge ages them out \(em unless the port an
 address was learnt behind still exists in the bridge: such a device is merely
 quiet and stays registered while its port lives, and when the filter nears
 its capacity the longest\-missing entries are released first.
-That memory is the daemon's own; a hand-run \fB--once\fR beside it, or a
+That memory is the daemon's own; a hand-run \fB\-\-once\fR beside it, or a
 restart, falls back to plain ageing until the next ARP. It works out which
 interface is the uplink structurally \(em an interface with virtual functions, or
 one that is a virtual function \(em following bonds and stacked bridges, so a card
@@ -88,10 +88,10 @@ Addresses never to register, separated by commas or whitespace.
 Addresses to register unconditionally, for a device that never speaks first. The
 wire\-side and own\-address rules still override this.
 .TP
-.B \-v ", " \-\-verbose
+.BR \-v ", " \-\-verbose
 Explain what is skipped and why.
 .TP
-.B \-h ", " \-\-help
+.BR \-h ", " \-\-help
 Print the usage text.
 .TP
 .B \-\-version
@@ -117,10 +117,11 @@ Seconds between full reconciliations.
 Warning threshold per uplink.
 .TP
 .B EXCLUDE
-Addresses never to register.
+Addresses never to register. \fB\-\-exclude\fR on the command line adds to
+this list rather than replacing it.
 .TP
 .B EXTRA
-Addresses to register unconditionally.
+Addresses to register unconditionally. \fB\-\-extra\fR likewise adds to it.
 .SH VERIFYING
 That the kernel accepted an entry is not the same as the card acting on it.
 Test with traffic, in this order:

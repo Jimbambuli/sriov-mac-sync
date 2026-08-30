@@ -9,9 +9,9 @@ interfaces matter as much as addresses, and the picture-rebuilding below hangs
 on the link subscription. No shelling out to `bridge`, no output parsing, no
 async runtime — and real error codes, which is what makes `EEXIST` and
 `ENOSPC` distinguishable instead of guessed at. The one thing outside
-rtnetlink is a single generic-netlink question at startup — the devlink
-parameter `max_macs`, the card's real filter capacity; hardware-notes has the
-details.
+rtnetlink is a single generic-netlink question — the devlink parameter
+`max_macs`, the card's real filter capacity, asked at startup and again for a
+pair that appears at runtime; hardware-notes has the details.
 
 Topology comes from one `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
 the interface kind for stacking (a veth reports a peer there and a tunnel its
@@ -122,7 +122,13 @@ Everything this program does with that data — parsing 9826 entries, building t
 graph, putting 4200 addresses through several sets — is the 0.35 ms that is
 *not* syscall time. The cost of a pass is the kernel serialising its tables. On
 a normal host a whole cold pass was about 2 ms before the optimisations
-below; with `RTEXT_FILTER_SKIP_STATS` it is ~0.7 ms on a ConnectX-4.
+below; with them it is ~0.7 ms on a ConnectX-4.
+
+Two things keep the event path quiet between passes: wake-ups drain the
+socket in one burst (up to 256 datagrams) so an ARP storm buys one pass, not
+one per packet, and a small cBPF filter on the subscription drops
+neighbour-table noise for other address families in the kernel, before it
+wakes anybody.
 
 Five things were tried against that profile, recorded so they are not tried
 again on the strength of how sensible they sound:
@@ -132,8 +138,9 @@ again on the strength of how sensible they sound:
   attempt measured no difference because it asked with `RTEXT_FILTER_VF`, which
   makes every driver with VFs answer out of its firmware.
 * **Not asking for what is not read** — done, and the largest thing left in a
-  pass. `RTEXT_FILTER_SKIP_STATS` took a ConnectX-4 pass from 2.17 ms to 0.73,
-  43% of a cold pass, for counters this daemon never looks at.
+  pass. `RTEXT_FILTER_SKIP_STATS` took the VF-address call on a ConnectX-4 from
+  2.17 ms to 0.73 — worth 43% of the whole cold pass — for traffic counters
+  this daemon never looks at.
 * **A faster hash** — done, worth 45% of the phase that puts addresses through
   sets, and nothing anywhere else.
 * **MAC addresses as integers** — not done. It would work on part of that

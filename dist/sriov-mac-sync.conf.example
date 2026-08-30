@@ -1,23 +1,25 @@
 # /etc/sriov-mac-sync.conf - all optional
 
 # Uplink/bridge pairs to manage. Empty means autodetect: every interface with
-# virtual functions that ends up in a bridge, following bonds.
+# virtual functions - or itself a virtual function - that ends up in a bridge,
+# following bonds.
 #PAIRS="nic1:vmbr1 nic0:vmbr0"
 
 # Seconds between full reconciliations. This is paranoia, not the mechanism.
-# Addresses are registered the moment the kernel reports them, removed when the
-# bridge ages them out, and interface changes - a new NIC, a new bridge -
-# arrive as link notifications. A VF address changed silently (a down PF, a
+# Addresses are registered the moment the kernel reports them and removed when
+# they move out onto the wire or their bridge port goes - an aged-out address
+# whose port still hangs in the bridge is kept, see the README. Interface
+# changes - a new NIC, a new bridge - arrive as link notifications. A VF address changed silently (a down PF, a
 # guest-side change over the driver mailbox) is caught by the fresh driver
 # question that precedes any filter growth. The timed pass exists only in
 # case a notification is ever missed.
 #RESYNC=300
 
-# Warn above this many addresses per uplink. The vport list on ConnectX-4 Lx
-# holds 128; other hardware differs. Where the card reports its capacity through
-# devlink the daemon uses that instead, and setting this overrides both.
+# The filter capacity to respect: warn above it, and shed kept quiet
+# addresses as the list nears it. The vport list on ConnectX-4 Lx holds 128;
+# other hardware differs. Where the card reports its capacity through devlink
+# the daemon uses that instead, and setting this overrides both.
 #MAX_MACS=128
-
 
 # Addresses never to register, separated by commas or whitespace.
 #EXCLUDE=""

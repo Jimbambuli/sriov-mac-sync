@@ -36,7 +36,8 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-# One netlink socket is the whole of its outside world.
+# Netlink - commands, the subscription, one devlink question - is the
+# whole of its outside world.
 RestrictAddressFamilies=AF_NETLINK
 UMask=0077
 # Which entries are ours is noted here. Keep it across a restart, or the

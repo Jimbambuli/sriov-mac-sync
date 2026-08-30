@@ -342,8 +342,15 @@ impl Socket {
         // it gets a warning and the unfiltered behaviour, like the receive
         // buffer above.
         if groups != 0 {
-            if let Err(e) = attach_noise_filter(fd.as_raw_fd()) {
-                eprintln!("warning: cannot filter neighbour noise in the kernel: {e}");
+            // The filter reconstructs multi-byte fields byte-wise and
+            // hard-codes their little-endian storage; on a big-endian host
+            // it would degrade to accept-everything anyway, so it is not
+            // attached there - the daemon then merely wakes for noise, as
+            // it did before the filter existed.
+            if cfg!(target_endian = "little") {
+                if let Err(e) = attach_noise_filter(fd.as_raw_fd()) {
+                    eprintln!("warning: cannot filter neighbour noise in the kernel: {e}");
+                }
             }
         }
 
@@ -666,8 +673,12 @@ impl Socket {
                     NLMSG_DONE => {
                         if msg.payload.len() >= 4 {
                             let code = i32::from_ne_bytes(msg.payload[..4].try_into().unwrap());
-                            if code < 0 {
-                                return Err(io::Error::from_raw_os_error(-code));
+                            // The same trust rule as run_dump's: the kernel
+                            // writes 0 or -errno here, so anything nonzero
+                            // is a refusal - a positive value would be a
+                            // spoof or a bug, not a success.
+                            if code != 0 {
+                                return Err(io::Error::from_raw_os_error(code.saturating_abs()));
                             }
                         }
                         return Ok(OneEnd::Answered);
@@ -1026,6 +1037,12 @@ impl Socket {
     }
 
     /// Wait for a notification, giving up after `millis`. False on timeout.
+    /// The subscription's descriptor, for a caller that polls it together
+    /// with something of its own (the daemon adds its stop pipe).
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
     pub fn wait(&self, millis: i32) -> io::Result<bool> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -1248,7 +1265,14 @@ impl<'a> Iterator for Attrs<'a> {
         }
         let value = &self.buf[self.off + RTATTR_HDR..self.off + len];
         self.off += align4(len);
-        Some((kind, value))
+        // The top two bits are NLA_F_NESTED and NLA_F_NET_BYTEORDER, not
+        // part of the type. Today's kernels emit the attributes this
+        // program matches flag-free, but a kernel that one day stamps
+        // NLA_F_NESTED on IFLA_VFINFO_LIST would otherwise make the VF
+        // list come back empty - and an exclusion set silently missing
+        // the sister VFs' own addresses is the worst failure direction
+        // this program has.
+        Some((kind & 0x3fff, value))
     }
 }
 
@@ -1403,8 +1427,8 @@ fn attach_noise_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
         stmt(LD_B_ABS, 3),     //          nlmsg_len, fourth byte
         jump(JEQ_K, 0, 0, 16), //      != 0: accept
         stmt(LD_B_ABS, 1),     //          nlmsg_len, reconstructed from bytes
-        stmt(LSH_K, 8),        //             (little-endian on the wire, and cBPF
-        stmt(TAX, 0),          //               loads big-endian - hence byte-wise)
+        stmt(LSH_K, 8),        //             (byte-wise, hard-coding the host's
+        stmt(TAX, 0),          //               little-endian layout - see attach)
         stmt(LD_B_ABS, 0),
         stmt(OR_X, 0), //              A = nlmsg_len
         stmt(ADD_K, 3),
