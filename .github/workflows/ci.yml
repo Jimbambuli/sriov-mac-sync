@@ -131,7 +131,9 @@ jobs:
           # come back enabled.
           sudo touch /run/sriov-mac-sync/canary
           sudo dpkg -i dist/out/sriov-mac-sync_amd64.deb
-          if ! test -e /run/sriov-mac-sync/canary; then
+          # sudo, because the state directory is 0700 root - an
+          # unprivileged test -e reads "denied" as "gone" and cried wolf.
+          if ! sudo test -e /run/sriov-mac-sync/canary; then
             echo "the upgrade cleared the state directory"; exit 1
           fi
           test "$(systemctl is-enabled sriov-mac-sync)" = enabled
