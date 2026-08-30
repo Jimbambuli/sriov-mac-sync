@@ -89,7 +89,8 @@ sriov-mac-sync --once               reconcile and exit; the exit code says
                                     whether every change went through
 sriov-mac-sync --flush              remove what this daemon registered
 sriov-mac-sync --interval SEC       seconds between timed passes (default 300)
-sriov-mac-sync --max NUM            warn above this many addresses (default 128)
+sriov-mac-sync --max NUM            filter capacity: warn above it, shed quiet
+                                    keeps as the list nears it (default 128)
 sriov-mac-sync --timings            after every pass, what each phase cost
 sriov-mac-sync --extra <macs>       register these unconditionally, for a
                                     device that never speaks first
@@ -141,7 +142,10 @@ hardware are welcome; those four steps are the whole test.
   a ConnectX-4 Lx holds. `--max` overrides both.
 - **It knows nothing about VLANs.** One entry covers a MAC in every VLAN. So
   registering is all-or-nothing, and an address learnt on the uplink in *any*
-  VLAN is left out entirely.
+  VLAN is left out entirely. A kept quiet address is VLAN-blind the same way:
+  behind the bridge in one VLAN and out on the wire in another, the keep
+  re-asserts the behind view once both learns age - bounded, and healed by
+  the peer's next frame.
 - **A quiet guest stays registered.** Bridge entries age out, 300 s by
   default, but a router that caches ARP longer keeps sending unicast without
   asking again (FreeBSD holds it 1200 s), and those frames went out on the

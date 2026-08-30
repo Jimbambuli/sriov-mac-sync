@@ -125,6 +125,16 @@ jobs:
           # to stop it.
           test "$(systemctl is-enabled sriov-mac-sync)" = enabled
           systemctl is-active sriov-mac-sync || echo "(not running here, fine)"
+          # The upgrade path the quiet-keep memory exists for: installing
+          # the same .deb again runs old-prerm "upgrade" + postinst with
+          # $2 set - the state directory must survive it and the unit must
+          # come back enabled.
+          sudo touch /run/sriov-mac-sync/canary
+          sudo dpkg -i dist/out/sriov-mac-sync_amd64.deb
+          if ! test -e /run/sriov-mac-sync/canary; then
+            echo "the upgrade cleared the state directory"; exit 1
+          fi
+          test "$(systemctl is-enabled sriov-mac-sync)" = enabled
           sudo dpkg --purge sriov-mac-sync
           # Not `! test -e`: errexit exempts !-pipelines, and a leftover
           # would have sailed through green.

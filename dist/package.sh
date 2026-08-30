@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the release artefacts: a static binary, a .deb, an OpenWrt .ipk and
-# (with APK= set) an Alpine .apk, for x86_64 and aarch64. Everything lands in
-# dist/out/.
+# (with APK= set) an .apk for OpenWrt 24.10's apk-based opkg successor - NOT
+# for Alpine: it ships the procd init and OpenWrt arch names. Everything
+# lands in dist/out/, for x86_64 and aarch64.
 #
 #   ./dist/package.sh [version]
 #
@@ -208,6 +209,15 @@ EOF
 	cat > "$root/control/postinst" <<'EOF'
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
+# On an upgrade procd's `start` is a no-op - it compares the instance
+# definition, never the binary - so without this restart the OLD daemon
+# runs until reboot: the very bug the .deb postinst names. The restart is
+# safe now precisely because the quiet-keep memory is handed over.
+if [ "${PKG_UPGRADE:-0}" = 1 ]; then
+	/etc/init.d/sriov-mac-sync restart 2>/dev/null
+	echo "sriov-mac-sync restarted on the new binary."
+	exit 0
+fi
 /etc/init.d/sriov-mac-sync enable
 /etc/init.d/sriov-mac-sync start
 echo "sriov-mac-sync is running. What it decided:  sriov-mac-sync --status"
@@ -225,6 +235,12 @@ EOF
 # the init script's comment forbids. opkg exports PKG_UPGRADE=1 for it.
 [ "${PKG_UPGRADE:-0}" = 1 ] && exit 0
 /etc/init.d/sriov-mac-sync stop 2>/dev/null
+# procd's stop returns before the process dies; a --flush racing the dying
+# daemon's last pass could see its entries put straight back.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -x sriov-mac-sync >/dev/null 2>&1 || break
+	sleep 0.5
+done
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 exit 0
@@ -273,6 +289,10 @@ EOF
 	cat > "$root.pre-deinstall" <<'EOF'
 #!/bin/sh
 /etc/init.d/sriov-mac-sync stop 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -x sriov-mac-sync >/dev/null 2>&1 || break
+	sleep 0.5
+done
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
 [ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 exit 0

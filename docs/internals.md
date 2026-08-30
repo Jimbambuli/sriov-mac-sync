@@ -48,8 +48,9 @@ the same name does not inherit somebody else's keeps. The clock is
 `CLOCK_BOOTTIME` in milliseconds, which can be written down and read back
 and cannot step under NTP; the file shares the notes' tmpfs, so a stamp and
 the clock that reads it always come from the same boot. Losing the file
-costs the keeps and nothing else, so every failure to read or write it is a
-warning and a fall back to what every build before it did. The whole picture is rebuilt whenever an
+costs the keeps and nothing else: a write that fails is one warning per
+device and a carry on, and a file that cannot be read or parsed is simply
+no memory - the fall back to what every build before it did. The whole picture is rebuilt whenever an
 interface appears, disappears or is reconfigured. What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever
@@ -87,7 +88,11 @@ and because a missed notification would otherwise be silent and permanent. It
 doubles as a canary: a change line ending in `[timed]` means the notification
 path missed something. Recovery passes label themselves `[lost events]` and
 `[recovery]` instead, so the canary stays honest. Every line reporting a change
-names what triggered the pass, for exactly that reason.
+names what triggered the pass, for exactly that reason. The quiet-keep adds
+three lines of its own: `kept [quiet]` when addresses enter the kept state,
+`took over ...` when a fresh daemon adopts the previous run's memory, and
+`released N quiet address(es) [pressure]` when the capacity valve sheds -
+each said by the process that acts, never by `--status`.
 
 **The note outlives the pair it was made for**, on purpose: when a device stops
 being an uplink — the bridge taken apart, the port moved elsewhere — what was
@@ -173,12 +178,14 @@ exists for, verifies each came out right, and reports what it cost:
 python3 bench/trial.py vmbr1 --vlan 22
 ```
 
-Eight scenarios: addresses learnt one at a time, in close succession, and as a
+Nine scenarios: addresses learnt one at a time, in close succession, and as a
 burst of sixteen; a hundred cold `--once` passes with the CPU governor logged;
 an address of ours turning up on the uplink's own port (a guest that moved
-host); a VF's own address learnt behind the bridge; the port's removal; and a
-closing quiescence check — journal quiet, no `[timed]` pass that had to fix
-anything, no residue. A failed verification fails the exit code.
+host); a VF's own address learnt behind the bridge; a guest going quiet whose
+entry has to stay — the keep, proven on the real eSwitch; the port's removal;
+and a closing quiescence check — journal quiet, no `[timed]` pass that had to
+fix anything, no residue, the quiet-keep memory file included. A failed
+verification fails the exit code.
 
 It refuses to start unless everything holds: the service active and not in
 `--dry-run`, the bridge actually watched, STP off, the VLAN named on a

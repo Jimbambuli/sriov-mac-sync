@@ -10,8 +10,9 @@ came out right, and reports what it cost:
   S4  a hundred cold passes of --once        -> per-phase min/median/p95/max
   S5  one of ours learnt on the uplink port  -> unregistered, and how fast
   S6  a virtual function's own address       -> never registered at all
-  S7  the test port deleted                  -> everything taken back, bounded
-  S8  the daemon's own journal and the state -> quiet, and byte-identical
+  S7  a guest goes quiet, the entry stays    -> the keep, on real silicon
+  S8  the test port deleted                  -> everything taken back, bounded
+  S9  the daemon's own journal and the state -> no warnings, no residue
 
 The run fails loudly if any verification does not hold; the exit code says so.
 
@@ -99,10 +100,6 @@ def filter_capacity(dev):
 def read(path):
     with open(path) as f:
         return f.read().strip()
-
-
-def mac_bytes(s):
-    return bytes(int(p, 16) for p in s.split(":"))
 
 
 def mac_str(b):
@@ -270,7 +267,7 @@ class Monitor:
                 ln, ty, _fl, _seq, _pid = struct.unpack_from("IHHII", data, off)
                 if ln < 16:
                     break
-                if ty in (RTM_NEWNEIGH, RTM_DELNEIGH):
+                if ty == RTM_NEWNEIGH:
                     fam, ifindex, _state, flags, _typ = struct.unpack_from(
                         "BxxxiHBB", data, off + 16
                     )
@@ -285,18 +282,16 @@ class Monitor:
                                 mac = bytes(data[aoff + 4 : aoff + 10])
                             aoff += (alen + 3) & ~3
                         if mac:
-                            self.events.append(
-                                (t, "NEW" if ty == RTM_NEWNEIGH else "DEL", ifindex, flags, mac)
-                            )
+                            self.events.append((t, "NEW", ifindex, flags, mac))
                 off += (ln + 3) & ~3
 
     def learns(self, mac, port_idx):
         return [t for (t, k, i, f, m) in self.events
                 if k == "NEW" and m == mac and i == port_idx and not f & NTF_SELF]
 
-    def selfs(self, mac, uplink_idxs, kind="NEW"):
+    def selfs(self, mac, uplink_idxs):
         return {i: t for (t, k, i, f, m) in self.events
-                if k == kind and m == mac and i in uplink_idxs and f & NTF_SELF}
+                if k == "NEW" and m == mac and i in uplink_idxs and f & NTF_SELF}
 
 
 def watched_pairs(binary):
@@ -452,6 +447,16 @@ def free_virtual_function(uplink):
 def note_bytes(uplink):
     try:
         with open(f"/run/sriov-mac-sync/{uplink}.owned", "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return b""
+
+
+def ports_bytes(uplink):
+    """The quiet-keep memory beside the note - part of "the state
+    afterwards", so trial residue in it would show, not slip."""
+    try:
+        with open(f"/run/sriov-mac-sync/.{uplink}.owned.ports", "rb") as f:
             return f.read()
     except FileNotFoundError:
         return b""
@@ -652,7 +657,7 @@ class Trial:
                   f"max {fmt_ms(lats[-1])}" if lats else "no address made it")
         self.verdict("fast path", ok, detail)
 
-    def s2_settle_path(self, mon):
+    def s2_close_succession(self, mon):
         print("\nS2  the second of two addresses sent 50 ms apart")
         lats = []
         pairs_ok = 0
@@ -672,7 +677,7 @@ class Trial:
         detail = (f"{pairs_ok}/4 pairs; second-address latency min {fmt_ms(lats[0])} "
                   f"median {fmt_ms(percentile(lats, 0.5))} max {fmt_ms(lats[-1])} "
                   f"(the price of arriving in close succession)" if lats else "none made it")
-        self.verdict("settle path", ok, detail)
+        self.verdict("close succession", ok, detail)
 
     def s3_burst(self, mon):
         print("\nS3  sixteen addresses in one burst")
@@ -868,8 +873,52 @@ class Trial:
             f"REGISTERED on {uplink} - the guest holding {vf_name} would have "
             f"its traffic sent past it")
 
-    def s7_teardown(self, mon):
-        print("\nS7  the port disappears; everything has to come back out")
+    def s7_quiet_keep(self, mon):
+        """A guest that goes quiet stays registered while its port lives.
+
+        The bridge forgetting an address - here said outright with `fdb del
+        ... master`, which announces exactly what ageing announces - must
+        not take the filter entry with it any more: the router's ARP cache
+        outlives the bridge's ageing, and the frames of the next quarter
+        hour would leave on the wire. This is the netns scenario S6c run on
+        real silicon: what the eSwitch itself holds is the thing the unit
+        tests cannot see. The kept entry is deliberately left standing -
+        the teardown that follows proves the other half, that deleting the
+        port takes it back out."""
+        print("\nS7  a guest goes quiet; the entry has to stay while its port lives")
+        since = f"{time.time():.6f}"
+        mac = self.macs(1)[0]
+        if not learn_on(VETH, mac, self.args.vlan):
+            self.verdict("quiet keep", False, "the bridge refused the learn")
+            return
+        deadline = time.monotonic_ns() + 5_000_000_000
+        registered = False
+        while time.monotonic_ns() < deadline and not registered:
+            mon.pump(time.monotonic_ns() + 100_000_000)
+            registered = all(mac_str(mac) in self_macs(u) for u in self.uplinks)
+        if not registered:
+            self.verdict("quiet keep", False, "never registered to begin with")
+            return
+        # The bridge forgets; the daemon must not.
+        unlearn_on(VETH, mac, self.args.vlan)
+        held = True
+        deadline = time.monotonic_ns() + 8_000_000_000
+        while time.monotonic_ns() < deadline and held:
+            mon.pump(time.monotonic_ns() + 200_000_000)
+            held = all(mac_str(mac) in self_macs(u) for u in self.uplinks)
+        said = "kept [quiet]" in run(
+            ["journalctl", "-u", "sriov-mac-sync", "-q",
+             "--since", f"@{since}", "-o", "cat"]).stdout
+        self.verdict(
+            "quiet keep", held and said,
+            "kept through 8 s of silence, and the journal says so"
+            if held and said else
+            ("REMOVED after ageing - the blackhole this feature exists to "
+             "prevent" if not held else
+             "kept, but no 'kept [quiet]' line in the journal"))
+
+    def s8_teardown(self, mon):
+        print("\nS8  the port disappears; everything has to come back out")
         t0 = time.monotonic_ns()
         run(["ip", "link", "del", VETH])
         purged = purge_learned_residue()
@@ -894,15 +943,15 @@ class Trial:
         self.verdict("removal after port loss", clean, detail)
         return clean
 
-    def s8_quiescence(self, since_epoch, pre_state):
-        print("\nS8  the daemon's own account, and the state afterwards")
+    def s9_quiescence(self, since_epoch, pre_state):
+        print("\nS9  the daemon's own account, and the state afterwards")
         j = run(["journalctl", "-u", "sriov-mac-sync", "-q",
                  "--since", f"@{since_epoch}", "-o", "cat"])
         noise = [l for l in j.stdout.splitlines()
                  if re.search(r"warning|error", l, re.I)]
         timed = [l for l in j.stdout.splitlines()
                  if "[timed]" in l and re.search(r"\+[1-9]|-[1-9]", l)]
-        post = {u: (self_macs(u), note_bytes(u)) for u in self.uplinks}
+        post = {u: (self_macs(u), note_bytes(u), ports_bytes(u)) for u in self.uplinks}
         # The trial's own footprint has to be gone; the rest of the bridge is
         # a live network whose guests come and go - that drift is the
         # daemon's ordinary work, reported but never blamed on the trial.
@@ -911,6 +960,10 @@ class Trial:
             for u in self.uplinks
             for m in post[u][0]
             if m.startswith(("02:be:5c", "fe:be:5c"))
+        ] + [
+            f"{u} memory"
+            for u in self.uplinks
+            if b"02:be:5c" in post[u][2] or b"fe:be:5c" in post[u][2]
         ] + fdb_residue()
         drift = {
             u
@@ -977,7 +1030,7 @@ def main():
         print(f"governor: left as found ({governor.describe()})")
 
     since_epoch = f"{time.time():.6f}"
-    pre_state = {u: (self_macs(u), note_bytes(u)) for u in uplinks}
+    pre_state = {u: (self_macs(u), note_bytes(u), ports_bytes(u)) for u in uplinks}
 
     mon = Monitor()
 
@@ -986,15 +1039,16 @@ def main():
     time.sleep(2.5)  # the port add is an interface event; let its pass run
 
     t.s1_fast_path(mon)
-    t.s2_settle_path(mon)
+    t.s2_close_succession(mon)
     t.s3_burst(mon)
     t.s4_pass_stats()
     t.s5_reflection(mon)
     t.s6_vf_address(mon)
-    clean = t.s7_teardown(mon)
+    t.s7_quiet_keep(mon)
+    clean = t.s8_teardown(mon)
     cleanup.done = True  # the veth is gone; nothing else was ever created
     time.sleep(1)
-    t.s8_quiescence(since_epoch, pre_state)
+    t.s9_quiescence(since_epoch, pre_state)
 
     print("\n" + "=" * 64)
     print(f"Measured with the governor at: {governor.describe()}")

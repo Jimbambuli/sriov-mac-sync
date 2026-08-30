@@ -1,20 +1,17 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Something the daemon should handle
 title: ''
-labels: ''
+labels: enhancement
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**The situation the daemon does not handle**
+What your topology looks like, and what goes wrong or missing in it.
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**What you do today instead**
+Hookscripts, EXTRA/EXCLUDE pins, hand-run `bridge fdb` - whatever bridges
+the gap now.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
-
-**Additional context**
-Add any other context or screenshots about the feature request here.
+**What you would expect it to do**

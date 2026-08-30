@@ -50,22 +50,38 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # address does not, and `bridge fdb show dev X self` prints both.
 has_self() { $NS bridge fdb show dev veth-up | grep "$1" | grep -q self; }
 
+# A scenario daemon on the shared pair, logging to the named file.
+start_daemon() {
+  $NS "$BIN" --pair veth-up:br0 --interval 1 >"$1" 2>&1 &
+  DPID=$!
+  sleep 1
+}
+
+# Re-create the guest port and M1's registration for whatever follows a
+# scenario that deleted veth-g1. The port sits in state disabled until
+# linkwatch runs, and a dynamic entry on a disabled port earns EPERM - the
+# restore would silently never happen, the same race trial.py guards
+# against - hence the wait for forwarding.
+restore_guest_port() {
+  $NS ip link add veth-g1 type veth peer name veth-g1P
+  $NS ip link set veth-g1 master br0
+  $NS sh -c 'ip link set veth-g1 up; ip link set veth-g1P up'
+  for _ in $(seq 1 50); do
+    $NS bridge link show dev veth-g1 2>/dev/null | grep -q "state forwarding" && break
+    sleep 0.1
+  done
+  $NS bridge fdb replace $M1 dev veth-g1 master dynamic
+  $NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
+}
+
 cleanup() {
-  # Only the PID this script started. A pattern kill would match any
-  # process whose command line mentions the path - including whatever
-  # terminal or supervisor ran this script from the repository.
-  #
-  # Waited for, and escalated: the rm -rf below racing a daemon that is
-  # still writing recreates the state directory, and every later run then
-  # refuses with "state directory exists" until a hand cleans up.
+  # Only the PID this script started - a pattern kill would match any
+  # process whose command line mentions the path. stop_daemon waits and
+  # escalates: the rm -rf below racing a daemon that is still writing
+  # recreates the state directory, and every later run then refuses with
+  # "state directory exists" until a hand cleans up.
   if [ -n "$DPID" ]; then
-    kill "$DPID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$DPID" 2>/dev/null || break
-      sleep 0.2
-    done
-    kill -9 "$DPID" 2>/dev/null
-    wait "$DPID" 2>/dev/null
+    stop_daemon
   fi
   ip netns del sms-it 2>/dev/null
   rm -rf "$STATE" "$SNAP"
@@ -228,9 +244,11 @@ check "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
 stop_daemon
 
 say "S6c: a quiet guest outlives the bridge's ageing while its port does"
-$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6c.log 2>&1 &
-DPID=$!
-sleep 1
+# The port's KIND does not matter to the keep - quiet_survivors judges by
+# edges and indices alone, which is why the dummy-port twin this scenario
+# once had proved nothing a veth does not; the unit suite pins the
+# physical-port arm on the fixture instead.
+start_daemon /tmp/sms-it-s6c.log
 $NS bridge fdb replace $M2 dev veth-g1 master dynamic
 sleep 2
 check "M2 registered while learnt" "has_self $M2"
@@ -245,52 +263,12 @@ $NS ip link del veth-g1
 sleep 3
 check "M2 gone once its port is" "! has_self $M2"
 stop_daemon
-# Restore the guest port and M1's registration for the scenarios that
-# follow: deleting veth-g1 rightly ended M1's keep too.
-$NS ip link add veth-g1 type veth peer name veth-g1P
-$NS ip link set veth-g1 master br0
-$NS sh -c 'ip link set veth-g1 up; ip link set veth-g1P up'
-# The port sits in state disabled until linkwatch runs; a dynamic entry on
-# a disabled port earns EPERM and the restore silently never happens -
-# the same race trial.py guards against.
-for _ in $(seq 1 50); do
-  $NS bridge link show dev veth-g1 2>/dev/null | grep -q "state forwarding" && break
-  sleep 0.1
-done
-$NS bridge fdb replace $M1 dev veth-g1 master dynamic
-$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
-
-say "S6d: an aged address on a physical-style port is kept, and goes with the port"
-# A dummy port is the netns stand-in for a physical NIC in the bridge: its
-# aged addresses are kept exactly like a guest's - until the port goes.
-$NS ip link add dum0 type dummy
-$NS ip link set dum0 master br0
-$NS ip link set dum0 up
-M5="02:be:5c:00:00:55"
-$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6d.log 2>&1 &
-DPID=$!
-sleep 1
-$NS bridge fdb replace $M5 dev dum0 master dynamic
-sleep 2
-check "M5 registered while learnt" "has_self $M5"
-$NS bridge fdb del $M5 dev dum0 master
-sleep 3
-check "M5 kept after ageing (port lives)" "has_self $M5"
-$NS ip link del dum0
-sleep 3
-check "M5 gone once its port is" "! has_self $M5"
-check "the keep is said" "grep -q 'kept \[quiet\]' /tmp/sms-it-s6d.log"
-stop_daemon
-# M1 again for the scenarios that follow.
-$NS bridge fdb replace $M1 dev veth-g1 master dynamic
-$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
+restore_guest_port
 
 say "S6e: an update hands the keeps to the next process"
 # The scenario the persistence exists for: a quiet guest whose daemon is
 # replaced under it must not be unregistered by the new one's first pass.
-$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6e.log 2>&1 &
-DPID=$!
-sleep 1
+start_daemon /tmp/sms-it-s6e.log
 M6="02:be:5c:00:00:66"
 $NS bridge fdb replace $M6 dev veth-g1 master dynamic
 sleep 2
@@ -301,9 +279,8 @@ sleep 3
 check "M6 kept while its port lives" "has_self $M6"
 # The update: stop, start again, and let the new process run a full pass.
 stop_daemon
-$NS "$BIN" --pair veth-up:br0 --interval 1 >/tmp/sms-it-s6e2.log 2>&1 &
-DPID=$!
-sleep 4
+start_daemon /tmp/sms-it-s6e2.log
+sleep 3
 check "M6 survived the restart" "has_self $M6"
 check "the takeover is said" "grep -q 'took over' /tmp/sms-it-s6e2.log"
 # And the memory is still live in the new process: the port going still ends it.
@@ -311,16 +288,7 @@ $NS ip link del veth-g1
 sleep 3
 check "M6 gone once its port is" "! has_self $M6"
 stop_daemon
-# Restore the guest port and M1 for the scenarios that follow.
-$NS ip link add veth-g1 type veth peer name veth-g1P
-$NS ip link set veth-g1 master br0
-$NS sh -c 'ip link set veth-g1 up; ip link set veth-g1P up'
-for _ in $(seq 1 50); do
-  $NS bridge link show dev veth-g1 2>/dev/null | grep -q "state forwarding" && break
-  sleep 0.1
-done
-$NS bridge fdb replace $M1 dev veth-g1 master dynamic
-$NS "$BIN" --once --pair veth-up:br0 >/dev/null 2>&1
+restore_guest_port
 
 say "S7: --status reads without writing"
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)
