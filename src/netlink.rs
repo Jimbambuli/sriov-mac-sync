@@ -533,11 +533,8 @@ impl Socket {
                     // registration past the cut removed. Kernels that send no
                     // body are taken at their word, as before.
                     NLMSG_DONE => {
-                        if msg.payload.len() >= 4 {
-                            let code = i32::from_ne_bytes(msg.payload[..4].try_into().unwrap());
-                            if code != 0 {
-                                return Err(io::Error::from_raw_os_error(-code));
-                            }
+                        if let Some(e) = nlmsg_error(msg.payload) {
+                            return Err(e);
                         }
                         return Ok(DumpEnd::Done);
                     }
@@ -671,15 +668,8 @@ impl Socket {
                     // how a VF list quietly loses its exclusions. The dump
                     // path checks this code; this path must too.
                     NLMSG_DONE => {
-                        if msg.payload.len() >= 4 {
-                            let code = i32::from_ne_bytes(msg.payload[..4].try_into().unwrap());
-                            // The same trust rule as run_dump's: the kernel
-                            // writes 0 or -errno here, so anything nonzero
-                            // is a refusal - a positive value would be a
-                            // spoof or a bug, not a success.
-                            if code != 0 {
-                                return Err(io::Error::from_raw_os_error(code.saturating_abs()));
-                            }
+                        if let Some(e) = nlmsg_error(msg.payload) {
+                            return Err(e);
                         }
                         return Ok(OneEnd::Answered);
                     }
@@ -1036,13 +1026,13 @@ impl Socket {
         }
     }
 
-    /// Wait for a notification, giving up after `millis`. False on timeout.
     /// The subscription's descriptor, for a caller that polls it together
     /// with something of its own (the daemon adds its stop pipe).
     pub fn raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
     }
 
+    /// Wait for a notification, giving up after `millis`. False on timeout.
     pub fn wait(&self, millis: i32) -> io::Result<bool> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -1233,6 +1223,11 @@ fn messages(buf: &[u8]) -> Messages<'_> {
     Messages { buf, off: 0 }
 }
 
+/// The status code at the front of an NLMSG_ERROR or NLMSG_DONE payload,
+/// as an error when it is one. The kernel writes 0 or -errno; anything
+/// positive would be a spoof or a bug, refused with the same errno rather
+/// than trusted - and `saturating_abs` keeps even i32::MIN from panicking
+/// a debug build. One arithmetic for every reader of this wire field.
 fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
     if payload.len() < 4 {
         return None;
@@ -1241,7 +1236,7 @@ fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
     if code == 0 {
         None // an acknowledgement, not a failure
     } else {
-        Some(io::Error::from_raw_os_error(-code))
+        Some(io::Error::from_raw_os_error(code.saturating_abs()))
     }
 }
 

@@ -130,41 +130,12 @@ impl Syncer {
     /// file - the same rules the note itself is written by, for the same
     /// reasons. Says so once per device when it cannot, and then carries on:
     /// the memory still works in this process, it just will not outlive it.
+    /// Precondition: `lines` sorted and non-empty - the one caller sorts
+    /// for its change comparison anyway, and hands the empty case to the
+    /// file's removal instead.
     pub(super) fn write_ports(&self, dev: &str, lines: &[String]) {
-        let text = if lines.is_empty() {
-            String::new()
-        } else {
-            let mut sorted = lines.to_vec();
-            sorted.sort();
-            sorted.join("\n") + "\n"
-        };
-        let put = |tmp: &PathBuf| -> io::Result<()> {
-            use std::io::Write;
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(tmp)?
-                .write_all(text.as_bytes())
-        };
-        let write = || -> io::Result<()> {
-            let tmp = self
-                .state_dir
-                .join(format!(".{dev}.owned.ports.{}.tmp", std::process::id()));
-            if let Err(e) = put(&tmp) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    return Err(e);
-                }
-                self.ensure_state_dir()?;
-                put(&tmp)?;
-            }
-            fs::rename(&tmp, self.ports_path(dev)).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                e
-            })
-        };
-        if let Err(e) = write() {
+        let text = lines.join("\n") + "\n";
+        if let Err(e) = self.put_file(&self.ports_path(dev), &text) {
             if self.ports_warned.borrow_mut().insert(dev.to_string()) {
                 eprintln!(
                     "warning: cannot write the quiet-keep memory for {dev}: {e} - \
@@ -196,25 +167,10 @@ impl Syncer {
         if self.indices.borrow().get(dev) == Some(&index) {
             return;
         }
-        let path = self.index_path(dev);
-        let put = || -> io::Result<()> {
-            use std::io::Write;
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)?
-                .write_all(format!("{index}\n").as_bytes())
-        };
-        let wrote = put().or_else(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                self.ensure_state_dir()?;
-                put()
-            } else {
-                Err(e)
-            }
-        });
+        // Atomic like every other writer here: a second process's
+        // renamed_target reading a torn index record would fail to follow
+        // exactly the rename the record exists for.
+        let wrote = self.put_file(&self.index_path(dev), &format!("{index}\n"));
         if let Err(e) = wrote {
             eprintln!(
                 "warning: cannot record which interface {dev} is: {e} - \
@@ -567,29 +523,34 @@ impl Syncer {
         self.locked(dev, || self.write_owned(dev, set));
     }
 
-    /// The write itself. Every caller holds the lock. Whether the note now
-    /// records the set - a caller that registered something on the strength
-    /// of this write has to know, because an entry in the card that no note
-    /// names would never be removed again.
-    /// The note's bytes onto disk: a temporary file, then a rename.
+    /// The one atomic writer everything on-disk here goes through: a
+    /// temporary file, then a rename onto `dest`.
     ///
-    /// Through a temporary file because a note truncated by a crash
-    /// mid-write would read as "we own nothing". The name is a hidden
-    /// prefix, not a suffix - "eth0.new" is a perfectly legal interface
-    /// name whose own note would otherwise be this file - and it carries
-    /// the process id, because the daemon is not the only thing that writes
-    /// these: `--once` and `--flush` are run by hand while it is running,
-    /// and two of them sharing one temporary file means one truncates what
-    /// the other is writing and then renames it into place.
+    /// Through a temporary file because a file truncated by a crash
+    /// mid-write would read as "we own nothing" (the note) or as no memory
+    /// (the ports file). The temporary's name is the destination's with a
+    /// hidden prefix and this process's id appended - a prefix, not a
+    /// suffix, because "eth0.new" is a perfectly legal interface name
+    /// whose own note would otherwise be this file; and the pid because
+    /// the daemon is not the only writer - `--once` and `--flush` are run
+    /// by hand while it is running, and two writers sharing one temporary
+    /// file means one truncates what the other is writing and then renames
+    /// it into place.
     ///
     /// 0600 rather than what `fs::write` asks for, which is 0666 with the
-    /// process umask taken off it: the note the rename leaves behind keeps
-    /// the mode of the temporary file it came from, and a note other users
-    /// may write is a note that decides what this daemon takes out of a
-    /// card. The directory is 0700 as well; this is the second lock on the
-    /// same door, for the case where the directory was made by something
-    /// else.
-    fn put_note(&self, dev: &str, text: &str) -> io::Result<()> {
+    /// process umask taken off it: the file the rename leaves behind keeps
+    /// the mode of the temporary it came from, and state other users may
+    /// write is state that decides what this daemon takes out of a card.
+    /// The directory is 0700 as well; this is the second lock on the same
+    /// door, for the case where the directory was made by something else.
+    fn put_file(&self, dest: &std::path::Path, text: &str) -> io::Result<()> {
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = self
+            .state_dir
+            .join(format!(".{name}.{}.tmp", std::process::id()));
         let put = |tmp: &PathBuf| -> io::Result<()> {
             use std::io::Write;
             fs::OpenOptions::new()
@@ -600,9 +561,6 @@ impl Syncer {
                 .open(tmp)?
                 .write_all(text.as_bytes())
         };
-        let tmp = self
-            .state_dir
-            .join(format!(".{dev}.owned.{}.tmp", std::process::id()));
         if let Err(e) = put(&tmp) {
             // The directory is created by the unit and survives a restart;
             // asking for it on every write was a syscall per write for a
@@ -613,7 +571,7 @@ impl Syncer {
             self.ensure_state_dir()?;
             put(&tmp)?;
         }
-        fs::rename(&tmp, self.state_path(dev)).map_err(|e| {
+        fs::rename(&tmp, dest).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             e
         })
@@ -641,20 +599,22 @@ impl Syncer {
             return true;
         }
         let text = kept.join("\n") + "\n";
-        match self.put_note(dev, &text) {
-            Ok(()) => {
-                // The remembered copy is about a file that just changed.
-                self.notes.borrow_mut().remove(dev);
-                true
-            }
+        // Either way the remembered copy is about a file that changed, or
+        // that is no longer known to hold what it claims.
+        self.notes.borrow_mut().remove(dev);
+        match self.put_file(&self.state_path(dev), &text) {
+            Ok(()) => true,
             Err(e) => {
-                self.notes.borrow_mut().remove(dev);
                 eprintln!("warning: cannot write the ownership note for {dev}: {e}");
                 false
             }
         }
     }
 
+    /// The write itself. Every caller holds the lock. Whether the note now
+    /// records the set - a caller that registered something on the strength
+    /// of this write has to know, because an entry in the card that no note
+    /// names would never be removed again.
     pub(super) fn write_owned(&self, dev: &str, set: &Set<Mac>) -> bool {
         if !self.note_is_readable(dev) {
             eprintln!(
@@ -684,25 +644,9 @@ impl Syncer {
         };
         // A note that cannot be written strands every entry it should have
         // named: the next pass reads nothing and counts them as foreign,
-        // forever. That must not happen in silence.
-        //
-        // Through a temporary file: a note truncated by a crash mid-write
-        // would read as "we own nothing" just the same. The name is a hidden
-        // prefix, not a suffix - "eth0.new" is a perfectly legal interface
-        // name whose own note would otherwise be this file - and it carries
-        // the process id, because the daemon is not the only thing that
-        // writes these. `--once` and `--flush` are run by hand while it is
-        // running; two of them sharing one temporary file means one truncates
-        // what the other is writing and then renames it into place, and the
-        // note that results is neither's.
-        // 0600 rather than what `fs::write` asks for, which is 0666 with the
-        // process umask taken off it: the note the rename leaves behind keeps
-        // the mode of the temporary file it came from, and a note other users
-        // may write is a note that decides what this daemon takes out of a
-        // card. The directory is 0700 as well; this is the second lock on the
-        // same door, for the case where the directory was made by something
-        // else.
-        match self.put_note(dev, &text) {
+        // forever. That must not happen in silence. The how - temporary
+        // file, hidden pid-carrying name, 0600 - lives on put_file.
+        match self.put_file(&self.state_path(dev), &text) {
             Ok(()) => {
                 self.remember(dev, set);
                 true
@@ -832,6 +776,12 @@ impl Syncer {
     /// agrees - a caller that cannot un-note has claimed a foreign entry
     /// and has to say so.
     pub(super) fn unnote_locked(&self, dev: &str, macs: &[Mac]) -> bool {
+        // Unreadable is not "removed": the empty could-not-tell set would
+        // read as "nothing to do" and swallow the caller's warning about
+        // lines it could not take back.
+        if !self.note_is_readable(dev) {
+            return false;
+        }
         let before = self.load_owned(dev);
         let mut after = before.clone();
         for mac in macs {

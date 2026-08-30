@@ -427,20 +427,26 @@ impl Topology {
         }
     }
 
-    /// Everything stacked on top of `root`, `root` itself included: VLAN
-    /// interfaces over a bridge, bridges over those, and so on. One walk up
-    /// the inverse of the `lowers` edges.
-    pub fn stacked_above(&self, root: u32) -> Set<u32> {
+    /// One flood over one kind of edge, roots included - the shape both
+    /// directions share.
+    fn flood(&self, roots: &[u32], next: impl Fn(&Link) -> &[u32]) -> Set<u32> {
         let mut seen: Set<u32> = crate::hash::set();
-        let mut stack: Vec<u32> = vec![root];
+        let mut stack: Vec<u32> = roots.to_vec();
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
                 continue;
             }
             let Some(link) = self.at(cur) else { continue };
-            stack.extend(link.uppers.iter().copied());
+            stack.extend(next(link).iter().copied());
         }
         seen
+    }
+
+    /// Everything stacked on top of `root`, `root` itself included: VLAN
+    /// interfaces over a bridge, bridges over those, and so on. One walk up
+    /// the inverse of the `lowers` edges.
+    pub fn stacked_above(&self, root: u32) -> Set<u32> {
+        self.flood(&[root], |l| &l.uppers)
     }
 
     /// By name. For the few places that start from one - a --pair, a bridge
@@ -503,16 +509,7 @@ impl Topology {
     /// interface at once, where asking each interface whether it leads to the
     /// bridge walks the same edges once per interface.
     pub fn subtree_of(&self, roots: &[u32]) -> Set<u32> {
-        let mut seen: Set<u32> = crate::hash::set();
-        let mut stack: Vec<u32> = roots.to_vec();
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
-                continue;
-            }
-            let Some(link) = self.at(cur) else { continue };
-            stack.extend(link.lowers.iter().copied());
-        }
-        seen
+        self.flood(roots, |l| &l.lowers)
     }
 
     /// Follow the master chain upwards - through bonds, teams, whatever -

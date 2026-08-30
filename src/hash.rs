@@ -189,11 +189,6 @@ impl Hasher for FxHasher {
     }
 
     #[inline]
-    fn write_u64(&mut self, n: u64) {
-        self.add(n);
-    }
-
-    #[inline]
     fn write_usize(&mut self, n: usize) {
         self.add(n as u64);
     }

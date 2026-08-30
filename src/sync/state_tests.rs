@@ -1,5 +1,6 @@
 use super::tests::*;
 use super::*;
+use crate::netlink::{RTM_DELNEIGH, RTM_NEWNEIGH};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("sriov-mac-sync-{}-{name}", std::process::id()));
@@ -195,14 +196,7 @@ fn a_device_that_stopped_being_an_uplink_is_noticed() {
     let mut set = crate::hash::set();
     set.insert(BEHIND_NIC);
 
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let mut s = br0_syncer(&dir);
     s.save_owned("nic1", &set);
     s.save_owned("nic0", &set); // was an uplink once, is not one now
     assert_eq!(
@@ -428,12 +422,8 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
             vf: vf.clone(),
             ..Default::default()
         };
-        s.fast_apply(
-            &mut sock,
-            &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, entry.clone())],
-        )
-        .unwrap();
+        s.fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, entry.clone())])
+            .unwrap();
         let registered = !sock.added.is_empty();
         // Only learned entries reach the fast path at all; desired() also
         // wants the host's own addresses, which never arrive as events.
@@ -475,7 +465,7 @@ fn a_batch_that_would_register_asks_the_driver_afresh() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+        &[(RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
     )
     .unwrap();
     assert_eq!(sock.vf_asked, 1, "an addition consults the driver");
@@ -489,7 +479,7 @@ fn a_batch_that_would_register_asks_the_driver_afresh() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert!(
@@ -502,7 +492,7 @@ fn a_batch_that_would_register_asks_the_driver_afresh() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert_eq!(sock.vf_asked, asked, "a deletion-only batch stays cheap");
@@ -529,7 +519,7 @@ fn a_failed_refresh_leaves_the_carried_answer_distrusted() {
     let r = s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+        &[(RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
     );
     assert!(r.is_err(), "the failed question reaches the caller");
     assert!(s.vf_stale, "and the carried answer is no longer believed");
@@ -540,7 +530,7 @@ fn a_failed_refresh_leaves_the_carried_answer_distrusted() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
+        &[(RTM_NEWNEIGH, learned(3, 10, VF_ADMIN))],
     )
     .unwrap();
     assert!(
@@ -569,12 +559,8 @@ fn reflection_keeps_what_a_parallel_writer_noted() {
         ..Default::default()
     };
     // WIRE turns up on the uplink port itself: the wire has the last word.
-    s.fast_apply(
-        &mut sock,
-        &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))],
-    )
-    .unwrap();
+    s.fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(2, 10, WIRE))])
+        .unwrap();
     assert!(
         sock.removed.iter().any(|(_, m)| *m == WIRE),
         "the reflected address came out of the filter"
@@ -603,7 +589,7 @@ fn relearning_an_owned_address_buys_no_question() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert_eq!(sock.vf_asked, 0, "nothing grew, nothing was asked");
@@ -639,7 +625,7 @@ fn the_grow_refresh_asks_only_the_growing_pairs_functions() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert_eq!(
@@ -777,7 +763,7 @@ fn the_fast_path_notes_before_it_writes() {
         .fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+            &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
         )
         .unwrap();
     assert!(
@@ -815,7 +801,7 @@ fn a_foreign_entry_met_by_the_fast_path_is_not_claimed() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert!(
@@ -859,7 +845,7 @@ fn an_unusable_note_holds_the_card_back() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
     assert!(
@@ -1348,11 +1334,7 @@ fn a_detached_device_is_left_alone_rather_than_mistaken_for_the_port() {
 
     // The fast path refuses the same pair the same way.
     let urgency = s
-        .fast_apply(
-            &mut sock,
-            &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(4, 10, WIRE))],
-        )
+        .fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(4, 10, WIRE))])
         .unwrap();
     assert!(
         sock.added.is_empty(),
@@ -1630,7 +1612,7 @@ fn an_address_that_reappears_on_the_wire_is_unregistered_at_once() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
     )
     .unwrap();
 
@@ -1660,7 +1642,7 @@ fn a_reflection_of_an_address_we_never_registered_is_left_alone() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
+        &[(RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC))],
     )
     .unwrap();
 
@@ -1689,9 +1671,9 @@ fn within_one_batch_the_wire_wins() {
         &topo,
         &[
             // behind the bridge, on the other NIC ...
-            (crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC)),
+            (RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC)),
             // ... and on the uplink's own port in the same breath
-            (crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC)),
+            (RTM_NEWNEIGH, learned(2, 10, BEHIND_NIC)),
         ],
     )
     .unwrap();
@@ -1712,8 +1694,8 @@ fn within_one_batch_the_wire_wins() {
             &mut sock,
             &topo,
             &[
-                (crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST)),
-                (crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST)),
+                (RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST)),
+                (RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST)),
             ],
         )
         .unwrap();
@@ -1728,11 +1710,7 @@ fn within_one_batch_the_wire_wins() {
     // refusal above must not have bought this one a pass too.
     let mut sock = FakeSock::default();
     let urgency = s
-        .fast_apply(
-            &mut sock,
-            &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))],
-        )
+        .fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(2, 10, WIRE))])
         .unwrap();
     assert_eq!(
         urgency,
@@ -1793,7 +1771,7 @@ fn a_stale_vf_exclusion_is_settled_by_the_fresh_question() {
         .fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+            &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
         )
         .unwrap();
     assert_eq!(
@@ -1825,7 +1803,7 @@ fn a_deletion_alone_does_not_remove_a_registration() {
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
+        &[(RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))],
     )
     .unwrap();
 
@@ -1927,12 +1905,8 @@ fn only_a_batch_with_something_in_it_earns_a_pass() {
 
     // Somebody else's address, learnt out on the wire. Nothing of ours.
     assert!(
-        s.fast_apply(
-            &mut sock,
-            &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, WIRE))]
-        )
-        .unwrap()
+        s.fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(2, 10, WIRE))])
+            .unwrap()
             == Urgency::Nothing,
         "learning on the wire that was never ours leaves nothing to reconcile"
     );
@@ -1942,7 +1916,7 @@ fn only_a_batch_with_something_in_it_earns_a_pass() {
         s.fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(22, 20, OTHER_BRIDGE))]
+            &[(RTM_NEWNEIGH, learned(22, 20, OTHER_BRIDGE))]
         )
         .unwrap()
             == Urgency::Nothing,
@@ -1954,7 +1928,7 @@ fn only_a_batch_with_something_in_it_earns_a_pass() {
         s.fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))]
+            &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))]
         )
         .unwrap()
             == Urgency::Now,
@@ -1967,7 +1941,7 @@ fn only_a_batch_with_something_in_it_earns_a_pass() {
         s.fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))]
+            &[(RTM_DELNEIGH, learned(3, 10, BEHIND_NIC))]
         )
         .unwrap()
             == Urgency::WhenConvenient,
@@ -1983,7 +1957,7 @@ fn only_a_batch_with_something_in_it_earns_a_pass() {
         s2.fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))]
+            &[(RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))]
         )
         .unwrap()
             == Urgency::Now,
@@ -2221,7 +2195,7 @@ fn an_address_the_wire_set_still_holds_still_buys_a_pass() {
             &mut sock,
             &topo,
             // ... and now it is learnt behind the bridge again.
-            &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
+            &[(RTM_NEWNEIGH, learned(3, 10, BEHIND_NIC))],
         )
         .unwrap();
 
@@ -2259,12 +2233,8 @@ fn the_fast_path_asks_again_when_the_answer_went_stale() {
         vf: vec![(2, fresh)],
         ..Default::default()
     };
-    s.fast_apply(
-        &mut sock,
-        &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(3, 10, fresh))],
-    )
-    .unwrap();
+    s.fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(3, 10, fresh))])
+        .unwrap();
 
     assert!(
         sock.added.is_empty(),
@@ -2460,6 +2430,51 @@ fn an_unknowable_virtual_function_is_reported_once() {
 
 // ----------------------------------------------------------------- quiet keep
 
+/// nic1 (one VF) and a veth guest port side by side in br0 - the small
+/// stage most valve and clock tests play on. Indices: nic1=2, vetha=4,
+/// br0=10.
+fn small_host() -> crate::sysfs::Topology {
+    Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build()
+}
+
+/// An authoritative syncer over the nic1:br0 pair, state in `dir`.
+fn br0_syncer(dir: &std::path::Path) -> Syncer {
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1".into(),
+            bridge: "br0".into(),
+        }],
+        dir.to_path_buf(),
+    );
+    s.authoritative = true;
+    s
+}
+
+/// The ritual most quiet tests open with: the host fixture, a ready
+/// syncer over `dir`, and a first pass that registered everything. The
+/// returned sock holds what that pass added.
+fn registered(dir: &std::path::Path) -> (crate::sysfs::Topology, Syncer, FakeSock) {
+    let topo = host(mac(1));
+    let mut s = ready_syncer(dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    (topo, s, sock)
+}
+
 /// The forwarding table as the fixture knows it, minus one address - the
 /// shape a dump takes after the bridge aged that address out.
 fn fdb_without(mac: Mac) -> Vec<crate::netlink::FdbEntry> {
@@ -2486,14 +2501,7 @@ fn card_holds(dev: u32, mac: Mac) -> crate::netlink::FdbEntry {
 #[test]
 fn an_aged_guest_behind_a_living_port_stays_registered() {
     let dir = scratch("quiet-kept");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
 
     let mut aged = fdb_without(BEHIND_GUEST);
@@ -2541,14 +2549,7 @@ fn age_out(s: &mut Syncer, topo: &crate::sysfs::Topology, m: Mac) -> Vec<Report>
 #[test]
 fn an_aged_address_on_a_physical_port_is_kept_while_the_port_lives() {
     let dir = scratch("quiet-lan-kept");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
 
     let reports = age_out(&mut s, &topo, BEHIND_NIC);
@@ -2568,14 +2569,7 @@ fn an_aged_address_on_a_physical_port_is_kept_while_the_port_lives() {
 #[test]
 fn a_kept_lan_address_leaves_when_its_nic_does() {
     let dir = scratch("quiet-lan-port-gone");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     age_out(&mut s, &topo, BEHIND_NIC);
 
     // nic2 is unplugged from the picture entirely.
@@ -2604,14 +2598,7 @@ fn a_kept_lan_address_leaves_when_its_nic_does() {
 #[test]
 fn a_kept_address_leaves_when_its_port_does() {
     let dir = scratch("quiet-port-gone");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (_topo, mut s, _) = registered(&dir);
 
     // The container stopped: veth0 is gone from the picture.
     let vethless = Builder::new()
@@ -2650,14 +2637,7 @@ fn a_kept_address_leaves_when_its_port_does() {
 #[test]
 fn the_wire_wins_over_a_quiet_keep() {
     let dir = scratch("quiet-wire");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
 
     // The guest moved to another host: gone behind the bridge, learnt on
     // the uplink port instead.
@@ -2684,20 +2664,13 @@ fn the_wire_wins_over_a_quiet_keep() {
 #[test]
 fn a_reflection_evicts_the_port_memory() {
     let dir = scratch("quiet-reflection");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, mut sock) = registered(&dir);
 
     // The batch that says the guest moved out onto the wire.
     s.fast_apply(
         &mut sock,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
+        &[(RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
     )
     .unwrap();
     assert!(sock.removed.iter().any(|(_, m)| *m == BEHIND_GUEST));
@@ -2725,14 +2698,7 @@ fn a_reflection_evicts_the_port_memory() {
 #[test]
 fn a_restart_takes_over_the_quiet_memory() {
     let dir = scratch("quiet-restart");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     // The guest goes quiet while the old process is still running, so the
     // clock is already ticking when it is written down.
     age_out(&mut s, &topo, BEHIND_GUEST);
@@ -2764,14 +2730,7 @@ fn a_restart_takes_over_the_quiet_memory() {
 #[test]
 fn a_reboot_starts_from_nothing() {
     let dir = scratch("quiet-reboot");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     age_out(&mut s, &topo, BEHIND_GUEST);
     assert!(
         dir.join(".nic1.owned.ports").exists(),
@@ -2806,14 +2765,7 @@ fn a_reboot_starts_from_nothing() {
 #[test]
 fn a_replaced_port_does_not_inherit_the_memory() {
     let dir = scratch("quiet-replaced-port");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     age_out(&mut s, &topo, BEHIND_GUEST);
     drop(s);
 
@@ -2877,23 +2829,8 @@ fn the_missing_clock_survives_a_restart() {
     // `old` sorts after `young`, so only a surviving clock can name it.
     let old: Mac = [0x02, 0xe6, 0, 0, 0, 2];
     let young: Mac = [0x02, 0xe6, 0, 0, 0, 1];
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .lower("nic1")
-        .lower("vetha")
-        .build();
-    let pairs = vec![Pair {
-        dev: "nic1".into(),
-        bridge: "br0".into(),
-    }];
-    let mut s = Syncer::new(pairs.clone(), dir.clone());
-    s.authoritative = true;
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(4, 10, old), learned(4, 10, young)],
         vf: vec![(2, VF_ADMIN)],
@@ -2922,8 +2859,7 @@ fn the_missing_clock_survives_a_restart() {
     // The update lands, and the filter is tight. The one shed has to be
     // `old`; a process that restamped both on the way in would see a tie
     // and fall back to the addresses themselves, which names `young`.
-    let mut restarted = Syncer::new(pairs, dir.clone());
-    restarted.authoritative = true;
+    let mut restarted = br0_syncer(&dir);
     restarted.max_macs = 3;
     let mut sock4 = FakeSock {
         fdb: vec![card_holds(2, old), card_holds(2, young)],
@@ -2949,14 +2885,7 @@ fn the_missing_clock_survives_a_restart() {
 #[test]
 fn a_damaged_memory_file_is_stepped_over() {
     let dir = scratch("quiet-damaged");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     // Both go quiet, so both are written down with a clock - one line to
     // damage, one to leave alone.
     let mut aged: Vec<crate::netlink::FdbEntry> = fdb()
@@ -3026,14 +2955,7 @@ fn a_damaged_memory_file_is_stepped_over() {
 #[test]
 fn a_kept_absent_address_triggers_the_grow_refresh() {
     let dir = scratch("quiet-grow");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, sock) = registered(&dir);
 
     // Everything the first pass registered is in the card.
     let holds: Vec<crate::netlink::FdbEntry> =
@@ -3086,14 +3008,7 @@ fn a_kept_absent_address_triggers_the_grow_refresh() {
 #[test]
 fn entering_the_kept_state_buys_a_fresh_driver_question() {
     let dir = scratch("quiet-entry-ask");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, sock) = registered(&dir);
     let holds: Vec<crate::netlink::FdbEntry> =
         sock.added.iter().map(|&(_, m)| card_holds(2, m)).collect();
 
@@ -3124,14 +3039,7 @@ fn entering_the_kept_state_buys_a_fresh_driver_question() {
 #[test]
 fn a_kept_address_missing_from_the_card_is_reregistered() {
     let dir = scratch("quiet-heal");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
 
     // Aged AND absent from the card (no self entry in the dump).
     let mut sock2 = FakeSock {
@@ -3152,14 +3060,7 @@ fn a_kept_address_missing_from_the_card_is_reregistered() {
 #[test]
 fn exclusions_and_extras_outrank_the_keep() {
     let dir = scratch("quiet-exclude");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
 
     // Excluded after the fact: the keep must not override the operator.
     s.exclude.insert(BEHIND_GUEST);
@@ -3198,14 +3099,7 @@ fn an_unreadable_note_does_not_erase_the_port_memory() {
         return;
     }
     let dir = scratch("quiet-unreadable");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
 
     let note = dir.join("nic1.owned");
     fs::set_permissions(&note, fs::Permissions::from_mode(0o000)).unwrap();
@@ -3246,25 +3140,8 @@ fn the_pressure_valve_sheds_keeps_first() {
     let m1: Mac = [0x02, 0xdd, 0, 0, 0, 1];
     let m2: Mac = [0x02, 0xdd, 0, 0, 0, 2];
     let m3: Mac = [0x02, 0xdd, 0, 0, 0, 3];
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .lower("nic1")
-        .lower("vetha")
-        .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(4, 10, m1), learned(4, 10, m2), learned(4, 10, m3)],
         vf: vec![(2, VF_ADMIN)],
@@ -3299,25 +3176,8 @@ fn the_pressure_valve_sheds_the_longest_missing_first() {
     let dir = scratch("quiet-pressure-order");
     let old: Mac = [0x02, 0xde, 0, 0, 0, 2];
     let young: Mac = [0x02, 0xde, 0, 0, 0, 1];
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .lower("nic1")
-        .lower("vetha")
-        .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(4, 10, old), learned(4, 10, young)],
         vf: vec![(2, VF_ADMIN)],
@@ -3372,7 +3232,7 @@ fn a_learn_buys_the_pass_that_records() {
         .fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
+            &[(RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
         )
         .unwrap();
     assert_eq!(
@@ -3405,14 +3265,7 @@ fn the_memory_follows_the_latest_learn() {
         br.lower("vethb").build()
     };
     let topo = build(true);
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let mut s = br0_syncer(&dir);
 
     // Learnt behind vetha first, then behind vethb.
     let mut sock = FakeSock {
@@ -3478,14 +3331,7 @@ fn a_note_turning_readable_mid_pass_keeps_the_memory() {
         return;
     }
     let dir = scratch("quiet-flip");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
 
     // A parallel --once rewrote the note (same content, new inode), and
@@ -3547,14 +3393,7 @@ fn a_note_turning_readable_mid_pass_keeps_the_memory() {
 #[test]
 fn a_failed_reflection_removal_does_not_become_a_keep() {
     let dir = scratch("quiet-reflect-err");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     assert!(s.load_owned("nic1").contains(&BEHIND_GUEST));
 
     // The guest's address fails over to the wire; the reflection's removal
@@ -3569,7 +3408,7 @@ fn a_failed_reflection_removal_does_not_become_a_keep() {
     s.fast_apply(
         &mut sock2,
         &topo,
-        &[(crate::netlink::RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
+        &[(RTM_NEWNEIGH, learned(2, 10, BEHIND_GUEST))],
     )
     .unwrap();
     assert!(sock2.removed.is_empty(), "the removal really failed");
@@ -3612,14 +3451,7 @@ fn a_port_moved_to_another_bridge_ends_the_keep() {
         .lower("nic1")
         .lower("vetha")
         .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(4, 10, m)],
         vf: vec![(2, VF_ADMIN)],
@@ -3675,14 +3507,7 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
         .lower("nic1")
         .lower("nic2")
         .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(5, 10, m)],
         vf: vec![(2, VF_ADMIN)],
@@ -3727,25 +3552,8 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
 #[test]
 fn the_pressure_valve_opens_exactly_at_nine_tenths() {
     let dir = scratch("quiet-pressure-edge");
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .lower("nic1")
-        .lower("vetha")
-        .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
     // Eight learns plus the bridge's own address: want is exactly 9.
     let learns: Vec<Mac> = (1..=8u8).map(|i| [0x02, 0xe0, 0, 0, 0, i]).collect();
     let mut sock = FakeSock {
@@ -3784,25 +3592,8 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
     // name it as the one to shed.
     let old: Mac = [0x02, 0xe1, 0, 0, 0, 2];
     let young: Mac = [0x02, 0xe1, 0, 0, 0, 1];
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .lower("nic1")
-        .lower("vetha")
-        .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
     let mut sock = FakeSock {
         fdb: vec![learned(4, 10, old), learned(4, 10, young)],
         vf: vec![(2, VF_ADMIN)],
@@ -3854,14 +3645,7 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
 #[test]
 fn a_rename_carries_the_quiet_memory_along() {
     let dir = scratch("quiet-rename");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
 
     // The guest goes quiet while still called nic1.
     age_out(&mut s, &topo, BEHIND_GUEST);
@@ -3929,7 +3713,7 @@ fn dry_run_gates_the_fast_path() {
         .fast_apply(
             &mut sock,
             &topo,
-            &[(crate::netlink::RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
+            &[(RTM_NEWNEIGH, learned(13, 12, BEHIND_GUEST))],
         )
         .unwrap();
     assert!(sock.added.is_empty(), "a dry run wrote to the filter");
@@ -3957,8 +3741,12 @@ fn a_clean_check_probe_leaves_no_note_behind() {
         "the probe's note survived the check"
     );
     assert!(
-        !dir.join("nic9.index").exists(),
+        !dir.join(".nic9.owned.index").exists(),
         "the probe's index survived the check"
+    );
+    assert!(
+        !dir.join(".nic9.owned.ports").exists(),
+        "the probe's memory file survived the check"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -4020,14 +3808,7 @@ fn a_bound_sister_vf_is_excluded_by_its_netdev() {
         .lower("nic1")
         .lower("vetha")
         .build();
-    let mut s = Syncer::new(
-        vec![Pair {
-            dev: "nic1".into(),
-            bridge: "br0".into(),
-        }],
-        dir.clone(),
-    );
-    s.authoritative = true;
+    let mut s = br0_syncer(&dir);
     // The bridge learns the VF's own address behind a guest port - the
     // reflection case the exclusion set exists to refuse. The driver's
     // answer does NOT name it: no admin MAC was ever set.
@@ -4080,14 +3861,7 @@ fn a_check_probe_leaves_the_note_byte_identical() {
 #[test]
 fn an_empty_memory_leaves_no_file() {
     let dir = scratch("quiet-empty-file");
-    let topo = host(mac(1));
-    let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
-    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let (topo, mut s, _) = registered(&dir);
     let path = dir.join(".nic1.owned.ports");
     assert!(path.exists(), "the learnt addresses were not written down");
 
@@ -4110,4 +3884,112 @@ fn an_empty_memory_leaves_no_file() {
     );
     assert!(!path.exists(), "an empty memory left its file behind");
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A stamp from after now is a clock that was tampered with or a file from
+/// another boot - clamped to "missing since now", the youngest there is,
+/// not believed as ancient: ancient is the valve's FIRST victim, and a
+/// bogus stamp must not nominate one.
+#[test]
+fn a_future_stamp_is_clamped_not_believed() {
+    let dir = scratch("quiet-future-stamp");
+    let honest: Mac = [0x02, 0xe7, 0, 0, 0, 2];
+    let bogus: Mac = [0x02, 0xe7, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: vec![learned(4, 10, honest), learned(4, 10, bogus)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // `honest` goes quiet and earns a real clock; then the file is doctored
+    // so `bogus` carries a stamp from the far future.
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, honest), learned(4, 10, bogus)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    drop(s);
+    std::thread::sleep(Dur::from_millis(20));
+    let path = dir.join(".nic1.owned.ports");
+    let doctored = fs::read_to_string(&path)
+        .unwrap()
+        .replace(" -", " 18446744073709551615");
+    fs::write(&path, doctored).unwrap();
+
+    // Both quiet, room for one keep: the honest clock is older than a
+    // clamped future stamp, so `honest` is the one shed - a believed
+    // future stamp would wrap into the distant past and shed `bogus`...
+    // except the tiebreak would too. The discriminating assert is that the
+    // load itself does not panic and `bogus` is NOT shed first despite a
+    // stamp that, taken at face value, dwarfs every honest one.
+    let mut restarted = br0_syncer(&dir);
+    restarted.max_macs = 3;
+    let mut sock3 = FakeSock {
+        fdb: vec![card_holds(2, honest), card_holds(2, bogus)],
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    restarted
+        .reconcile(&mut sock3, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == honest),
+        "the honestly-oldest entry is the valve's victim"
+    );
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == bogus),
+        "a clamped future stamp must count as the youngest, not the oldest"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An idle pass writes no memory file: the lines are compared against what
+/// was last written, and a host where nothing changes must not rewrite a
+/// file per pass - the notes hold themselves to the same rule.
+#[test]
+fn an_idle_pass_leaves_the_memory_file_untouched() {
+    let dir = scratch("quiet-idle-file");
+    let (topo, mut s, _) = registered(&dir);
+    let path = dir.join(".nic1.owned.ports");
+    // Backdate, then run an unchanged pass: an untouched file keeps the
+    // old timestamp, a rewritten one comes back young.
+    let old = filetime_backdate(&path);
+    let mut sock2 = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    let meta = fs::metadata(&path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        (meta.mtime(), meta.mtime_nsec()),
+        old,
+        "an idle pass rewrote the memory file"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Set a file's mtime into the past and return what it was set to.
+fn filetime_backdate(path: &std::path::Path) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).unwrap();
+    let old = meta.mtime() - 3600;
+    let times = [
+        libc::timespec {
+            tv_sec: old,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: old,
+            tv_nsec: 0,
+        },
+    ];
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat failed");
+    (old, 0)
 }

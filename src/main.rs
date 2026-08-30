@@ -35,6 +35,22 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONF: &str = "/etc/sriov-mac-sync.conf";
 const STATE_DIR: &str = "/run/sriov-mac-sync";
 
+/// Where the notes live on THIS system.
+///
+/// `/run` is the tmpfs on every systemd platform - but OpenWrt has no
+/// `/run` at all, and creating it there puts the state on the overlay:
+/// persistent flash, worn by every note write, and a "reboot starts from
+/// nothing" story that quietly stops being true. `/var/run` is OpenWrt's
+/// spelling of the same tmpfs (a symlink into /tmp). Decided by what the
+/// system provides, not by a build flag, so one binary is right on both.
+fn state_dir() -> PathBuf {
+    if std::path::Path::new("/run").is_dir() {
+        PathBuf::from(STATE_DIR)
+    } else {
+        PathBuf::from("/var/run/sriov-mac-sync")
+    }
+}
+
 /// Ordinary progress, on stdout.
 ///
 /// Everything this daemon says used to go to stderr, which systemd timestamps
@@ -96,7 +112,7 @@ impl Default for Options {
             mode: Mode::Daemon,
             pairs: Vec::new(),
             interval: 300,
-            max_macs: 128,
+            max_macs: sync::DEFAULT_MAX_MACS,
             max_macs_set: false,
             exclude: Vec::new(),
             extra: Vec::new(),
@@ -189,6 +205,7 @@ fn usage() {
 /// defaults are written out here by hand and drifted from the code once
 /// already.
 fn usage_text() -> String {
+    use sync::DEFAULT_MAX_MACS;
     format!(
         "\
 sriov-mac-sync {VERSION} - keep an SR-IOV uplink's unicast filter in step with
@@ -207,7 +224,7 @@ usage: sriov-mac-sync [options]
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  full reconciliation interval (default 300)
   --max NUM       the filter capacity to respect: warn above it, and shed
-                  quiet keeps as the list nears it (default 128)
+                  quiet keeps as the list nears it (default {DEFAULT_MAX_MACS})
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
   -v, --verbose   explain what is skipped and why
@@ -498,7 +515,12 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
                 let Some(dev_index) = topo.index_of(dev) else {
                     return Err(format!("no such interface: {dev}"));
                 };
-                let bridge_index = topo.index_of(bridge).unwrap_or(0);
+                let Some(bridge_index) = topo.index_of(bridge) else {
+                    // Its own answer: "not a bridge" about an interface
+                    // that does not exist sends the operator checking
+                    // bridge flags instead of spelling.
+                    return Err(format!("no such interface: {bridge}"));
+                };
                 if !topo.is_bridge(bridge_index) {
                     return Err(format!("not a bridge: {bridge}"));
                 }
@@ -634,33 +656,21 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
     ok
 }
 
-fn report_changes(
-    reports: &[sync::Report],
-    dry_run: bool,
-    max_macs: usize,
-    verbose: bool,
-    trigger: &str,
-    warned_over: &mut std::collections::BTreeSet<String>,
-) {
+/// A millisecond count the way an operator reads one: seconds under two
+/// minutes, minutes under two hours, hours beyond.
+fn human_duration(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 120 {
+        format!("{s}s")
+    } else if s < 7200 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
+fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigger: &str) {
     for r in reports {
-        // Said once per stay above the limit, re-armed when it clears: an
-        // overloaded bridge buys passes at the event rate, and the same
-        // warning five times a second is how an operator learns to stop
-        // reading exactly the journal that matters.
-        if r.wanted.len() > max_macs {
-            if warned_over.insert(r.dev.clone()) {
-                eprintln!(
-                    "warning: {}: {} addresses behind {}, above the {} the vport list \
-                     is assumed to hold - some will be dropped silently",
-                    r.dev,
-                    r.wanted.len(),
-                    r.bridge,
-                    max_macs
-                );
-            }
-        } else {
-            warned_over.remove(&r.dev);
-        }
         if verbose && r.foreign > 0 {
             note!(
                 "{}: {} address(es) already present, left alone",
@@ -669,36 +679,24 @@ fn report_changes(
             );
         }
         if r.added > 0 || r.removed > 0 {
-            if dry_run && r.quiet > 0 {
+            // Composed, not branched four ways: the words stay byte for
+            // byte what the journal greps in bench/ expect.
+            let quiet = if r.quiet > 0 {
+                format!(", {} held quiet", r.quiet)
+            } else {
+                String::new()
+            };
+            if dry_run {
                 note!(
-                    "{}: would be +{} -{}, {} address(es) in total, {} held \
-                     quiet [{trigger}]",
-                    r.dev,
-                    r.added,
-                    r.removed,
-                    r.wanted.len(),
-                    r.quiet
-                );
-            } else if dry_run {
-                note!(
-                    "{}: would be +{} -{}, {} address(es) in total [{trigger}]",
+                    "{}: would be +{} -{}, {} address(es) in total{quiet} [{trigger}]",
                     r.dev,
                     r.added,
                     r.removed,
                     r.wanted.len()
                 );
-            } else if r.quiet > 0 {
-                note!(
-                    "{}: +{} -{}, {} address(es) registered, {} held quiet [{trigger}]",
-                    r.dev,
-                    r.added,
-                    r.removed,
-                    r.wanted.len(),
-                    r.quiet
-                );
             } else {
                 note!(
-                    "{}: +{} -{}, {} address(es) registered [{trigger}]",
+                    "{}: +{} -{}, {} address(es) registered{quiet} [{trigger}]",
                     r.dev,
                     r.added,
                     r.removed,
@@ -821,7 +819,19 @@ impl World for Live {
         self.mon.recv_events()
     }
     fn pause(&mut self, wait: Duration) {
-        std::thread::sleep(wait);
+        // A poll on the stop pipe rather than a sleep: SIGTERM during the
+        // wait-failure brake must not wait the brake out.
+        let Some(stop_rx) = &self.stop_rx else {
+            std::thread::sleep(wait);
+            return;
+        };
+        let mut pfd = libc::pollfd {
+            fd: stop_rx.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = wait.as_millis().min(i32::MAX as u128) as i32;
+        unsafe { libc::poll(&mut pfd, 1, millis) };
     }
     fn read_topology(&mut self) -> Result<Topology, String> {
         read_topology(&mut self.sock)
@@ -1041,13 +1051,9 @@ fn distrust_carried(picture: &mut Picture, syncer: &mut Syncer) {
 fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
     let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
     let mut picture = Picture::new();
-    // The threshold may move when a pair adopted at runtime reports its
-    // card's capacity; the operator's --max never moves.
-    let mut max_macs = opts.max_macs;
     let mut wait_failures = 0u32;
     let mut state = LoopState {
         said_empty: false,
-        warned_over: std::collections::BTreeSet::new(),
         // In autodetect mode the adoption rides on pair-set changes instead.
         capacity_pending: !opts.pairs.is_empty() && !opts.max_macs_set,
     };
@@ -1065,7 +1071,6 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
                 syncer,
                 &mut picture,
                 opts,
-                &mut max_macs,
                 schedule.trigger,
                 &mut state,
             ) {
@@ -1130,7 +1135,7 @@ fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
             &mut picture,
             &events,
             schedule.last_pass,
-            max_macs,
+            syncer.max_macs,
         ) {
             schedule.bring_forward(due, trigger);
         }
@@ -1151,7 +1156,6 @@ enum Pass {
 /// loop does.
 struct LoopState {
     said_empty: bool,
-    warned_over: std::collections::BTreeSet<String>,
     /// Whether a configured pair's card still owes its capacity answer.
     capacity_pending: bool,
 }
@@ -1161,7 +1165,6 @@ fn run_pass<W: World>(
     syncer: &mut Syncer,
     picture: &mut Picture,
     opts: &Options,
-    max_macs: &mut usize,
     trigger: &'static str,
     state: &mut LoopState,
 ) -> Pass {
@@ -1203,10 +1206,11 @@ fn run_pass<W: World>(
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
                 let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
                 let answers = world.filter_capacities(&devs);
-                if let Some(v) = adopt_reported_capacity(answers, opts.verbose, *max_macs) {
-                    *max_macs = v;
-                    // The quiet-keep's pressure valve measures against the
-                    // same limit the warnings do.
+                if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
+                    // One number, one home: the warning threshold and the
+                    // quiet-keep's pressure valve read the same field. The
+                    // operator's --max never moves - the max_macs_set gate
+                    // above is what enforces that, not a second copy.
                     syncer.max_macs = v;
                 }
             }
@@ -1219,15 +1223,20 @@ fn run_pass<W: World>(
     // assumed number for the rest of the process. Asked again on every
     // reloaded picture until a card answers; the operator's --max still
     // wins, the gate is the same one.
-    if !auto && reloaded && state.capacity_pending && !opts.max_macs_set {
+    // `capacity_pending` already implies configured pairs and no operator
+    // --max (it is initialised from exactly those two and only ever
+    // cleared), so it carries the gate alone.
+    if reloaded && state.capacity_pending {
         let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
         if !devs.is_empty() {
             let answers = world.filter_capacities(&devs);
-            if answers.iter().any(|(_, a)| matches!(a, Ok(Some(_)))) {
+            // Settled only when EVERY written-down device has answered: the
+            // first card's answer must not orphan a second, later-appearing
+            // one - possibly the smaller filter - for the process's life.
+            if answers.iter().all(|(_, a)| matches!(a, Ok(Some(_)))) {
                 state.capacity_pending = false;
             }
-            if let Some(v) = adopt_reported_capacity(answers, opts.verbose, *max_macs) {
-                *max_macs = v;
+            if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
                 syncer.max_macs = v;
             }
         }
@@ -1243,14 +1252,7 @@ fn run_pass<W: World>(
     };
     match syncer.reconcile(world, true, topo, topo_load) {
         Ok(reports) => {
-            report_changes(
-                &reports,
-                opts.dry_run,
-                *max_macs,
-                opts.verbose,
-                trigger,
-                &mut state.warned_over,
-            );
+            report_changes(&reports, opts.dry_run, opts.verbose, trigger);
             if opts.timings {
                 note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
             }
@@ -1458,21 +1460,7 @@ fn run() -> Result<bool, String> {
         }
     }
 
-    if opts.mode == Mode::Check {
-        // Saying "fine" for having skipped every pair is the one answer
-        // --check must not give.
-        if opts.dry_run {
-            return Err("--check works by writing a probe entry, which --dry-run \
-                        rules out - run it without --dry-run"
-                .into());
-        }
-        // The probe bookkeeping wants the same notes the daemon keeps -
-        // that is what makes a killed check healable at all.
-        let syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
-        return Ok(check(&mut sock, &topo, &pairs, &syncer));
-    }
-
-    let mut syncer = Syncer::new(pairs.clone(), PathBuf::from(STATE_DIR));
+    let mut syncer = Syncer::new(pairs.clone(), state_dir());
     syncer.dry_run = opts.dry_run;
     // Only autodetection sees every uplink, so only autodetection may conclude
     // that a leftover note belongs to none of them.
@@ -1517,10 +1505,22 @@ fn run() -> Result<bool, String> {
                     }
                 );
                 if opts.verbose {
+                    let ages: std::collections::BTreeMap<_, _> =
+                        r.quiet_ages.iter().copied().collect();
                     let mut wanted = r.wanted.clone();
                     wanted.sort();
                     for mac in &wanted {
-                        println!("    {}", format_mac(mac));
+                        match ages.get(mac) {
+                            // The question the 502 hunt actually asked:
+                            // which of these is a keep, and for how long
+                            // has nobody heard from it.
+                            Some(ms) => println!(
+                                "    {} (quiet, missing {})",
+                                format_mac(mac),
+                                human_duration(*ms)
+                            ),
+                            None => println!("    {}", format_mac(mac)),
+                        }
                     }
                 }
             }
@@ -1530,14 +1530,7 @@ fn run() -> Result<bool, String> {
             let reports = syncer
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
-            report_changes(
-                &reports,
-                opts.dry_run,
-                opts.max_macs,
-                opts.verbose,
-                "once",
-                &mut std::collections::BTreeSet::new(),
-            );
+            report_changes(&reports, opts.dry_run, opts.verbose, "once");
             if opts.timings {
                 note!("{}", syncer.timings.report().trim_end());
             }
@@ -1578,7 +1571,18 @@ fn run() -> Result<bool, String> {
             );
             Ok(true)
         }
-        Mode::Check => unreachable!(),
+        Mode::Check => {
+            if opts.dry_run {
+                return Err("--check works by writing a probe entry, which --dry-run \
+                            rules out - run it without --dry-run"
+                    .into());
+            }
+            // The probe bookkeeping wants the same notes the daemon keeps -
+            // that is what makes a killed check healable at all. That the
+            // syncer above also carries exclude/extra is irrelevant to the
+            // note helpers check() uses.
+            Ok(check(&mut sock, &topo, &pairs, &syncer))
+        }
     }
 }
 
@@ -1934,6 +1938,10 @@ mod tests {
                 world.topo_calls >= 2,
                 "the recovery pass believed the carried picture"
             );
+            assert!(
+                world.fdb.vf_asked >= 2,
+                "the recovery pass believed the carried VF answer"
+            );
         }
 
         /// A pair adopted at runtime brings its card's capacity with it.
@@ -2086,6 +2094,10 @@ mod tests {
                 world.topo_calls, 2,
                 "a picture from before the loss must not be believed"
             );
+            assert!(
+                world.fdb.vf_asked >= 2,
+                "a VF answer from before the loss must not be believed either"
+            );
         }
 
         /// A kernel that will not describe the interfaces is retried in
@@ -2168,8 +2180,10 @@ mod tests {
         /// from entries that should be there.
         #[test]
         fn a_filling_filter_turns_deletions_urgent() {
-            let (mut syncer, mut opts) = setup("filling", 300);
-            opts.max_macs = 1;
+            let (mut syncer, opts) = setup("filling", 300);
+            // The wiring run() does: the one capacity number lives in the
+            // syncer, where the valve and the batch heuristic read it.
+            syncer.max_macs = 1;
             // One address already on record. The file is the truth, so the
             // file is what the test writes.
             std::fs::create_dir_all(&syncer.state_dir).unwrap();
@@ -2197,14 +2211,33 @@ mod tests {
 
         /// A stop is a stop: the loop ends without unregistering anything.
         /// The registrations and the notes outliving the process is what
-        /// makes a daemon restart invisible to the guests.
+        /// makes a daemon restart invisible to the guests. There has to BE
+        /// a registration for the claim to mean anything - stopping an
+        /// empty world proved only that nothing removes nothing.
         #[test]
         fn stopping_leaves_every_registration_in_place() {
             let (mut syncer, opts) = setup("stop", 300);
-            let mut world = FakeWorld::new(0);
+            let guest = [0x02u8, 0, 0, 0, 0, 0x71];
+            let mut world = FakeWorld::new(4).at(
+                1,
+                Ok(Events {
+                    fdb: vec![(RTM_NEWNEIGH, learned(3, 10, guest))],
+                    ..Default::default()
+                }),
+            );
+            world.fdb.fdb = vec![learned(3, 10, guest)];
             daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(world.passes.is_empty());
+            assert!(
+                world.fdb.added.iter().any(|(_, m)| *m == guest),
+                "the fixture never registered anything to leave in place"
+            );
             assert!(world.fdb.removed.is_empty(), "a stop must not flush");
+            assert!(
+                std::fs::read_to_string(syncer.state_dir.join("nic1.owned"))
+                    .unwrap_or_default()
+                    .contains("02:00:00:00:00:71"),
+                "the note has to survive the stop"
+            );
         }
     }
 
@@ -2553,7 +2586,7 @@ mod tests {
         for (spec, names) in [
             ("nic1", "malformed"),
             ("ghost:br0", "no such interface"),
-            ("nic1:ghost", "not a bridge"),
+            ("nic1:ghost", "no such interface"),
             ("nic1:nic2", "not a bridge"),
             ("br0:br0", "its own uplink"),
             ("nic2:br0", "not enslaved"),

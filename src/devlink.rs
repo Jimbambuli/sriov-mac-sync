@@ -38,18 +38,19 @@ const DEVLINK_ATTR_PARAM_NAME: u16 = 81;
 const DEVLINK_ATTR_PARAM_VALUES_LIST: u16 = 84;
 const DEVLINK_ATTR_PARAM_VALUE: u16 = 85;
 const DEVLINK_ATTR_PARAM_VALUE_DATA: u16 = 86;
-const DEVLINK_ATTR_PARAM_VALUE_CMODE: u16 = 87;
+#[cfg(test)]
+const DEVLINK_ATTR_PARAM_VALUE_CMODE: u16 = 87; // the tests still emit it, as the kernel does
 
 const MAX_MACS: &str = "max_macs";
 
-/// A capacity as one device reported it, with the mode it applies in. A
-/// parameter can be offered several times - what is in effect now, what the
-/// driver would start with, what is burnt in - and the lowest number wins,
-/// because it is the one a filter can actually be pushed past.
+/// A capacity as one device reported it. A parameter can be offered
+/// several times - what is in effect now, what the driver would start
+/// with, what is burnt in - and the lowest number wins, because it is the
+/// one a filter can actually be pushed past. Which mode said it does not
+/// matter for that: only the value is ever read out.
 struct Reported {
     bus: String,
     dev: String,
-    cmode: u8,
     value: u32,
 }
 
@@ -163,29 +164,24 @@ fn collect_param(payload: &[u8], out: &mut Vec<Reported>) {
         if kind != DEVLINK_ATTR_PARAM_VALUE {
             continue;
         }
-        let (mut number, mut cmode) = (None, u8::MAX);
+        let mut number = None;
         for (vkind, vvalue) in attrs(value) {
-            match vkind {
-                // Read by length rather than by the declared type: the type
-                // enum has been renumbered in the kernel's history and this
-                // parameter is a number in every version of it.
-                DEVLINK_ATTR_PARAM_VALUE_DATA => {
-                    number = match vvalue.len() {
-                        1 => Some(vvalue[0] as u32),
-                        2 => Some(u16::from_ne_bytes(vvalue[..2].try_into().unwrap()) as u32),
-                        4 => Some(u32::from_ne_bytes(vvalue[..4].try_into().unwrap())),
-                        _ => None,
-                    }
+            // Read by length rather than by the declared type: the type
+            // enum has been renumbered in the kernel's history and this
+            // parameter is a number in every version of it.
+            if vkind == DEVLINK_ATTR_PARAM_VALUE_DATA {
+                number = match vvalue.len() {
+                    1 => Some(vvalue[0] as u32),
+                    2 => Some(u16::from_ne_bytes(vvalue[..2].try_into().unwrap()) as u32),
+                    4 => Some(u32::from_ne_bytes(vvalue[..4].try_into().unwrap())),
+                    _ => None,
                 }
-                DEVLINK_ATTR_PARAM_VALUE_CMODE if !vvalue.is_empty() => cmode = vvalue[0],
-                _ => {}
             }
         }
         if let Some(value) = number {
             out.push(Reported {
                 bus: bus.clone(),
                 dev: dev.clone(),
-                cmode,
                 value,
             });
         }
@@ -247,7 +243,7 @@ impl Capacities {
                 .reported
                 .iter()
                 .filter(|r| r.bus == "pci" && &r.dev == pci)
-                .min_by_key(|r| (r.value, r.cmode))
+                .min_by_key(|r| r.value)
                 .map(|r| r.value);
             if best.is_some() {
                 return best;
@@ -325,7 +321,6 @@ mod tests {
         assert_eq!(out[0].bus, "pci");
         assert_eq!(out[0].dev, "0000:01:00.1");
         assert_eq!(out[0].value, 128);
-        assert_eq!(out[0].cmode, 1);
     }
 
     /// The dump carries every parameter of every device - `enable_roce`,

@@ -304,65 +304,21 @@ fn excluded_addresses_stay_out() {
     assert!(want.contains(&BEHIND_NIC));
 }
 
-/// A dual-port card that shares one PCI function across its ports shows a PF
-/// netdev per port, and each reports only its own port's VF addresses. A VF
-/// handed to a guest can sit on the other port than the uplink, so its admin
-/// address arrives keyed to the other port's PF. It must still be excluded:
-/// resolving the uplink to a single PF once left it out, and the daemon then
-/// registered the guest's own address and sent its traffic past it. Observed
-/// on an mlx4 ConnectX-3 as trial scenario S6.
-#[test]
-fn a_sibling_vf_on_the_shared_functions_other_port_is_excluded() {
-    // pf0 and pf1 are two netdevs of one function; the uplink VF sits on pf0's
-    // port and names both as its function. The guest VF's address is reported
-    // under pf1 - the port a single-PF resolution of the uplink would miss.
-    const SIBLING: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x99];
-    let topo = Builder::new()
-        .add("pf0", 100, Some(mac(0x50)))
-        .vfs(2)
-        .add("pf1", 101, Some(mac(0x51)))
-        .vfs(2)
-        .add("pf0v0", 110, Some(mac(0x60)))
-        .master("br0")
-        .pf_netdevs(&["pf0", "pf1"])
-        .add("br0", 120, Some(mac(0xaa)))
-        .bridge()
-        .lower("pf0v0")
-        .lower("tap0")
-        .add("tap0", 121, Some(mac(0xa0)))
-        .master("br0")
-        .build();
-    let p = Pair {
-        dev: "pf0v0".into(),
-        bridge: "br0".into(),
-    };
-    // Both addresses are learnt behind the bridge on the tap, not on the
-    // uplink's own wire side: one is the misplaced guest VF, one a real guest.
-    let entries = vec![learned(121, 120, SIBLING), learned(121, 120, BEHIND_GUEST)];
-    let (want, _, _) = desired_named(
-        &syncer(),
-        &topo,
-        &p,
-        "pf0v0",
-        &entries,
-        &[(101, SIBLING)], // keyed to pf1, the uplink's other-port PF
-    );
-    assert!(
-        !want.contains(&SIBLING),
-        "a sibling VF on the shared function's other port must be excluded"
-    );
-    assert!(
-        want.contains(&BEHIND_GUEST),
-        "a genuine local guest is still registered"
-    );
-}
-
-/// Two ports was the example, not the rule: the same shared function may
-/// carry four. The sibling's address is reported under the LAST port here,
-/// so anything that asks fewer than all of them lets it through.
+/// A card that shares one PCI function across its ports shows a PF netdev
+/// per port, and each reports only its own port's VF addresses - so a
+/// guest's VF can sit on another port than the uplink, and its admin
+/// address arrives keyed to that other port's PF. Resolving the uplink to
+/// a single PF once left exactly that address out, and the daemon
+/// registered the guest's own address and sent its traffic past it -
+/// observed on an mlx4 ConnectX-3 as trial scenario S6, with two ports.
+/// Four ports here, because two was the example and not the rule: one
+/// sibling answers under the FIRST port and one under the LAST, so a walk
+/// that asks any subset - only-first and only-last alike - lets one
+/// through.
 #[test]
 fn a_sibling_vf_is_excluded_across_all_four_ports_of_a_function() {
     const SIBLING: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x77];
+    const FIRSTLING: Mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x78];
     let topo = Builder::new()
         .add("pf0", 100, Some(mac(0x50)))
         .vfs(4)
@@ -386,14 +342,23 @@ fn a_sibling_vf_is_excluded_across_all_four_ports_of_a_function() {
         dev: "pf0v0".into(),
         bridge: "br0".into(),
     };
-    let entries = vec![learned(121, 120, SIBLING), learned(121, 120, BEHIND_GUEST)];
+    let entries = vec![
+        learned(121, 120, SIBLING),
+        learned(121, 120, FIRSTLING),
+        learned(121, 120, BEHIND_GUEST),
+    ];
     let (want, _, _) = desired_named(
         &syncer(),
         &topo,
         &p,
         "pf0v0",
         &entries,
-        &[(103, SIBLING)], // keyed to pf3, the fourth port
+        // One keyed to pf0, the first port, one to pf3, the fourth.
+        &[(100, FIRSTLING), (103, SIBLING)],
+    );
+    assert!(
+        !want.contains(&FIRSTLING),
+        "a sibling on the first port of the function must be excluded"
     );
     assert!(
         !want.contains(&SIBLING),
