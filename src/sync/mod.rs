@@ -843,7 +843,16 @@ impl Syncer {
         if self.ports_written.get(dev) == Some(&lines) {
             return;
         }
-        self.locked(dev, || self.write_ports(dev, &lines));
+        // Nothing to remember is no file: an uplink with no quiet addresses
+        // would otherwise keep an empty one around for the next process to
+        // read nothing out of.
+        if lines.is_empty() {
+            self.locked(dev, || {
+                let _ = fs::remove_file(self.ports_path(dev));
+            });
+        } else {
+            self.locked(dev, || self.write_ports(dev, &lines));
+        }
         self.ports_written.insert(dev.to_string(), lines);
     }
 

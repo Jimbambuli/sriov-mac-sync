@@ -4073,3 +4073,41 @@ fn a_check_probe_leaves_the_note_byte_identical() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// An uplink with nothing to remember keeps no file around. The first
+/// pass on a quiet host used to leave an empty one per uplink, for the
+/// next process to read nothing out of.
+#[test]
+fn an_empty_memory_leaves_no_file() {
+    let dir = scratch("quiet-empty-file");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = FakeSock {
+        fdb: fdb(),
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let path = dir.join(".nic1.owned.ports");
+    assert!(path.exists(), "the learnt addresses were not written down");
+
+    // Everything moves out onto the wire: nothing is owned, nothing is
+    // remembered, and the file goes with it.
+    let wire: Vec<crate::netlink::FdbEntry> = fdb()
+        .into_iter()
+        .filter(|e| !e.is_self())
+        .map(|e| learned(2, 10, e.mac))
+        .collect();
+    let mut sock2 = FakeSock {
+        fdb: wire,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        s.load_owned("nic1").is_empty(),
+        "the fixture did not end up owning nothing"
+    );
+    assert!(!path.exists(), "an empty memory left its file behind");
+    let _ = fs::remove_dir_all(&dir);
+}
