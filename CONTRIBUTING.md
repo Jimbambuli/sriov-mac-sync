@@ -102,3 +102,10 @@ The order matters, and every step has a reason it is where it is.
    `.deb`. Copying the bare binary over a package-managed path leaves
    `dpkg -V` reporting a modified file, and the next `apt` upgrade silently
    reverts it.
+
+If the release moves `PORTS_FORMAT` — the first line of the quiet-keep memory
+file, `sriov-mac-sync ports N` — say so in the release notes. A file the new
+build does not recognise is no memory at all, which is deliberate: reading old
+stamps under new rules is worse than starting again. The visible effect is that
+the first restart on each node re-learns its keeps, so a guest that was silent
+across exactly that window loses its entry until it speaks.

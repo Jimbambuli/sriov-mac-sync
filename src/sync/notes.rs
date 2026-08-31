@@ -335,7 +335,8 @@ impl Syncer {
                 _ => false,
             };
             if self.note_is_readable(dev) && steady {
-                self.remember(dev, &set);
+                // `after` is Some here: `steady` cannot be true otherwise.
+                self.remember(dev, &set, after.as_ref());
             } else if self.note_is_readable(dev) {
                 // Readable, but it moved while we read it. The set is
                 // whatever we got; the next look reads again rather than
@@ -385,12 +386,30 @@ impl Syncer {
 
     /// Note what was just read or written, together with what the file looks
     /// like now, so the next read can be a stat.
-    pub(super) fn remember(&self, dev: &str, set: &Set<Mac>) {
-        let Ok(meta) = fs::metadata(self.state_path(dev)) else {
-            // No file: nothing to recognise later. Forget any older copy
-            // rather than keep one that describes a file that is gone.
-            self.notes.borrow_mut().remove(dev);
-            return;
+    ///
+    /// `meta` is what the caller already knows the file to be. `with_owned`
+    /// passes the stat it took *after* the read and proved identical to the
+    /// one before it: taking a third, later stat here would cache old
+    /// contents under a newer file's identity, which is the very window the
+    /// read-steadiness check was added to close. Callers that have just
+    /// written the file pass `None` and let this look.
+    pub(super) fn remember(&self, dev: &str, set: &Set<Mac>, meta: Option<&fs::Metadata>) {
+        let looked;
+        let meta = match meta {
+            Some(m) => m,
+            None => {
+                looked = fs::metadata(self.state_path(dev)).ok();
+                match &looked {
+                    Some(m) => m,
+                    None => {
+                        // No file: nothing to recognise later. Forget any
+                        // older copy rather than keep one that describes a
+                        // file that is gone.
+                        self.notes.borrow_mut().remove(dev);
+                        return;
+                    }
+                }
+            }
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -555,6 +574,11 @@ impl Syncer {
     /// Write the note as the difference this caller made, not as the set it
     /// started from: whatever else has been added meanwhile stays.
     pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) {
+        // No caller reaches this today: the one production call site is
+        // gated on the owned set having changed, which a dry run cannot
+        // make happen. It stays because "a dry run writes nothing" is a
+        // promise to the operator, and the cost of keeping the last line
+        // of that promise where the writing happens is one comparison.
         if self.dry_run {
             return;
         }
@@ -622,6 +646,11 @@ impl Syncer {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
+                // Never through a symlink. `ensure_state_dir` narrows a
+                // state directory it finds group- or world-writable, but
+                // it cannot remove what was planted there before that
+                // first narrowing - and this daemon writes as root.
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(tmp)?
                 .write_all(text.as_bytes())
         };
@@ -630,11 +659,19 @@ impl Syncer {
             // asking for it on every write was a syscall per write for a
             // thing that is already there.
             if e.kind() != io::ErrorKind::NotFound {
+                let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
             self.ensure_state_dir()?;
-            put(&tmp)?;
+            if let Err(e) = put(&tmp) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
+        // Both error paths take the temporary with them, not just this
+        // one: a failed write left a half-written `.<dev>.owned.<pid>.tmp`
+        // lying in the state directory, where the next reader has to guess
+        // what it is.
         fs::rename(&tmp, dest).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             e
@@ -708,7 +745,7 @@ impl Syncer {
         // file, hidden pid-carrying name, 0600 - lives on put_file.
         match self.put_file(&self.state_path(dev), &text) {
             Ok(()) => {
-                self.remember(dev, set);
+                self.remember(dev, set, None);
                 true
             }
             Err(e) => {
@@ -738,6 +775,9 @@ impl Syncer {
     /// written, is in the file before the entry it names is anybody's to
     /// remove.
     pub(super) fn append_owned(&self, dev: &str, added: &[Mac]) -> bool {
+        // The dry-run half is unreachable as the modes stand - `--check`
+        // is the only reader that could get here and it refuses
+        // `--dry-run` - and stays for the reason `save_owned_merged` gives.
         if self.dry_run || added.is_empty() {
             return true;
         }
@@ -782,6 +822,8 @@ impl Syncer {
         let path = self.state_path(dev);
         let opened = fs::OpenOptions::new()
             .append(true)
+            // Never through a symlink, for the reason `put_file` gives.
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .or_else(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -790,6 +832,7 @@ impl Syncer {
                         .create(true)
                         .append(true)
                         .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW)
                         .open(&path)
                 } else {
                     Err(e)
@@ -806,7 +849,7 @@ impl Syncer {
             Ok(()) => {
                 let expected = was.map(|w| w + text.len() as u64);
                 set.extend(fresh.iter().copied());
-                self.remember(dev, &set);
+                self.remember(dev, &set, None);
                 let agrees = match (expected, self.notes.borrow().get(dev)) {
                     (Some(want), Some(now)) => now.len == want,
                     // Nothing was remembered, so there is nothing to check

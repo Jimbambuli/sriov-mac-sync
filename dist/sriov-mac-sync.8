@@ -58,7 +58,13 @@ Test whether the uplink accepts unicast filter entries at all. This only proves
 that the kernel took the entry; whether the card acts on it is a property of the
 driver and cannot be asked. See
 .B VERIFYING
-below.
+below. Unlike
+.B \-\-dry\-run
+and
+.BR \-\-status ,
+this writes: it puts a real unicast entry into the live card and takes it out
+again, and it leaves an ownership note behind. A take\-back that fails is
+reported, and the entry then stays until it is removed by hand.
 .TP
 .B \-\-flush
 Remove every address this daemon registered. A plain stop deliberately leaves
@@ -99,7 +105,17 @@ wire\-side and own\-address rules still override this.
 Explain what is skipped and why. With
 .B \-\-status
 it also lists every wanted address, marking the ones held through a silence
-with how long each has been silent.
+with how long each has been silent:
+.PP
+.EX
+    02:aa:bb:cc:dd:01 (quiet, silent 12m)
+    02:aa:bb:cc:dd:02
+.EE
+.PP
+A reported silence can be up to one bridge ageing time longer than anything
+this program itself witnessed: when the bridge announces that it has forgotten
+an address, it forgot it exactly one ageing time after the last frame, and that
+is taken as the better answer.
 .TP
 .BR \-h ", " \-\-help
 Print the usage text.
@@ -162,7 +178,9 @@ Optional configuration.
 One note per uplink, recording which entries are this daemon's - written before
 the entry is, so a crash cannot leave an entry nobody owns. Beside each note,
 a record of the uplink's interface index, so the note can follow a renamed
-interface, and the quiet\-keep memory
+interface, a lock file
+.RI ( . DEV .owned.lock )
+that is created empty and stays behind between writes, and the quiet\-keep memory
 .RI ( .DEV .owned.ports ):
 one line per owned address \(em live ones included \(em naming the port it was
 learnt behind and when the bridge was last seen holding it, so an update hands

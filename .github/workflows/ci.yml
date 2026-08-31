@@ -90,6 +90,16 @@ jobs:
           /tmp/apk-tools/build/src/apk --version
       - name: Build the artefacts
         run: APK=/tmp/apk-tools/build/src/apk ./dist/package.sh
+      - name: The shell we ship is checked
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -qq -y shellcheck
+          # Three scripts that run as root on other people's machines. The
+          # quoting and word-splitting class of bug is exactly what this
+          # catches, and package.sh already carried a hand-added disable
+          # comment - somebody ran it once and nothing kept it clean.
+          shellcheck -S warning dist/package.sh bench/integration.sh \
+            dist/openwrt/sriov-mac-sync.init
+
       - name: Both binaries are static
         run: |
           # readelf, not ldd: an x86 ldd prints no "=>" line for an aarch64
@@ -135,12 +145,32 @@ jobs:
           grep -q "not flushing" /tmp/debctl/prerm \
             || (echo ".deb prerm flushes without checking the daemon is down" && exit 1)
           systemctl is-active sriov-mac-sync || echo "(not running here, fine)"
+          # And the same for the .deb: the control file's Architecture
+          # against the ELF machine of the binary it carries.
+          debarch=$(dpkg-deb -f dist/out/sriov-mac-sync_amd64.deb Architecture)
+          dpkg-deb --fsys-tarfile dist/out/sriov-mac-sync_amd64.deb \
+            | tar xOf - ./usr/sbin/sriov-mac-sync > /tmp/debbin
+          debmachine=$(readelf -h /tmp/debbin | sed -n 's/.*Machine: *//p')
+          case "$debarch:$debmachine" in
+            amd64:*X86-64*|arm64:*AArch64*) ;;
+            *) echo ".deb declares $debarch but carries a $debmachine binary"; exit 1 ;;
+          esac
           # The upgrade path the quiet-keep memory exists for: installing
           # the same .deb again runs old-prerm "upgrade" + postinst with
           # $2 set - the state directory must survive it and the unit must
           # come back enabled.
           sudo touch /run/sriov-mac-sync/canary
+          # The whole reason the postinst exists: `start` on a running unit
+          # is a no-op, so an upgrade without a restart leaves the OLD
+          # binary running until reboot. The process id either side says
+          # whether it really came back on the new one. Only when it was
+          # running at all - a runner under policy-rc.d may have none.
+          before=$(systemctl show -p MainPID --value sriov-mac-sync)
           sudo dpkg -i dist/out/sriov-mac-sync_amd64.deb
+          after=$(systemctl show -p MainPID --value sriov-mac-sync)
+          if [ "$before" != 0 ] && [ "$before" = "$after" ]; then
+            echo "the upgrade did not restart the daemon (pid $before)"; exit 1
+          fi
           # sudo, because the state directory is 0700 root - an
           # unprivileged test -e reads "denied" as "gone" and cried wolf.
           if ! sudo test -e /run/sriov-mac-sync/canary; then
@@ -183,6 +213,18 @@ jobs:
             # An upgrade must not start a daemon the operator stopped.
             ar p "$f" control.tar.gz | tar xzOf - ./postinst | grep -q "left stopped" \
               || (echo "$f: postinst restarts unconditionally on upgrade" && exit 1)
+            # The binary inside has to be the architecture the control file
+            # declares. A transposed suffix in package.sh's argument lists
+            # would ship the x86_64 binary as aarch64_generic, and the
+            # audience runs routers, where that is a brick.
+            arch=$(ar p "$f" control.tar.gz | tar xzOf - ./control \
+              | sed -n 's/^Architecture: //p')
+            ar p "$f" data.tar.gz | tar xzOf - ./usr/sbin/sriov-mac-sync > /tmp/pkgbin
+            machine=$(readelf -h /tmp/pkgbin | sed -n 's/.*Machine: *//p')
+            case "$arch:$machine" in
+              x86_64:*X86-64*|aarch64_generic:*AArch64*) ;;
+              *) echo "$f: declares $arch but carries a $machine binary"; exit 1 ;;
+            esac
           done
       - name: The .apk is one OpenWrt would take
         run: |

@@ -59,11 +59,22 @@ check_soon() {
 # address does not, and `bridge fdb show dev X self` prints both.
 has_self() { $NS bridge fdb show dev veth-up | grep "$1" | grep -q self; }
 
+# Up and listening, said by the daemon itself rather than guessed at: it
+# prints what it is watching once its first pass is done, and everything a
+# scenario does afterwards depends on that having happened.
+wait_ready() {
+  for _ in $(seq 1 50); do
+    grep -q "watching" "$1" && return 0
+    sleep 0.1
+  done
+  echo "   note: the daemon never said what it was watching" >&2
+}
+
 # A scenario daemon on the shared pair, logging to the named file.
 start_daemon() {
   $NS "$BIN" --pair veth-up:br0 --interval 1 >"$1" 2>&1 &
   DPID=$!
-  sleep 1
+  wait_ready "$1"
 }
 
 # Re-create the guest port and M1's registration for whatever follows a
@@ -155,8 +166,9 @@ $NS ip link set br0 type bridge stp_state 0
 # readings in a row, or two seconds, whichever comes first; a table still
 # moving after two seconds is reported rather than silently tested on.
 settle_fdb() {
-  local last="" now="" same=0 i
-  for i in $(seq 1 20); do
+  local last="" now="" same=0 tries=0
+  while [ "$tries" -lt 20 ]; do
+    tries=$((tries + 1))
     now=$($NS bridge fdb show br br0)
     if [ "$now" = "$last" ]; then
       same=$((same + 1))
@@ -206,18 +218,16 @@ check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 say "S4: the daemon's fast path registers within seconds"
 $NS "$BIN" --pair veth-up:br0 >/tmp/sms-it-s4.log 2>&1 &
 DPID=$!
-sleep 1
+wait_ready /tmp/sms-it-s4.log
 $NS bridge fdb replace $M2 dev veth-g1 master dynamic
-sleep 2
-check "M2 in the filter (fast path)" "has_self $M2"
-check "M2 in the note" "grep -q $M2 $STATE/veth-up.owned"
+check_soon "M2 in the filter (fast path)" "has_self $M2"
+check_soon "M2 in the note" "grep -q $M2 $STATE/veth-up.owned"
 
 say "S5: an address that moves out onto the wire is unregistered"
 $NS bridge fdb replace $M2 dev veth-up master dynamic
-sleep 2
-check "M2 self entry removed" "! has_self $M2"
-check "M2 out of the note" "! grep -q $M2 $STATE/veth-up.owned"
-check "reflection line in the log" "grep -q 'reflection' /tmp/sms-it-s4.log"
+check_soon "M2 self entry removed" "! has_self $M2"
+check_soon "M2 out of the note" "! grep -q $M2 $STATE/veth-up.owned"
+check_soon "reflection line in the log" "grep -q 'reflection' /tmp/sms-it-s4.log"
 
 say "S6: SIGTERM stops the daemon promptly and the notes survive"
 kill -TERM $DPID
@@ -241,15 +251,13 @@ check "parting line" "grep -qi 'left registered' /tmp/sms-it-s4.log"
 say "S6b: a short-interval daemon repairs what happened behind its back"
 $NS "$BIN" --pair veth-up:br0 --interval 1 --timings >/tmp/sms-it-s6b.log 2>&1 &
 DPID=$!
-sleep 1
-check "the restart pass calls itself [start]" "grep -q 'pass \[start\]' /tmp/sms-it-s6b.log"
+check_soon "the restart pass calls itself [start]" "grep -q 'pass \[start\]' /tmp/sms-it-s6b.log"
 # Removed by hand, behind the daemon's back. The deletion notification may
 # buy a prompt pass, the 1-second refresh certainly follows - either way
 # the entry has to come back without anyone asking.
 $NS bridge fdb del $M1 dev veth-up self permanent
-sleep 2.5
-check "M1 restored" "has_self $M1"
-check "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
+check_soon "M1 restored" "has_self $M1"
+check_soon "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
 stop_daemon
 
 say "S6c: a quiet guest outlives the bridge's ageing while its port does"
@@ -259,18 +267,21 @@ say "S6c: a quiet guest outlives the bridge's ageing while its port does"
 # physical-port arm on the fixture instead.
 start_daemon /tmp/sms-it-s6c.log
 $NS bridge fdb replace $M2 dev veth-g1 master dynamic
-sleep 2
-check "M2 registered while learnt" "has_self $M2"
+check_soon "M2 registered while learnt" "has_self $M2"
 # The bridge forgets - the kernel announces it exactly as ageing does -
 # while veth-g1 lives on. The keep must hold the entry.
+KEPT_BEFORE=$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6c.log || true)
 $NS bridge fdb del $M2 dev veth-g1 master
-sleep 3
+# Waited on the daemon's own account of having dealt with THIS deletion,
+# not on a guess at how long that takes and not on a line an earlier
+# scenario left in the log: the entry surviving is only worth asserting
+# once the pass that could have removed it has run.
+check_soon "the keep is said" \
+  "[ \"\$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6c.log)\" -gt $KEPT_BEFORE ]"
 check "M2 kept after ageing (port lives)" "has_self $M2"
-check "the keep is said" "grep -q 'kept \[quiet\]' /tmp/sms-it-s6c.log"
 # The guest actually stops: the veth goes, and the entry must follow.
 $NS ip link del veth-g1
-sleep 3
-check "M2 gone once its port is" "! has_self $M2"
+check_soon "M2 gone once its port is" "! has_self $M2"
 stop_daemon
 restore_guest_port
 
@@ -287,23 +298,26 @@ BASE=$($NS "$BIN" --status --pair veth-up:br0 | awk '/registered by us/ {print $
 MAX=$((BASE + 2 + 4))  # allowed = MAX - headroom(4) = BASE + 2
 $NS "$BIN" --pair veth-up:br0 --interval 1 --max $MAX >/tmp/sms-it-s6f.log 2>&1 &
 DPID=$!
-sleep 1
+wait_ready /tmp/sms-it-s6f.log
 $NS bridge fdb replace $M7 dev veth-g1 master dynamic
 sleep 1
 $NS bridge fdb replace $M8 dev veth-g1 master dynamic
-sleep 2
-check "both registered while learnt" "has_self $M7 && has_self $M8"
-# M7 goes quiet first, M8 a moment later: M7 is the older keep.
+check_soon "both registered while learnt" "has_self $M7 && has_self $M8"
+# M7 goes quiet first, M8 a moment later: M7 is the older keep. Each is
+# announced by the pass that notices it, so the wait is for two more
+# announcements than the log already had.
+KEPT_BEFORE=$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6f.log || true)
 $NS bridge fdb del $M7 dev veth-g1 master
-sleep 2
+check_soon "M7's silence is noticed" \
+  "[ \"\$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6f.log)\" -gt $KEPT_BEFORE ]"
 $NS bridge fdb del $M8 dev veth-g1 master
-sleep 2
+check_soon "M8's silence is noticed" \
+  "[ \"\$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6f.log)\" -gt $((KEPT_BEFORE + 1)) ]"
 check "both kept while their port lives" "has_self $M7 && has_self $M8"
-# A third guest speaks. There is no room: the longest-missing keep pays.
+# A third guest speaks. There is no room: the longest-silent keep pays.
 $NS bridge fdb replace $M9 dev veth-g1 master dynamic
-sleep 2
 check_soon "the newcomer got its slot" "has_self $M9"
-check_soon "the longest-missing keep paid for it" "! has_self $M7"
+check_soon "the longest-silent keep paid for it" "! has_self $M7"
 check "the younger keep was left alone" "has_self $M8"
 check_soon "the release is said" "grep -q 'released .* \[pressure\]' /tmp/sms-it-s6f.log"
 check "the limit was derived, not guessed" "[ \"$BASE\" -ge 1 ]"
@@ -321,22 +335,49 @@ say "S6e: an update hands the keeps to the next process"
 start_daemon /tmp/sms-it-s6e.log
 M6="02:be:5c:00:00:66"
 $NS bridge fdb replace $M6 dev veth-g1 master dynamic
-sleep 2
-check "M6 registered while learnt" "has_self $M6"
+check_soon "M6 registered while learnt" "has_self $M6"
 # It ages out, and is kept.
 $NS bridge fdb del $M6 dev veth-g1 master
-sleep 3
+# The handover is the memory file, so the wait is for this process to have
+# really written M6 into it - what the next one reads there is the whole
+# point of the scenario, and a log line about some other address is not it.
+check_soon "M6 is in the handover file" "grep -q $M6 $STATE/.veth-up.owned.ports"
 check "M6 kept while its port lives" "has_self $M6"
 # The update: stop, start again, and let the new process run a full pass.
 stop_daemon
 start_daemon /tmp/sms-it-s6e2.log
-sleep 3
+check_soon "the takeover is said" "grep -q 'took over' /tmp/sms-it-s6e2.log"
+# And on the keep decision itself having been made - the takeover line is
+# printed as the pass begins, and it is the pass that could unregister M6.
+# Not on a pass REPORT: a pass that changed nothing prints none.
+check_soon "the new process made its keep decision" \
+  "grep -q 'kept \[quiet\]' /tmp/sms-it-s6e2.log"
 check "M6 survived the restart" "has_self $M6"
-check "the takeover is said" "grep -q 'took over' /tmp/sms-it-s6e2.log"
 # And the memory is still live in the new process: the port going still ends it.
 $NS ip link del veth-g1
-sleep 3
-check "M6 gone once its port is" "! has_self $M6"
+check_soon "M6 gone once its port is" "! has_self $M6"
+stop_daemon
+restore_guest_port
+
+say "S6g: a memory file this build does not recognise is no memory"
+# Both harnesses otherwise only ever hand the daemon a file the same binary
+# wrote. The first line says what the numbers mean, and a build that does
+# not know the format has to fall back to what every build before the file
+# existed did - keep nothing - rather than read the stamps as something
+# else.
+start_daemon /tmp/sms-it-s6g.log
+MG="02:be:5c:00:00:67"
+$NS bridge fdb replace $MG dev veth-g1 master dynamic
+check_soon "the guest is registered" "has_self $MG"
+$NS bridge fdb del $MG dev veth-g1 master
+check_soon "it is in the handover file" "grep -q $MG $STATE/.veth-up.owned.ports"
+stop_daemon
+# A file from a future format. Nothing else about it changes.
+sed -i "1s/.*/sriov-mac-sync ports 99/" $STATE/.veth-up.owned.ports
+start_daemon /tmp/sms-it-s6g2.log
+check_soon "the pass ran" "grep -q 'registered' /tmp/sms-it-s6g2.log"
+check "no takeover was claimed" "! grep -q 'took over' /tmp/sms-it-s6g2.log"
+check_soon "the unrecognised memory kept nothing" "! has_self $MG"
 stop_daemon
 restore_guest_port
 

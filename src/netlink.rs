@@ -1148,14 +1148,24 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                 let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
                 out.name = String::from_utf8_lossy(&value[..end]).into_owned();
             }
+            // The length guard is the whole of the check, and what follows
+            // it cannot fail. Written with `?` it could nevertheless
+            // abandon the WHOLE interface over one attribute - and an
+            // interface that fell out of the reading takes its physical
+            // function with it, which loses the exclusion set its virtual
+            // functions' addresses: the worst direction this program has.
+            // So the conversion is spelled the way the ageing time next
+            // door is, where a bad attribute costs that attribute.
             IFLA_ADDRESS if value.len() == 6 => {
-                out.mac = Some(value.try_into().ok()?);
+                let mut m = [0u8; 6];
+                m.copy_from_slice(&value[..6]);
+                out.mac = Some(m);
             }
             IFLA_MASTER if value.len() >= 4 => {
-                out.master = Some(u32::from_ne_bytes(value[..4].try_into().ok()?));
+                out.master = Some(u32::from_ne_bytes([value[0], value[1], value[2], value[3]]));
             }
             IFLA_LINK if value.len() >= 4 => {
-                let i = u32::from_ne_bytes(value[..4].try_into().ok()?);
+                let i = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 if i != 0 {
                     out.link = Some(i);
                 }
@@ -1181,7 +1191,7 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                             for (inner, iv) in attrs(v) {
                                 if inner == IFLA_BR_AGEING_TIME && iv.len() >= 4 {
                                     out.ageing =
-                                        Some(u32::from_ne_bytes(iv[..4].try_into().unwrap()));
+                                        Some(u32::from_ne_bytes([iv[0], iv[1], iv[2], iv[3]]));
                                 }
                             }
                         }

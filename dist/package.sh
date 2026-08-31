@@ -208,7 +208,7 @@ ipk() {     # arch-suffix opkg-arch
 	root=$(mktemp -d)
 	TMPROOTS="$TMPROOTS $root"
 	chmod 755 "$root"
-	mkdir -p "$root/data/usr/sbin" "$root/data/etc/init.d" "$root/data/etc" "$root/control"
+	mkdir -p "$root/data/usr/sbin" "$root/data/etc/init.d" "$root/control"
 
 	install -m 755 "$OUT/sriov-mac-sync-$1" "$root/data/usr/sbin/sriov-mac-sync"
 	install -m 755 dist/openwrt/sriov-mac-sync.init "$root/data/etc/init.d/sriov-mac-sync"

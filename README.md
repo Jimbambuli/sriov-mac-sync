@@ -84,7 +84,10 @@ sriov-mac-sync --status             what is detected, wanted and registered
 
 If `--check` passes and `--dry-run` names the addresses you expected, enable the
 unit. `--check` only proves the *kernel* took the entry — whether the card acts
-on it is [a question for traffic](#does-it-work-on-your-card).
+on it is [a question for traffic](#does-it-work-on-your-card). Note that
+`--check` writes: it puts a real unicast entry into the live card, takes it out
+again, and leaves a note file behind. If the removal fails it says so, and the
+entry stays until you remove it. `--dry-run` and `--status` write nothing.
 
 ```
 sriov-mac-sync --once               reconcile and exit; the exit code says
@@ -159,15 +162,13 @@ hardware are welcome; those four steps are the whole test.
   news about the device. The entry goes when its port goes, when the
   address moves out to the wire, or under filter pressure: as the list
   nears its capacity the entries silent longest are released first, and
-  every fresh learn makes an entry young again. Pressure is measured, not
-  assumed - the card's own list is read back each pass, so foreign entries
-  count, and a burst on the event path surrenders a keep synchronously
-  rather than overflowing the card for even a moment. What the daemon remembers
+  every fresh learn makes an entry young again. What the daemon remembers
   is written down beside its notes, so an update or a restart hands the
   keeps to the next process instead of unregistering every quiet guest on
   its first pass. A reboot does start from nothing - `/run` is a tmpfs, and
   the card's filter went with the power. `EXTRA` still pins an address
-  outright.
+  outright. How the pressure is measured, and what it costs, is in
+  [docs/internals.md](docs/internals.md).
 - **Stopping the daemon leaves the filter as it is**, which is what makes a
   restart invisible to every guest. `--flush` clears the card.
 - **It only removes what it added**, from a note in `/run/sriov-mac-sync/` (`/var/run/sriov-mac-sync/` on OpenWrt).

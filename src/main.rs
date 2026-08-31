@@ -81,14 +81,6 @@ macro_rules! note {
         let _ = out.flush();
     }};
 }
-/// How long to wait before trying again when the kernel would not describe the
-/// interfaces. Short, because until it answers the daemon is not doing its job
-/// at all; not zero, because a kernel that just refused will refuse again.
-const RETRY_AFTER: Duration = Duration::from_secs(5);
-/// How long a batch that only reported deletions may hold the pass off. Long
-/// enough that a table ageing out is answered once rather than fifty times,
-/// short enough that a filter slot is not held by a guest that left.
-const AGEING_SETTLE: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq)]
 enum Mode {
@@ -699,7 +691,7 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigge
                     r.dev,
                     r.added,
                     r.removed,
-                    r.wanted.len()
+                    r.wanted
                 );
             } else {
                 note!(
@@ -707,7 +699,7 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigge
                     r.dev,
                     r.added,
                     r.removed,
-                    r.wanted.len()
+                    r.wanted
                 );
             }
         }
@@ -720,6 +712,20 @@ fn run() -> Result<bool, String> {
     parse_args(&mut opts)?;
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
+
+    // Subscribed BEFORE the interfaces are read, so that nothing can slip
+    // through between the reading and the listening: every change after
+    // this point is announced, and the reading below is therefore a
+    // picture the daemon may keep. It used to be opened afterwards, which
+    // is why the loop read the interfaces a second time for itself.
+    let mon = if opts.mode == Mode::Daemon {
+        Some(
+            Socket::subscribed()
+                .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     let topo_started = Instant::now();
     let topo = read_topology(&mut sock)?;
@@ -745,6 +751,9 @@ fn run() -> Result<bool, String> {
 
     let mut syncer = Syncer::new(pairs.clone(), state_dir());
     syncer.dry_run = opts.dry_run;
+    // Only --status prints the per-address half of a report, and only it
+    // pays for building one.
+    syncer.detail = opts.mode == Mode::Status;
     // Only autodetection sees every uplink, so only autodetection may conclude
     // that a leftover note belongs to none of them.
     syncer.authoritative = opts.pairs.is_empty();
@@ -770,7 +779,7 @@ fn run() -> Result<bool, String> {
                 // addresses are in this number precisely because they are
                 // NOT in the bridge's table, and the count must not
                 // disagree with `bridge fdb show` over them.
-                println!("  wanted in filter  : {}", r.wanted.len());
+                println!("  wanted in filter  : {}", r.wanted);
                 println!("  registered by us  : {}", r.owned);
                 // Worth a line only when there are any: the memory this
                 // reads is the running daemon's, taken from the file it
@@ -787,10 +796,13 @@ fn run() -> Result<bool, String> {
                         r.stacked.join(" ")
                     }
                 );
-                if opts.verbose {
+                // The per-address half is built only for this mode, so
+                // the daemon does not copy the whole desired set and walk
+                // every silence once a pass for numbers nothing prints.
+                if let (true, Some(detail)) = (opts.verbose, r.detail.as_ref()) {
                     let ages: std::collections::BTreeMap<_, _> =
-                        r.quiet_ages.iter().copied().collect();
-                    let mut wanted = r.wanted.clone();
+                        detail.quiet_ages.iter().copied().collect();
+                    let mut wanted = detail.wanted.clone();
                     wanted.sort();
                     for mac in &wanted {
                         match ages.get(mac) {
@@ -833,8 +845,9 @@ fn run() -> Result<bool, String> {
                 opts.interval
             );
             let stop_rx = catch_signals();
-            let mon = Socket::subscribed()
-                .map_err(|e| format!("cannot subscribe to neighbour events: {e}"))?;
+            // Opened before the reading above; `mon` is Some in this mode
+            // by construction.
+            let mon = mon.expect("the daemon subscribes before it reads");
             // A device that drops out of one reading is not gone: an
             // interface reload takes a bridge away for a moment, and taking
             // its guests' addresses out of a live filter over that is the
@@ -843,7 +856,11 @@ fn run() -> Result<bool, String> {
             // is tidied up within the interval.
             syncer.orphan_grace = Duration::from_secs(60);
             let mut world = Live { sock, mon, stop_rx };
-            daemon_loop(&mut world, &mut syncer, &opts);
+            // The reading this process already did, handed over rather
+            // than paid for twice. It was taken after the subscription was
+            // opened, so anything that changed since is on its way as an
+            // event.
+            daemon_loop(&mut world, &mut syncer, &opts, Some(topo));
 
             // Deliberately without a flush - catch_signals says why. Say how
             // much is left behind, so nobody has to wonder.
@@ -916,20 +933,41 @@ mod tests {
     /// quietly lying.
     #[test]
     fn every_document_names_the_capacity_the_code_assumes() {
+        // Anchored, not a bare substring. `128` occurs in prose, in a
+        // year, in a byte count; the needle has to be the sentence that
+        // states the default, or the test passes against every document
+        // for a DEFAULT_MAX_MACS of 8 - which it did.
         let n = sync::DEFAULT_MAX_MACS.to_string();
-        for (what, text) in [
-            ("the manual page", include_str!("../dist/sriov-mac-sync.8")),
-            ("the README", include_str!("../README.md")),
+        for (what, text, needle) in [
+            (
+                "the manual page",
+                include_str!("../dist/sriov-mac-sync.8"),
+                format!("default {n}"),
+            ),
+            (
+                "the README",
+                include_str!("../README.md"),
+                format!("default {n}"),
+            ),
             (
                 "the example configuration",
                 include_str!("../dist/sriov-mac-sync.conf.example"),
+                format!("MAX_MACS={n}"),
             ),
-            ("the trial harness", include_str!("../bench/trial.py")),
-            ("the help text", usage_text().as_str()),
+            (
+                "the trial harness",
+                include_str!("../bench/trial.py"),
+                format!("FILTER_CAPACITY = {n}"),
+            ),
+            (
+                "the help text",
+                usage_text().as_str(),
+                format!("default {n}"),
+            ),
         ] {
             assert!(
-                text.contains(&n),
-                "{what} never names {n}, the capacity the code assumes"
+                text.contains(&needle),
+                "{what} never says \"{needle}\", the capacity the code assumes"
             );
         }
     }
@@ -1189,6 +1227,14 @@ mod tests {
         assert!(
             unit.contains("RuntimeDirectoryPreserve=yes"),
             "without RuntimeDirectoryPreserve the ownership notes die on every stop"
+        );
+        // 0700, because `ensure_state_dir` narrows a directory it finds
+        // group- or world-writable and says so - and 0755 & 0o022 is zero,
+        // so it would find nothing to say. Dropping this line from the unit
+        // is therefore silent, which is the reason to assert it here.
+        assert!(
+            unit.contains("RuntimeDirectoryMode=0700"),
+            "the state directory has to be created 0700; nothing complains if it is not"
         );
     }
 

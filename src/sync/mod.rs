@@ -143,7 +143,8 @@ pub struct Report {
     pub bridge: String,
     pub port: String,
     pub driver: String,
-    pub wanted: Vec<Mac>,
+    /// how many addresses this uplink's filter should hold
+    pub wanted: usize,
     pub owned: usize,
     pub present: usize,
     pub stacked: Vec<String>,
@@ -152,9 +153,20 @@ pub struct Report {
     pub foreign: usize,
     /// aged out of the bridge, kept because their guest ports live on
     pub quiet: usize,
-    /// the kept addresses themselves, with how long each has been silent -
-    /// milliseconds since the bridge last held it - which is what
-    /// --status -v marks them with
+    /// Only built when somebody is going to print it. On the daemon path
+    /// this was a copy of the whole desired set and a silence walk, per
+    /// uplink per pass, for numbers nothing prints - on a host with a
+    /// thousand learnt addresses that is the pass's largest allocation.
+    pub detail: Option<Detail>,
+}
+
+/// The per-address half of a report, for `--status -v` and nothing else.
+/// Built from the same sets the pass decided on, so there is no second
+/// spelling of "what this uplink wants" to drift from the first.
+pub struct Detail {
+    pub wanted: Vec<Mac>,
+    /// the kept addresses, with how long each has been silent -
+    /// milliseconds since the bridge last held it
     pub quiet_ages: Vec<(Mac, u64)>,
 }
 
@@ -195,6 +207,9 @@ pub struct Syncer {
     /// addresses to register whether or not a bridge has learnt them
     pub extra: Set<Mac>,
     pub dry_run: bool,
+    /// Whether each pass should also build the per-address half of its
+    /// report. Only `--status` prints it, and only that sets this.
+    pub detail: bool,
     /// Whether the pair list is the whole picture. It is when autodetection
     /// drew it, and it is not when somebody named pairs by hand - and only
     /// something that knows every uplink may decide that a note belongs to
@@ -470,6 +485,7 @@ impl Syncer {
             exclude: crate::hash::set(),
             extra: crate::hash::set(),
             dry_run: false,
+            detail: false,
             authoritative: false,
             state_dir,
             timings: Timings::default(),
@@ -614,11 +630,27 @@ impl Syncer {
                         if let Some(c) = self.carried.remove(&dev) {
                             self.carried.insert(new_name.clone(), c);
                         }
+                        // The two say-once sets follow as well. Nothing
+                        // decides anything on them - they only keep a
+                        // warning from being repeated every pass - but a
+                        // rename made the daemon say both again, once, for
+                        // a device that had not changed.
+                        if self.warned_unknown_vf.remove(&dev) {
+                            self.warned_unknown_vf.insert(new_name.clone());
+                        }
+                        if let Some(said) = self.warned_extra.remove(&dev) {
+                            self.warned_extra.insert(new_name.clone(), said);
+                        }
                         // And onto disk under the new name at once: the old
                         // file went with the old note, and a crash before
                         // the pair's next pass would otherwise forget the
                         // very keeps the migration carried over.
-                        self.save_ports(&new_name, topo, Self::boot_millis());
+                        // The pass stamp, like every other caller: a
+                        // fresh clock reading here is later than every
+                        // stamp in the map, so the memo recorded each line
+                        // as quiet and the next pass rewrote the file for
+                        // nothing.
+                        self.save_ports(&new_name, topo, self.last_pass_at);
                     }
                     // Worked, or waits (an unreadable note, an unwritable
                     // new one - both said out loud where they happened, and
@@ -836,6 +868,8 @@ impl Syncer {
         // numvfs and host-bound netdevs are device-level - the same on every
         // port netdev of a shared function - so the first PF answers for them;
         // only the set addresses are per-port, and are counted across them all.
+        // `topo.at` cannot fail for an index this topology produced; what
+        // this really guards is the empty list, a device with no functions.
         let Some(pf_link) = pfs.first().and_then(|&pf| topo.at(pf)) else {
             return;
         };
@@ -899,45 +933,75 @@ impl Syncer {
             return;
         }
         let mut ports: Map<Mac, (u32, u64)> = crate::hash::map();
-        let mut lines: Vec<String> = Vec::new();
         let now = Self::boot_millis();
-        for (mac, name, index, seen) in self.read_ports(dev) {
-            if topo.index_of(&name) != Some(index) {
-                continue;
-            }
-            // A stamp from the future - a file from another boot, since the
-            // clock counts from it - is brought back to now. Left standing
-            // it says "spoke after the last pass" for the life of the
-            // process, which is not merely the youngest: it is never quiet,
-            // so the valve can never reach it and the slot is held until
-            // the address leaves the bridge. Clamped, it costs one pass of
-            // being thought current and then ages like everything else.
-            let seen = seen.min(now);
-            ports.insert(mac, (index, seen));
-            lines.push(Self::ports_line(&mac, &name, index, seen));
+        let read: Vec<(Mac, String, u32, u64)> = self
+            .read_ports(dev)
+            .into_iter()
+            .filter(|(_, name, index, _)| topo.index_of(name) == Some(*index))
+            .collect();
+        // Stamps from the future - a file that outlived a reboot, since the
+        // clock counts from one - are brought back. Left standing, such a
+        // stamp says "spoke after the last pass" for the life of the
+        // process, which is not merely the youngest: it is never quiet, so
+        // the valve can never reach it and the slot is held until the
+        // address leaves the bridge.
+        //
+        // Shifted as one, not clamped one by one. Clamping maps every
+        // stamp ahead of now onto the same instant and loses the order
+        // between them - which is the whole content of this file, and a
+        // pass stamp is `max(clock, previous + 1)`, so ordinary stamps sit
+        // a millisecond or two ahead of the clock quite legitimately. The
+        // shift keeps every gap and puts the newest at now.
+        let ahead = read
+            .iter()
+            .map(|&(_, _, _, seen)| seen)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(now);
+        for (mac, _, index, seen) in read {
+            ports.insert(mac, (index, seen.saturating_sub(ahead)));
         }
         if ports.is_empty() {
             return;
         }
         // Said by the process that actually manages the card - a --status
-        // or dry run beside the daemon takes nothing over. And counted
-        // honestly: the file carries a line per owned learnt address, but
-        // what an update must not drop is the quiet ones.
-        // The previous run's last pass is the ground its stamps were
-        // written against: without it nothing here can be called quiet,
-        // and the first pass of this run replaces it anyway.
-        let newest = ports.values().map(|&(_, t)| t).max().unwrap_or(0);
+        // or dry run beside the daemon takes nothing over.
+        //
+        // The total, and only the total. Quietness is a comparison against
+        // the ground of the pass that wrote the stamps, and that ground is
+        // not in the file; judging against the file's own newest stamp
+        // gave `count(t < max(t))`, which is at most N-1 for any input - a
+        // host with one kept guest said "1 address(es), 0 of them quiet"
+        // and was contradicted by the very next line. This pass says how
+        // many are held quiet, from what it actually kept.
         if apply && !self.dry_run {
-            let quiet = ports.values().filter(|&&(_, t)| t < newest).count();
             note!(
-                "{dev}: took over the last run's memory of {} address(es), \
-                 {quiet} of them quiet",
+                "{dev}: took over the last run's memory of {} address(es)",
                 ports.len()
             );
         }
+        // Seeded in the vocabulary `save_ports` compares against - the
+        // quiet-flag keys, not the raw lines. Seeding raw lines meant the
+        // memo could never hit after a takeover, and the first save of
+        // every restart rewrote a file that already said the right thing.
+        // Judged against the takeover's own newest stamp, which is the
+        // ground the first pass will replace anyway.
+        let newest_seen = ports.values().map(|&(_, t)| t).max().unwrap_or(0);
+        let mut keys: Vec<String> = ports
+            .iter()
+            .filter_map(|(m, &(index, seen))| {
+                topo.name_of(index).map(|name| {
+                    format!(
+                        "{} {name} {index} {}",
+                        format_mac(m),
+                        u8::from(seen < newest_seen)
+                    )
+                })
+            })
+            .collect();
         self.carried_ports.insert(dev.to_string(), ports);
-        lines.sort();
-        self.ports_written.insert(dev.to_string(), lines);
+        keys.sort();
+        self.ports_written.insert(dev.to_string(), keys);
     }
 
     fn ports_line(mac: &Mac, name: &str, index: u32, seen: u64) -> String {
@@ -995,19 +1059,29 @@ impl Syncer {
         // restart, which is usually an update, would unregister every quiet
         // guest on its first pass. One stat says whether the file is still
         // the shape the memo claims.
-        let on_disk = self.ports_path(dev).exists();
-        if self.ports_written.get(dev) == Some(&keys) && on_disk != lines.is_empty() {
-            return;
-        }
         // Nothing to remember is no file: an uplink with no quiet addresses
         // would otherwise keep an empty one around for the next process to
-        // read nothing out of.
-        let wrote = if lines.is_empty() {
-            self.locked(dev, || fs::remove_file(self.ports_path(dev)).is_ok())
-                || !self.ports_path(dev).exists()
-        } else {
-            self.locked(dev, || self.write_ports(dev, &lines))
-        };
+        // read nothing out of. The look and the write are one locked
+        // stretch: asking outside it and writing inside meant a --flush
+        // landing between the two decided against a file that no longer
+        // existed by the time the write ran.
+        let memo_holds = self.ports_written.get(dev) == Some(&keys);
+        let empty = lines.is_empty();
+        let mut skipped = false;
+        let wrote = self.locked(dev, || {
+            if memo_holds && self.ports_path(dev).exists() != empty {
+                skipped = true;
+                return true;
+            }
+            if empty {
+                fs::remove_file(self.ports_path(dev)).is_ok() || !self.ports_path(dev).exists()
+            } else {
+                self.write_ports(dev, &lines)
+            }
+        });
+        if skipped {
+            return;
+        }
         // Memoised only when the file really says this. A failed write that
         // counted as done would leave the running process believing a stale
         // file, and every later pass skipping the correction.
@@ -1084,16 +1158,30 @@ impl Syncer {
             // is also what keeps our own filter entries out: a `self`
             // entry names no master, so a deletion from the card says
             // nothing here and is stepped over.
-            let Some(ageing) = entry
-                .master
-                .and_then(|m| topo.at(m))
-                .and_then(|l| l.ageing_ms)
-            else {
+            let Some(master) = entry.master else {
+                continue;
+            };
+            let Some(ageing) = topo.at(master).and_then(|l| l.ageing_ms) else {
                 continue;
             };
             let spoke = now.saturating_sub(ageing);
-            for ports in self.carried_ports.values_mut() {
-                Self::note_seen(ports, entry.mac, None, spoke);
+            // Only the uplinks this bridge actually serves. The ageing
+            // time is read from the bridge that forgot the address, so
+            // handing the answer to every uplink's memory let one bridge's
+            // interval date another's keeps: a dual-homed guest, or the
+            // same segment bridged twice, drags an hour-old entry forward
+            // to five minutes old, and the pressure valve then surrenders
+            // a genuinely quieter guest instead.
+            for pair in &self.pairs {
+                let Some(bridge) = topo.index_of(&pair.bridge) else {
+                    continue;
+                };
+                if !topo.leads_to(master, bridge) {
+                    continue;
+                }
+                if let Some(ports) = self.carried_ports.get_mut(&pair.dev) {
+                    Self::note_seen(ports, entry.mac, None, spoke);
+                }
             }
         }
     }
@@ -1103,6 +1191,11 @@ impl Syncer {
     /// this process never saw learnt counts as silent since boot: nothing
     /// is known in its favour.
     fn silence_of(&self, dev: &str, macs: &Set<Mac>, now: u64) -> Vec<(u64, Mac)> {
+        // `now` is the pass's own stamp, not a fresh clock reading: the
+        // valve's ordering and what --status -v prints then describe the
+        // same instant instead of two microseconds apart, and the clamp
+        // below cannot be handed a moment the stamps were never judged
+        // against.
         let ports = self.carried_ports.get(dev);
         macs.iter()
             .map(|m| {
@@ -1224,6 +1317,60 @@ impl Syncer {
         })
     }
 
+    /// How full the fullest uplink's filter is, as the last pass measured
+    /// it against the card itself.
+    ///
+    /// The limit applies to one card's unicast list, so the question is
+    /// the fullest list, not the total across uplinks. This used to count
+    /// the notes instead - our own registrations, summed - which both
+    /// missed every foreign entry taking a real slot and listed the state
+    /// directory and read every note to find out, on a path that an
+    /// ageing table walks hundreds of times.
+    pub fn fullest_filter(&self) -> usize {
+        self.carried
+            .values()
+            .map(|c| c.occupancy)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The card is now known to hold these.
+    ///
+    /// Idempotent: an address already counted stays counted once. Only
+    /// ever called with what the card really took or really had - an
+    /// address a hard error left out must not be recorded as present,
+    /// because the grow-gate reads owned-and-present as "re-learning this
+    /// grows nothing" and would then skip the fresh driver question that
+    /// keeps a virtual function's own address out of the filter.
+    fn card_now_holds(&mut self, dev: &str, macs: impl IntoIterator<Item = Mac>) {
+        let c = self.carried.entry(dev.to_string()).or_default();
+        for mac in macs {
+            if c.present.insert(mac) {
+                c.occupancy += 1;
+            }
+        }
+    }
+
+    /// The card is known not to hold these any anymore - it took them out,
+    /// or it turned out never to have had them.
+    ///
+    /// Both free the slot, and a slot the count still claims is a slot the
+    /// next burst will not use: the valve would shed again, and again, one
+    /// guest per burst, while the card never gets any emptier. Surrendered
+    /// is also no longer kept, or a second batch in the same window counts
+    /// it as room it can free a second time.
+    fn card_no_longer_holds(&mut self, dev: &str, macs: &[Mac]) {
+        let Some(c) = self.carried.get_mut(dev) else {
+            return;
+        };
+        for mac in macs {
+            if c.present.remove(mac) {
+                c.occupancy = c.occupancy.saturating_sub(1);
+            }
+            c.quiet.remove(mac);
+        }
+    }
+
     /// Surrender up to `need` kept addresses, longest-silent first -
     /// card, note and memory in the same breath, under the note's lock
     /// like every other removal. The fast path's arm of the pressure
@@ -1304,15 +1451,7 @@ impl Syncer {
             }
         }
         self.save_ports(dev, topo, passed_at);
-        if let Some(c) = self.carried.get_mut(dev) {
-            c.occupancy = c.occupancy.saturating_sub(dropped.len());
-            for mac in &dropped {
-                c.present.remove(mac);
-                // Surrendered is no longer kept: a second batch in the
-                // same window must not count it as room it can free again.
-                c.quiet.remove(mac);
-            }
-        }
+        self.card_no_longer_holds(dev, &dropped);
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
              address(es) [pressure]",
@@ -1546,8 +1685,12 @@ impl Syncer {
             let Some(idx) = topo.index_of(dev) else {
                 continue;
             };
+            // No existence check: every index `physical_functions` can
+            // return came out of a link this very topology holds, so one
+            // here would ask whether the reading contains what the reading
+            // just said. It was there, and it never fired.
             for pf in physical_functions(topo, idx) {
-                if topo.at(pf).is_some() && !pfs.contains(&pf) {
+                if !pfs.contains(&pf) {
                     pfs.push(pf);
                 }
             }
@@ -1804,7 +1947,7 @@ impl Syncer {
                 .count();
             let mut occupied = want.len() + foreign_extra;
             if !kept.is_empty() && occupied + CAPACITY_HEADROOM > self.max_macs {
-                let mut order = self.silence_of(&pair.dev, &kept, Self::boot_millis());
+                let mut order = self.silence_of(&pair.dev, &kept, pass_at);
                 // Longest silent first; the address is the tiebreak.
                 order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let mut shed = 0usize;
@@ -2064,9 +2207,16 @@ impl Syncer {
                 },
             );
 
-            // Unsorted on purpose: outside --status only its length is read,
-            // and the status page sorts for display itself.
-            let wanted: Vec<Mac> = want.into_iter().collect();
+            // Unsorted on purpose: the status page sorts for display
+            // itself, and nothing else looks at the addresses at all.
+            let detail = self.detail.then(|| Detail {
+                wanted: want.iter().copied().collect(),
+                quiet_ages: self
+                    .silence_of(&pair.dev, &kept, pass_at)
+                    .into_iter()
+                    .map(|(silent, m)| (m, silent))
+                    .collect(),
+            });
             reports.push(Report {
                 dev: pair.dev.clone(),
                 bridge: pair.bridge.clone(),
@@ -2074,17 +2224,13 @@ impl Syncer {
                 driver,
                 owned: owned.len(),
                 present: present.len(),
-                wanted,
+                wanted: want.len(),
                 stacked,
                 added,
                 removed,
                 foreign,
                 quiet: kept.len(),
-                quiet_ages: self
-                    .silence_of(&pair.dev, &kept, Self::boot_millis())
-                    .into_iter()
-                    .map(|(silent, m)| (m, silent))
-                    .collect(),
+                detail,
             });
         }
         timings.pairs = mark.elapsed();
@@ -2323,14 +2469,12 @@ impl Syncer {
                         ports.remove(mac);
                     }
                 }
-                // Slots the Ok-arm really freed leave the carried count too.
-                if let Some(c) = self.carried.get_mut(&fp.dev) {
-                    c.occupancy = c.occupancy.saturating_sub(taken_back.len());
-                    for mac in &taken_back {
-                        c.present.remove(mac);
-                        c.quiet.remove(mac);
-                    }
-                }
+                // Every slot this really freed leaves the carried count -
+                // the ENOENT arm's as much as the Ok arm's. An entry the
+                // card says it does not have is not occupying anything,
+                // and leaving it counted made the next burst measure its
+                // room against a slot that was already free.
+                self.card_no_longer_holds(&fp.dev, &dropped);
                 // And out of the written-down memory too: an eviction that
                 // lived only in RAM could come back through the file after
                 // a crash, once the wire evidence has aged - re-registering
@@ -2373,7 +2517,7 @@ impl Syncer {
         // batch - ~0.9 ms on mlx5, whose firmware answers it, ~0.01 ms on
         // the Intel drivers and mlx4.
         if vf_carried {
-            let mut would: Map<String, Vec<Mac>> = crate::hash::map();
+            let mut would: Map<String, Vec<(Mac, u32)>> = crate::hash::map();
             for (kind, entry) in events {
                 if *kind != crate::netlink::RTM_NEWNEIGH {
                     continue;
@@ -2394,7 +2538,7 @@ impl Syncer {
             for (dev, macs) in would.iter_mut() {
                 let present = self.carried.get(dev).map(|c| &c.present);
                 self.with_owned(dev, |o| {
-                    macs.retain(|m| !(o.contains(m) && present.is_some_and(|p| p.contains(m))))
+                    macs.retain(|(m, _)| !(o.contains(m) && present.is_some_and(|p| p.contains(m))))
                 });
             }
             would.retain(|_, macs| !macs.is_empty());
@@ -2433,7 +2577,7 @@ impl Syncer {
                     let Some(fp) = pairs.iter().find(|f| &f.dev == dev) else {
                         continue;
                     };
-                    for mac in macs {
+                    for (mac, _) in macs {
                         if fp.skip.contains(mac) {
                             note!(
                                 "{}: {} is a virtual function's address by the \
@@ -2451,7 +2595,7 @@ impl Syncer {
         // written after, because the note has to take every address before
         // the card does. The pass explains the order; it is the same one,
         // for the same crash.
-        let mut to_register: Map<String, Vec<Mac>> = crate::hash::map();
+        let mut to_register: Map<String, Vec<(Mac, u32)>> = crate::hash::map();
         for (kind, entry) in events {
             if *kind != crate::netlink::RTM_NEWNEIGH {
                 continue;
@@ -2460,12 +2604,19 @@ impl Syncer {
                 urgency = Urgency::Now;
             }
         }
-        for (dev, mut macs) in to_register {
+        for (dev, learns) in to_register {
             // The same address can arrive several times in one drained
             // burst - once per VLAN on a vlan-aware bridge - and both the
-            // note and the card want it once.
+            // note and the card want it once. When the ports differ too,
+            // the last learn wins: the events are drained in the order the
+            // kernel sent them, so the last one is where the address is
+            // now.
+            let mut learnt_on: Map<Mac, u32> = crate::hash::map();
+            for (m, port) in &learns {
+                learnt_on.insert(*m, *port);
+            }
+            let mut macs: Vec<Mac> = learnt_on.keys().copied().collect();
             macs.sort_unstable();
-            macs.dedup();
             let Some(fp) = pairs.iter().find(|f| f.dev == dev) else {
                 continue;
             };
@@ -2478,9 +2629,14 @@ impl Syncer {
             // silence, and the shedder would name it first, deleting an
             // entry the very next line puts back.
             let now = Self::boot_millis();
-            if let Some(ports) = self.carried_ports.get_mut(&dev) {
+            // Only once the file has been consulted for this uplink:
+            // making the map here before that would look to `load_ports`
+            // like a memory already carried in RAM, and the previous
+            // process's keeps would be thrown away unread.
+            if self.ports_loaded.contains(&dev) {
+                let ports = self.carried_ports.entry(dev.clone()).or_default();
                 for mac in &macs {
-                    Self::note_seen(ports, *mac, None, now);
+                    Self::note_seen(ports, *mac, learnt_on.get(mac).copied(), now);
                 }
             }
             let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);
@@ -2530,12 +2686,7 @@ impl Syncer {
             // and would then skip the fresh driver question that keeps a
             // virtual function's own address out of the filter. The next
             // pass's read-back corrects any drift.
-            let c = self.carried.entry(dev.clone()).or_default();
-            for mac in held {
-                if c.present.insert(mac) {
-                    c.occupancy += 1;
-                }
-            }
+            self.card_now_holds(&dev, held);
         }
         Ok(urgency)
     }
@@ -2555,7 +2706,7 @@ impl Syncer {
         topo: &Topology,
         entry: &FdbEntry,
         pairs: &[FastPair],
-        registered: &mut Map<String, Vec<Mac>>,
+        registered: &mut Map<String, Vec<(Mac, u32)>>,
         phase: FastPhase,
     ) -> bool {
         if !entry.is_learned() || !is_registerable(&entry.mac) {
@@ -2580,7 +2731,7 @@ impl Syncer {
                     registered
                         .entry(fp.dev.clone())
                         .or_default()
-                        .push(entry.mac);
+                        .push((entry.mac, entry.ifindex));
                 }
                 continue; // excluded, the host's own, or a VF's
             }
@@ -2641,10 +2792,15 @@ impl Syncer {
                 continue;
             }
             ours = true;
+            // With the port it was learnt on. The pass would put that on
+            // record at its next dump, but a daemon that dies in between
+            // leaves the address on the note with no port - and the
+            // restart, finding no port to check, unregisters it as soon as
+            // it falls quiet. Which is the outage the memory exists for.
             registered
                 .entry(fp.dev.clone())
                 .or_default()
-                .push(entry.mac);
+                .push((entry.mac, entry.ifindex));
         }
         ours
     }

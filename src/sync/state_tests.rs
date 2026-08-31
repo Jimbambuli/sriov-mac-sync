@@ -2455,6 +2455,27 @@ fn small_host() -> crate::topology::Topology {
         .build()
 }
 
+/// `small_host` with a bridge that forgets after `ms` milliseconds.
+///
+/// Taken as an argument rather than hidden: at the shipped defaults - a
+/// 300 s interval against the kernel's 300 s ageing - a deletion's date can
+/// never move a stamp at all, so a test of the dating has to say out loud
+/// that its bridge ages faster than its passes.
+fn small_host_ageing(ms: u64) -> crate::topology::Topology {
+    Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .ageing(Some(ms))
+        .lower("nic1")
+        .lower("vetha")
+        .build()
+}
+
 /// An authoritative syncer over the nic1:br0 pair, state in `dir`.
 fn br0_syncer(dir: &std::path::Path) -> Syncer {
     let mut s = Syncer::new(
@@ -2563,7 +2584,6 @@ fn an_aged_address_on_a_physical_port_is_kept_while_the_port_lives() {
     assert_eq!(reports[0].quiet, 1, "the quiet device counts as held");
 
     // And again, later: there is no window to run out of.
-    std::thread::sleep(Dur::from_millis(30));
     let reports = age_out(&mut s, &topo, BEHIND_NIC);
     assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
     assert_eq!(reports[0].quiet, 1);
@@ -2812,12 +2832,13 @@ fn the_missing_clock_survives_a_restart() {
     let mut sock = kernel(vec![learned(4, 10, old), learned(4, 10, young)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
-    // Both go quiet before the restart, thirty milliseconds apart: after
-    // this the only thing that tells them apart is the gap between their
-    // clocks, which is exactly what has to survive.
+    // Both go quiet before the restart, one pass apart: after this the
+    // only thing that tells them apart is the gap between their stamps,
+    // which is exactly what has to survive. No sleep buys that gap - a
+    // pass stamp is `max(clock, previous + 1)`, so two passes can never
+    // share one however fast they follow each other.
     let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    std::thread::sleep(Dur::from_millis(30));
     let mut sock3 = kernel(vec![card_holds(2, old), card_holds(2, young)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     drop(s);
@@ -3123,7 +3144,6 @@ fn the_pressure_valve_sheds_the_longest_missing_first() {
     // clock would shed `young` - only the clock names `old`.
     let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    std::thread::sleep(Dur::from_millis(30));
 
     // Now both are quiet, and the limit leaves room for only some of the
     // list: the longest-missing - `old` - is the one surrendered.
@@ -3488,7 +3508,6 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
     // Pass 2: `old` ages, `young` still speaks.
     let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    std::thread::sleep(Dur::from_millis(20));
 
     // Pass 3: both quiet now - `old`'s clock must keep its earlier start.
     let both = vec![card_holds(2, old), card_holds(2, young)];
@@ -4054,7 +4073,6 @@ fn the_shedder_spares_the_live_and_the_incoming() {
         ..Default::default()
     };
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    std::thread::sleep(Dur::from_millis(20));
     let mut sock3 = FakeSock {
         fdb: vec![
             card_holds(2, old),
@@ -4110,6 +4128,10 @@ fn a_fast_path_learn_makes_an_entry_young_again() {
     // `a` goes quiet first, then `b`: a is the older keep.
     let mut sock2 = kernel(vec![card_holds(2, a), learned(4, 10, b)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    // Real time, not just another pass: what follows is a fast-path learn,
+    // and the fast path stamps the raw clock while a pass stamp may sit a
+    // millisecond ahead of it. Stamps only move forward, so a learn inside
+    // that millisecond would correctly change nothing - and prove nothing.
     std::thread::sleep(Dur::from_millis(20));
     let mut sock3 = kernel(vec![card_holds(2, a), card_holds(2, b)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
@@ -4614,18 +4636,7 @@ fn a_deletion_says_how_long_after_the_pass_the_guest_spoke() {
     let just_quiet: Mac = [0x02, 0xf4, 0, 0, 0, 2];
     // A bridge that forgets in 10 ms, so "one ageing time ago" lands
     // inside a test's lifetime rather than five minutes outside it.
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .ageing(Some(10))
-        .lower("nic1")
-        .lower("vetha")
-        .build();
+    let topo = small_host_ageing(10);
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![
         learned(4, 10, spoke_later),
@@ -4740,18 +4751,7 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
     let dir = scratch("delneigh-arithmetic");
     let m: Mac = [0x02, 0xf6, 0, 0, 0, 1];
     // A bridge that forgets after 200 ms, so a test can outlive it.
-    let topo = Builder::new()
-        .add("nic1", 2, Some(mac(1)))
-        .master("br0")
-        .vfs(1)
-        .add("vetha", 4, Some(mac(4)))
-        .master("br0")
-        .add("br0", 10, Some(mac(3)))
-        .bridge()
-        .ageing(Some(200))
-        .lower("nic1")
-        .lower("vetha")
-        .build();
+    let topo = small_host_ageing(200);
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
@@ -4769,8 +4769,13 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
         .unwrap();
 
     let mut sock2 = kernel(vec![card_holds(2, m)]);
+    // The per-address half is what --status prints; ask for it.
+    s.detail = true;
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     let (_, silent) = reports[0]
+        .detail
+        .as_ref()
+        .expect("the detail was asked for")
         .quiet_ages
         .iter()
         .find(|(a, _)| *a == m)
@@ -4780,6 +4785,7 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
         "the silence should be the bridge's 200 ms ageing time, not the 400 ms \
          since the pass - was {silent} ms"
     );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Stamps only ever move forward, whoever writes them. The sources do
@@ -5060,6 +5066,237 @@ fn a_shed_entry_stops_being_counted() {
     assert_eq!(
         s.carried["nic1"].occupancy, before,
         "the occupancy did not follow what the valve did"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The note writers never follow a symlink.
+///
+/// `ensure_state_dir` narrows a state directory it finds group- or
+/// world-writable, but it cannot remove what was planted in it before that
+/// first narrowing - and this daemon writes as root. The whole-set writer
+/// renames a temporary into place, and rename does not follow a link, so
+/// the exposed name is the temporary's: it is derived from the file and
+/// this process's id, which is not a secret. The append path opens the
+/// note itself and is exposed directly.
+#[test]
+fn the_note_writers_refuse_a_symlink() {
+    let dir = scratch("note-nofollow");
+    fs::create_dir_all(&dir).unwrap();
+    let elsewhere = dir.join("elsewhere");
+    fs::write(&elsewhere, "untouched\n").unwrap();
+    let m: Mac = [0x02, 0xfd, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+
+    // The atomic writer: the link stands where its temporary goes. The
+    // quiet memory is the file a first pass writes that way.
+    let tmp = dir.join(format!("..nic1.owned.ports.{}.tmp", std::process::id()));
+    std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    let _ = s.reconcile(&mut sock, true, &topo, Dur::ZERO);
+    assert_eq!(
+        fs::read_to_string(&elsewhere).unwrap(),
+        "untouched\n",
+        "a note write followed a symlink out of the state directory"
+    );
+    assert!(
+        fs::symlink_metadata(&tmp).is_err(),
+        "the refused write left its temporary behind"
+    );
+
+    // The append path: the link stands where the note itself goes.
+    let _ = fs::remove_file(dir.join("nic1.owned"));
+    std::os::unix::fs::symlink(&elsewhere, dir.join("nic1.owned")).unwrap();
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let other: Mac = [0x02, 0xfd, 0, 0, 0, 2];
+    let mut ev = FakeSock::default();
+    let _ = s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, other))]);
+    assert_eq!(
+        fs::read_to_string(&elsewhere).unwrap(),
+        "untouched\n",
+        "an append followed a symlink out of the state directory"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An address registered by the fast path knows its port at once.
+///
+/// The pass would record it at its next dump, but a daemon that dies in
+/// that window leaves the address on the note with no port - and the
+/// restart, with no port to check, takes it out of the card as soon as it
+/// falls quiet. Which is the outage the memory file exists to prevent.
+#[test]
+fn a_fast_registration_records_the_port_it_was_learnt_on() {
+    let dir = scratch("fast-port-memory");
+    let m: Mac = [0x02, 0xc1, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    // A pass first, so the memory file has been consulted for this uplink.
+    let mut sock = kernel(vec![]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert_eq!(
+        s.carried_ports
+            .get("nic1")
+            .and_then(|p| p.get(&m))
+            .map(|&(i, _)| i),
+        Some(4),
+        "the fast path registered an address without recording its port"
+    );
+
+    // And when the same address arrives twice in one burst, on two
+    // different ports, the last learn is where it is now.
+    let two_ports = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("vethb", 5, Some(mac(5)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .lower("vethb")
+        .build();
+    let elsewhere: Mac = [0x02, 0xc1, 0, 0, 0, 2];
+    let mut ev2 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut ev2,
+        &two_ports,
+        &[
+            (RTM_NEWNEIGH, learned(4, 10, elsewhere)),
+            (RTM_NEWNEIGH, learned(5, 10, elsewhere)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        s.carried_ports["nic1"].get(&elsewhere).map(|&(i, _)| i),
+        Some(5),
+        "the earlier learn of a burst won over the later one"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A deletion dates the memory of the uplinks its own bridge serves, and
+/// no others.
+///
+/// The ageing time comes from the bridge that forgot the address, so
+/// handing that answer to every uplink let one bridge's interval date
+/// another's keeps: a dual-homed guest, or the same segment bridged twice,
+/// drags an hour-old entry forward to five minutes old, and the pressure
+/// valve then surrenders a genuinely quieter guest instead.
+#[test]
+fn a_deletion_dates_only_the_bridge_it_came_from() {
+    let dir = scratch("dating-per-bridge");
+    let m: Mac = [0x02, 0xc2, 0, 0, 0, 1];
+    // Two uplinks under two bridges. Both hold the same address - a
+    // dual-homed guest - and only br0 ages quickly.
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .ageing(Some(200))
+        .lower("nic1")
+        .lower("vetha")
+        .add("nic2", 3, Some(mac(2)))
+        .master("br1")
+        .vfs(1)
+        .add("vethb", 5, Some(mac(5)))
+        .master("br1")
+        .add("br1", 11, Some(mac(6)))
+        .bridge()
+        .ageing(Some(200))
+        .lower("nic2")
+        .lower("vethb")
+        .build();
+    let mut s = Syncer::new(
+        vec![
+            Pair {
+                dev: "nic1".into(),
+                bridge: "br0".into(),
+            },
+            Pair {
+                dev: "nic2".into(),
+                bridge: "br1".into(),
+            },
+        ],
+        dir.to_path_buf(),
+    );
+    let mut sock = kernel(vec![learned(4, 10, m), learned(5, 11, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let before = s.carried_ports["nic2"][&m].1;
+
+    // br0 forgets it. br1 has said nothing.
+    std::thread::sleep(Dur::from_millis(260));
+    s.remember_vf(vec![2, 3], vec![(2, VF_ADMIN), (3, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(&mut ev, &topo, &[(RTM_DELNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert!(
+        s.carried_ports["nic1"][&m].1 > before,
+        "the deletion should have dated its own bridge's memory"
+    );
+    assert_eq!(
+        s.carried_ports["nic2"][&m].1, before,
+        "one bridge's deletion dated another bridge's memory"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An entry the card says it never had frees its slot too.
+///
+/// A reflection removes an address the wire has taken over. The card can
+/// answer ENOENT - it is already gone - and that is a slot free just as
+/// much as a successful removal. Counting it as occupied made the next
+/// burst measure its room against a slot that was not there.
+#[test]
+fn a_removal_that_was_already_gone_still_frees_its_slot() {
+    let dir = scratch("enoent-frees-slot");
+    let m: Mac = [0x02, 0xc3, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let before = s.carried["nic1"].occupancy;
+    assert!(s.carried["nic1"].present.contains(&m));
+
+    // It turns up on the wire, so the daemon takes it back out - and the
+    // card says it was never there.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut fail = crate::hash::map();
+    fail.insert(m, libc::ENOENT);
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_del: fail,
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(2, 10, m))])
+        .unwrap();
+    assert!(
+        !s.carried["nic1"].present.contains(&m),
+        "an entry the card said it did not have was still counted as present"
+    );
+    assert_eq!(
+        s.carried["nic1"].occupancy,
+        before - 1,
+        "the slot it never occupied was never given back"
     );
     let _ = fs::remove_dir_all(&dir);
 }

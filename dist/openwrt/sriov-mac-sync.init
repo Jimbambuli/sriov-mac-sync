@@ -1,4 +1,6 @@
 #!/bin/sh /etc/rc.common
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # rc.common reads USE_PROCD, START and STOP
 # procd service for OpenWrt. Settings live in /etc/sriov-mac-sync.conf, the
 # same file the daemon reads everywhere else - there is no UCI section, because
 # there is nothing here that a second configuration format would make clearer.

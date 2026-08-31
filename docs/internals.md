@@ -92,8 +92,10 @@ and cannot step under NTP; the file shares the notes' tmpfs, so a stamp and
 the clock that reads it always come from the same boot. Losing the file
 costs the keeps and nothing else: a write that fails is one warning per
 device and a carry on, and a file that cannot be read or parsed is simply
-no memory - the fall back to what every build before it did. The whole picture is rebuilt whenever an
-interface appears, disappears or is reconfigured. What notifications do *not* cover is a VF's address changing
+no memory - the fall back to what every build before it did.
+
+The whole picture is rebuilt whenever an interface appears, disappears or is
+reconfigured. What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever
 reaching rtnetlink — an "up PFs announce" gate built on the opposite

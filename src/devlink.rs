@@ -108,15 +108,18 @@ fn param_dump_request(family: u16) -> Vec<u8> {
 
 /// The family number devlink was given at registration. It is assigned at
 /// boot and differs between hosts, which is why it has to be asked for.
-fn resolve_family(sock: &mut Socket, seq: u32) -> io::Result<Option<u16>> {
+fn resolve_family(sock: &mut Socket) -> io::Result<Option<u16>> {
     let mut id = None;
-    sock.request_one(&family_request(seq), GENL_ID_CTRL, &mut |payload| {
+    // One request on a fresh socket, so the sequence number is a constant
+    // rather than a parameter: it used to be one, and no caller ever
+    // passed anything but 1.
+    sock.request_one(&family_request(1), GENL_ID_CTRL, &mut |payload| {
         if payload.len() < GENL_HDR {
             return;
         }
         for (kind, value) in attrs(&payload[GENL_HDR..]) {
             if kind == CTRL_ATTR_FAMILY_ID && value.len() >= 2 {
-                id = Some(u16::from_ne_bytes(value[..2].try_into().unwrap()));
+                id = Some(u16::from_ne_bytes([value[0], value[1]]));
             }
         }
     })?;
@@ -170,10 +173,15 @@ fn collect_param(payload: &[u8], out: &mut Vec<Reported>) {
             // enum has been renumbered in the kernel's history and this
             // parameter is a number in every version of it.
             if vkind == DEVLINK_ATTR_PARAM_VALUE_DATA {
+                // Any other width is a parameter this is not about - the
+                // arm stays because this is the least exercised code in
+                // the tree, and a strange kernel would find it first.
                 number = match vvalue.len() {
                     1 => Some(vvalue[0] as u32),
-                    2 => Some(u16::from_ne_bytes(vvalue[..2].try_into().unwrap()) as u32),
-                    4 => Some(u32::from_ne_bytes(vvalue[..4].try_into().unwrap())),
+                    2 => Some(u16::from_ne_bytes([vvalue[0], vvalue[1]]) as u32),
+                    4 => Some(u32::from_ne_bytes([
+                        vvalue[0], vvalue[1], vvalue[2], vvalue[3],
+                    ])),
                     _ => None,
                 }
             }
@@ -208,7 +216,7 @@ pub struct Capacities {
 /// wrongly" look identical from the threshold and are not the same bug.
 pub fn read() -> Result<Option<Capacities>, String> {
     let mut sock = Socket::generic().map_err(|e| format!("no generic netlink socket: {e}"))?;
-    let family = match resolve_family(&mut sock, 1) {
+    let family = match resolve_family(&mut sock) {
         Ok(Some(f)) => f,
         Ok(None) => return Ok(None),
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
