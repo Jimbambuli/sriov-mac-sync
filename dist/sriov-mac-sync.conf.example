@@ -2,7 +2,10 @@
 
 # Uplink/bridge pairs to manage. Empty means autodetect: every interface with
 # virtual functions - or itself a virtual function - that ends up in a bridge,
-# following bonds.
+# following bonds. Two things naming pairs by hand changes: --pair on the
+# command line REPLACES this list (EXCLUDE/EXTRA merge), and the orphan sweep
+# is off - a pair removed from this list keeps its filter entries until
+# --flush, because only autodetection can know it sees every uplink.
 #PAIRS="nic1:vmbr1 nic0:vmbr0"
 
 # Seconds between full reconciliations. This is paranoia, not the mechanism.

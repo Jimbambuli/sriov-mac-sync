@@ -102,6 +102,13 @@ jobs:
           # and the grep assertions in the package step.
           shellcheck -S warning dist/package.sh bench/integration.sh \
             dist/openwrt/sriov-mac-sync.init
+          # And the one file no other check ever touches: 1000 lines of
+          # Python that drive real bridges as root. pyflakes catches the
+          # undefined-name and unused-import class - it proves the file
+          # parses and its names resolve, nothing more; the harness's
+          # behaviour is proven on hardware, not here.
+          sudo apt-get install -qq -y pyflakes3
+          pyflakes3 bench/trial.py
 
       - name: Both binaries are static
         run: |

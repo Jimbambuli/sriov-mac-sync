@@ -12,8 +12,12 @@ RestartSec=5
 KillMode=control-group
 
 # It writes hardware filters and reads /sys; nothing else is needed. It stays
-# root because programming a NIC's filters wants CAP_NET_ADMIN in the initial
-# user namespace, and everything below takes the rest of root away again.
+# uid 0 not for the capability - AmbientCapabilities below would hand
+# CAP_NET_ADMIN to any User= - but for the notes: --once and --flush are run
+# by hand as root and share the 0600 files in /run/sriov-mac-sync with the
+# daemon, and a non-root daemon could neither read nor lock what they leave
+# behind (notes.rs spells the same premise out). Everything below takes the
+# rest of root away again.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes

@@ -15,7 +15,6 @@ use crate::{clamp_max_macs, devlink, netlink, note, pair_names, report_changes, 
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-/// The interface picture, from the kernel in one dump.
 /// How long to wait before trying again when the kernel would not describe the
 /// interfaces. Short, because until it answers the daemon is not doing its job
 /// at all; not zero, because a kernel that just refused will refuse again.
@@ -25,6 +24,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// short enough that a filter slot is not held by a guest that left.
 const AGEING_SETTLE: Duration = Duration::from_secs(5);
 
+/// The interface picture, from the kernel in one dump.
 pub(crate) fn read_topology(sock: &mut Socket) -> Result<Topology, String> {
     let links = sock
         .dump_links()

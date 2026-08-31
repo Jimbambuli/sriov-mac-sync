@@ -1,5 +1,49 @@
 //! Deciding which addresses belong in an uplink's unicast filter, and putting
 //! them there.
+//!
+//! # The three invariants
+//!
+//! Cited by number throughout the tree; this is the list they point at.
+//! Each is one sentence here and enforced where named - the mechanism
+//! lives at the enforcement site, on purpose, so this list cannot go
+//! stale against it.
+//!
+//! 1. **An address learnt on the wire is never registered.** Enforced in
+//!    `fast_add` (the port exit and the carried wire set) and by the
+//!    pass's use of `uplink_port` in `topology.rs`.
+//! 2. **A virtual function's own address is never registered** - on ixgbe
+//!    the guest goes deaf, on i40e the eSwitch duplicates. Enforced by
+//!    the exclusion set (`exclusions`, built over every PF of a shared
+//!    function) and the grow-only driver refresh in the decide phase.
+//! 3. **Only what this daemon registered is ever removed** - the note is
+//!    written before the card. Enforced in `register_batch_locked` (the
+//!    crash-ordering argument lives there) and by every removal path
+//!    reading the note first.
+//!
+//! # Vocabulary
+//!
+//! One word per thing, everywhere - code, tests, journal, man page:
+//!
+//! * **note** - the ownership file per uplink (`<dev>.owned`): what WE put
+//!   in the card.
+//! * **wire** - the uplink port's own side; addresses learnt there are
+//!   peers, never guests.
+//! * **keep** / **quiet** - an address aged out of the bridge but kept
+//!   registered while its learn port lives; "quiet" is the state, "keep"
+//!   the decision.
+//! * **shed** / **release** - the pressure valve surrendering keeps as the
+//!   filter nears capacity.
+//! * **pass** - one full reconciliation against a fresh dump.
+//! * **batch** - one drained set of kernel notifications, answered by the
+//!   fast path.
+//! * **reflection** - one of our addresses turning up on the wire, and the
+//!   removal that answers it.
+//! * **ward** - the uplink's own address, registered so the host itself
+//!   stays reachable.
+//! * **orphan** - a note whose uplink is gone; only autodetection may
+//!   conclude that.
+//! * **carried** - state the daemon keeps between passes (wire set, VF
+//!   answer, occupancy), always revalidated before growth.
 
 use crate::hash::{Map, Set};
 use crate::note;
@@ -162,7 +206,8 @@ pub struct Report {
     pub detail: Option<Detail>,
 }
 
-/// The per-address half of a report, for `--status -v` and nothing else.
+/// The per-address half of a report, for the two single-pass modes that
+/// print it - `--status -v` and `--once -v` - and never for the daemon.
 /// Built from the same sets the pass decided on, so there is no second
 /// spelling of "what this uplink wants" to drift from the first.
 pub struct Detail {
@@ -220,7 +265,9 @@ pub struct Syncer {
     pub extra: Set<Mac>,
     pub dry_run: bool,
     /// Whether each pass should also build the per-address half of its
-    /// report. Only `--status` prints it, and only that sets this.
+    /// report. Set by the two single-pass modes that print it - `--status`
+    /// and `--once` - and never by the daemon, which would pay a copy of
+    /// the whole desired set per pass for numbers nothing prints.
     pub detail: bool,
     /// Whether the pair list is the whole picture. It is when autodetection
     /// drew it, and it is not when somebody named pairs by hand - and only
@@ -629,6 +676,22 @@ impl Syncer {
                         let moved = self.migrate_note(&dev, &new_name, index);
                         if moved {
                             note!("{dev}: now called {new_name}, its note follows the interface");
+                            // Deliberately field by field, not a struct
+                            // move. Three reviews proposed bundling the
+                            // per-device maps into one UplinkState so a
+                            // rename becomes remove+insert, and were
+                            // refuted each time: these collections carry
+                            // THREE lifecycles (file caches follow the
+                            // note, absent_since measures the missing,
+                            // the rest is uplink state), several must NOT
+                            // move uniformly (ports_written is discarded
+                            // for both names, ports_loaded only set when
+                            // the memory really migrated), and a struct
+                            // move would turn "forgot to move one" - a
+                            // cold start, benign - into "moved one that
+                            // must not" - inherited stale state under the
+                            // new name. Each line below is a policy, not
+                            // a copy.
                             // The port memory follows the note, or a rename
                             // would silently forget exactly the quiet guests.
                             if let Some(ports) = self.carried_ports.remove(&dev) {
@@ -779,6 +842,14 @@ impl Syncer {
             // reads afresh rather than believing this run's leftovers.
             self.ports_loaded.remove(&dev);
             self.ports_written.remove(&dev);
+            // The two remaining say-once marks go by the same rule the
+            // comment above states - a return also announces afresh. They
+            // were the only two this sweep forgot, which cost nothing but
+            // a suppressed one-time warning on a device that came back;
+            // named here so the next field added to the Syncer finds the
+            // complete list in one place.
+            self.warned_unknown_vf.remove(&dev);
+            self.warned_extra.remove(&dev);
         }
     }
 
@@ -1214,6 +1285,22 @@ impl Syncer {
     /// Erring towards keeping is the direction to err in.
     fn date_the_silence(&mut self, topo: &Topology, events: &[(u16, FdbEntry)]) {
         let now = Self::boot_millis();
+        // The pairs' bridge indices are batch-constant; resolve them once.
+        // The reachability is NOT batch-constant - `master` varies per
+        // event, a batch can carry deletions from several bridges, and
+        // hoisting the answer whole would date across bridges again, the
+        // very bug the scoping exists against - so it is memoised per
+        // deleting bridge instead. An ageing table hands over hundreds of
+        // deletions in one drained batch, and walking the bridge's whole
+        // port graph for each one cost more than the rest of the batch
+        // (measured: 0.42 ms -> 0.007 ms at 60 ports and two pairs).
+        let pair_bridges: Vec<(usize, u32)> = self
+            .pairs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| topo.index_of(&p.bridge).map(|b| (i, b)))
+            .collect();
+        let mut serves: Map<u32, Vec<usize>> = crate::hash::map();
         for (kind, entry) in events {
             if *kind != crate::netlink::RTM_DELNEIGH {
                 continue;
@@ -1230,21 +1317,22 @@ impl Syncer {
                 continue;
             };
             let spoke = now.saturating_sub(ageing);
-            // Only the uplinks this bridge actually serves. The ageing
-            // time is read from the bridge that forgot the address, so
-            // handing the answer to every uplink's memory let one bridge's
-            // interval date another's keeps: a dual-homed guest, or the
-            // same segment bridged twice, drags an hour-old entry forward
-            // to five minutes old, and the pressure valve then surrenders
-            // a genuinely quieter guest instead.
-            for pair in &self.pairs {
-                let Some(bridge) = topo.index_of(&pair.bridge) else {
-                    continue;
-                };
-                if !topo.leads_to(master, bridge) {
-                    continue;
-                }
-                if let Some(ports) = self.carried_ports.get_mut(&pair.dev) {
+            // Only the uplinks this bridge actually serves - the scoping
+            // that keeps one bridge's ageing time from dating another's
+            // keeps (a dual-homed guest, or the same segment bridged
+            // twice, would drag an hour-old entry forward to five minutes
+            // old, and the valve then surrenders a genuinely quieter
+            // guest).
+            let served = serves.entry(master).or_insert_with(|| {
+                pair_bridges
+                    .iter()
+                    .filter(|&&(_, b)| topo.leads_to(master, b))
+                    .map(|&(i, _)| i)
+                    .collect()
+            });
+            for &i in served.iter() {
+                let dev = &self.pairs[i].dev;
+                if let Some(ports) = self.carried_ports.get_mut(dev) {
                     Self::note_seen(ports, entry.mac, None, spoke);
                 }
             }
@@ -1314,6 +1402,10 @@ impl Syncer {
     /// Returns what really went into the card and what went wrong, for a
     /// caller that counts or reports. `None` means the note refused the
     /// batch and the card was not touched at all.
+    /// On the `_locked` suffix: this one TAKES the note's lock itself,
+    /// while `forget_locked` expects the caller to hold it - the suffix
+    /// marks involvement with the lock, not which side of it you are on.
+    /// Check the body of the one you call.
     fn register_batch_locked(
         &self,
         sock: &mut dyn FdbWriter,
@@ -1747,8 +1839,6 @@ impl Syncer {
         (want, stacked, wire, learnt_at)
     }
 
-    /// Bring the filter in line with the bridge.
-    ///
     /// The physical functions behind these uplinks, alive in this reading.
     /// Only they contribute exclusions, so only they are asked about - a
     /// dump would describe every interface on the host to reach them.
@@ -1809,6 +1899,16 @@ impl Syncer {
     /// anyway - autodetection runs off the same picture - and reading it twice
     /// for one pass is work nobody asked for. `topo_load` is how long the
     /// caller took over it, so the report still accounts for the whole pass.
+    /// Deliberately one function. Three reviews proposed carving the
+    /// per-pair body into phase methods and were refuted each time, on the
+    /// same grounds: the mechanics already live in named helpers
+    /// (wanted_with_keeps, register_batch_locked, shed_keeps, drop_orphans,
+    /// save_ports...), what remains inline is orchestration whose ORDER is
+    /// the content, and def-before-use of the dozen locals is the compiler
+    /// checking that order - a context struct would trade that for
+    /// compiling disorder. The precedent is daemon.rs (8609f1f): state got
+    /// types where invariants outlive an iteration; these locals die inside
+    /// one.
     pub fn reconcile(
         &mut self,
         sock: &mut dyn FdbWriter,
@@ -2025,9 +2125,22 @@ impl Syncer {
                 .count();
             let mut occupied = want.len() + foreign_extra;
             if !kept.is_empty() && occupied + CAPACITY_HEADROOM > self.max_macs {
-                let mut order = self.silence_of(&pair.dev, &kept, pass_at);
-                // Longest silent first; the address is the tiebreak.
-                order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                // Ordered by the RAW stamp, the way shed_keeps orders - one
+                // spelling for both valves. Not by `silence_of`: that view
+                // clamps a stamp ahead of the pass mark down to "just now"
+                // for display, and the pass mark is taken before the clock
+                // that stamps are read by - so two keeps a millisecond
+                // apart could clamp into a tie and the address decide,
+                // shedding the one that only just went quiet. The raw
+                // stamps carry the order the whole memory exists to keep.
+                let ports = self.carried_ports.get(&pair.dev);
+                let mut order: Vec<(u64, Mac)> = kept
+                    .iter()
+                    .map(|m| (ports.and_then(|ps| ps.get(m)).map_or(0, |&(_, t)| t), *m))
+                    .collect();
+                // Smallest stamp = longest since it last spoke; the
+                // address is the tiebreak.
+                order.sort_unstable();
                 let mut shed = 0usize;
                 for (_, m) in order {
                     if occupied + CAPACITY_HEADROOM <= self.max_macs {
@@ -2918,13 +3031,19 @@ impl Syncer {
                 // would: an unreadable note reads as the empty set, and
                 // "would remove 0" with exit 0 is the opposite of the
                 // refusal the real run answers this state with.
+                //
+                // Read FIRST, ask the mark second - the mark is only set
+                // once a read has failed (the shedder documents the same
+                // rule), and in this fresh one-shot process nothing has
+                // read yet: asked first, the guard can never fire, which
+                // is exactly the wrong-way preview it exists to prevent.
+                let owned = self.load_owned(&dev);
                 if !self.note_is_readable(&dev) {
-                    println!("{dev}: note unreadable, a real flush would fail here");
+                    note!("{dev}: note unreadable, a real flush would fail here");
                     clean = false;
                     continue;
                 }
-                let owned = self.load_owned(&dev);
-                println!("{dev}: would remove {} address(es)", owned.len());
+                note!("{dev}: would remove {} address(es)", owned.len());
                 continue;
             }
             // Read, unregister and unlink under the note's lock. A daemon
@@ -2940,7 +3059,7 @@ impl Syncer {
                 // name. The recorded index reaches the entries anyway.
                 let index = topo.get(&dev).map(|l| l.index).or_else(|| {
                     let (index, new_name) = self.renamed_target(&dev, &topo)?;
-                    println!("{dev}: now called {new_name}, removing through it");
+                    note!("{dev}: now called {new_name}, removing through it");
                     Some(index)
                 });
                 let (gone, kept) = match index {
@@ -2949,14 +3068,14 @@ impl Syncer {
                 };
                 if kept.is_empty() && self.note_is_readable(&dev) {
                     self.remove_note(&dev);
-                    println!("{dev}: removed {gone} address(es)");
+                    note!("{dev}: removed {gone} address(es)");
                     true
                 } else {
                     // write_owned, not save_owned: the lock is already held,
                     // and taking it again on a second descriptor would wait
                     // on itself.
                     self.write_owned(&dev, &kept);
-                    println!(
+                    note!(
                         "{dev}: removed {gone} address(es), {} could not be removed \
                          and stay on record",
                         kept.len()

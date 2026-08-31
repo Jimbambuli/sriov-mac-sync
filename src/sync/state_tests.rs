@@ -1,3 +1,17 @@
+//! The state machine's proving ground: ~140 tests against the fake socket,
+//! each one a sentence about behaviour. Rough map, in file order - the
+//! blocks grew with the features and the banners below mark them:
+//!
+//!   * notes and ownership (locks, appends, symlinks, crashes mid-write)
+//!   * the wire and reflection rules (invariant 1)
+//!   * virtual-function exclusion and the grow-refresh (invariant 2)
+//!   * removal only of what we own (invariant 3, orphans, renames)
+//!   * the quiet keep: stamps, memory file, restarts, both valves
+//!   * capacity: headroom, warnings, what a full card sheds
+//!
+//! House rule: every new assertion is verified against the mutation it
+//! guards before it lands; a guard that survives its mutant is deleted.
+
 use super::tests::*;
 use super::*;
 use crate::netlink::{RTM_DELNEIGH, RTM_NEWNEIGH};

@@ -62,7 +62,7 @@ mkdir -p "$OUT"
 
 build() {   # target
 	echo "== building $1"
-	RUSTFLAGS="-C linker=rust-lld" cargo build --release --target "$1" >/dev/null
+	RUSTFLAGS="-C linker=rust-lld" cargo build --locked --release --target "$1" >/dev/null
 	cp "target/$1/release/sriov-mac-sync" "$OUT/sriov-mac-sync-$2"
 }
 

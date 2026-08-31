@@ -62,13 +62,21 @@ below. Unlike
 .B \-\-dry\-run
 and
 .BR \-\-status ,
-this writes: it puts a real unicast entry into the live card and takes it out
-again, and it leaves an ownership note behind. A take\-back that fails is
-reported, and the entry then stays until it is removed by hand.
+this writes: it offers a real unicast entry to the live card and takes it back
+out, and an ownership note travels with the entry \(em gone again on the
+ordinary path. A take\-back that fails is reported, and the entry stays
+.IR noted :
+a running daemon's next pass, or
+.BR \-\-flush ,
+removes it. Only a host with no daemon at all needs a hand
+.BR "bridge fdb del" .
 .TP
 .B \-\-flush
 Remove every address this daemon registered. A plain stop deliberately leaves
-them in place, because they are what makes the peers reachable.
+them in place, because they are what makes the peers reachable; the order for
+taking a host out of service is under
+.B SIGNALS
+below.
 .TP
 .B \-\-dry\-run
 Report the changes without applying them.
@@ -155,7 +163,15 @@ starting a comment.
 .B PAIRS
 Space\-separated
 .I DEV:BRIDGE
-pairs. Empty means autodetect.
+pairs. Empty means autodetect. A
+.B \-\-pair
+on the command line replaces this list rather than adding to it \(em unlike
+.BR EXCLUDE / EXTRA ,
+which merge. And naming pairs by hand switches the orphan sweep off on
+purpose: the daemon then cannot know it sees every uplink, so a pair removed
+from this list keeps its filter entries until
+.B \-\-flush
+takes them out or autodetection is allowed to conclude the device is gone.
 .TP
 .B RESYNC
 Seconds between full reconciliations.

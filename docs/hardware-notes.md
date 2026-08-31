@@ -13,7 +13,7 @@ That 128 was arrived at by experiment, and this file used to say the size could
 not be queried. It can, on the drivers that register the generic devlink
 parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
 function and its VFs, which is exactly the experimental figure. The daemon asks
-over devlink at startup - and again when a pair appears at runtime - and both
+over devlink at startup — and again when a pair appears at runtime — and both
 warns above what the card says and releases quiet addresses to stay under it; `--max` or
 `MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
 place. `-v` reports the card's answer, or its silence; a written-down `--max`
@@ -123,7 +123,7 @@ Measured on an OPNsense (FreeBSD) living on a VF in front of a Proxmox host -
 which is much of this project's audience. FreeBSD holds ARP entries for
 1200 s (`net.link.ether.inet.max_age`); the Linux bridge forgets a silent
 MAC after 300 s (`ageing_time`). A guest that stays quiet for five minutes
-ages out of the bridge, the filter entry used to go with it - and the
+ages out of the bridge, the filter entry used to go with it — and the
 router then keeps sending unicast for another fifteen minutes without asking
 again. The eSwitch misses, the frame leaves on the wire, and every
 connection attempt dies in a dial timeout. Observed as 259 reverse-proxy 502s
@@ -131,15 +131,15 @@ over four weeks, alternating with successes exactly as the 15-minute poll
 beat against the 20-minute ARP lifetime.
 
 Who is bitten depends on where the miss lands. A missed frame leaves on the
-uplink port's own wire - for a peer on that wire (a printer on the same
+uplink port's own wire — for a peer on that wire (a printer on the same
 switch) the miss *is* the delivery: the path degrades to the physical switch
 and heals itself, and such wire-learnt addresses are never registered anyway.
 Every destination the bridge would have to carry the frame to is blackholed:
 guests behind the bridge, and just as much a device behind another NIC in
-the same bridge - the frame leaves on the uplink's wire, not on that NIC's.
+the same bridge — the frame leaves on the uplink's wire, not on that NIC's.
 
 The quiet-keep covers the bitten set whole: an aged-out address is kept
-while the port it was learnt behind still hangs in the bridge - ageing is
+while the port it was learnt behind still hangs in the bridge — ageing is
 the bridge managing its own table, not news about the device. The entry
 goes when its port goes, when the address moves out to the wire, or under
 filter pressure, longest silent first. The memory is written down beside

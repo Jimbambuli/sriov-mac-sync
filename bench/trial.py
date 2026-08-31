@@ -236,6 +236,9 @@ class Monitor:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.sock.bind((0, RTMGRP_NEIGH))
         self.sock.setblocking(False)
+        # Only 'NEW' is ever asserted on; 'DEL' rides along because the
+        # monitor mirrors what the socket delivers, and dropping it here
+        # would make the raw event log lie about what arrived.
         self.events = []  # (t_ns, 'NEW'|'DEL', ifindex, flags, mac)
 
     def pump(self, until_ns):

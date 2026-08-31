@@ -1,3 +1,15 @@
+//! Shared plumbing for the sync tests: the fake socket (`FakeSock`), the
+//! standard host fixture (`host()` - two bridges, a stacked vnet, VFs), the
+//! well-known addresses (WIRE, BEHIND_NIC, ...) and a handful of builders.
+//! The scenario tests live in `state_tests.rs`, the `--extra` pinning ones
+//! in `extra_tests.rs`.
+//!
+//! One fixture caveat, learnt the hard way: `Builder::master()` fills only
+//! `slaves`, not `lowers` - the real `Topology::load` fills both. A fixture
+//! built with `master()` alone has an empty lower graph, and `leads_to`/
+//! `flood` walk into nothing. Spell out `.lower(...)` when the test needs
+//! reachability to mean anything.
+
 use super::*;
 use crate::netlink::FdbEntry;
 use crate::topology::fixture::{mac, Builder};

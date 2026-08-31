@@ -426,9 +426,12 @@ impl Socket {
     fn recv_flags(&self, buf: &mut [u8], extra: libc::c_int) -> io::Result<usize> {
         // Dropping a datagram that is not the kernel's is the anti-spoofing
         // rule; dropping them for ever is a way to be wedged. Unicast to a
-        // netlink pid needs no privilege, so any local process can keep this
-        // loop fed - and the callers' deadlines are checked between calls,
-        // not in here. A bounded batch of drops, then WouldBlock: the
+        // netlink pid DOES take CAP_NET_ADMIN in this netns (measured on
+        // 6.12: unprivileged sendto answers EPERM) - so the feeder this
+        // bound defends against is already root-equivalent for the
+        // network, and the bound is defence in depth, not the last line.
+        // The callers' deadlines are checked between calls, not in here.
+        // A bounded batch of drops, then WouldBlock: the
         // deadline caller re-enters (and re-checks its clock), the event
         // reader reports an empty batch and the next poll wakes it again.
         let mut dropped = 0;
@@ -1959,6 +1962,31 @@ mod tests {
         collect_vf_macs(&body, &mut out);
         assert_eq!(out, vec![(5, [2, 0, 0, 0, 0, 1]), (5, [2, 0, 0, 0, 0, 2])]);
 
+        // The same message with NLA_F_NESTED stamped on every nest type -
+        // the shape a kernel with strict netlink validation sends one day.
+        // The flag mask (`kind & 0x3fff`) is what makes this come out
+        // equal; its own comment calls the failure "the worst failure
+        // direction this program has" (an empty VF list loses the sibling
+        // VF addresses from the exclusion set), and until this test the
+        // mask was the suite's only surviving mutation.
+        const NLA_F_NESTED: u16 = 0x8000;
+        let mut list = Vec::new();
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac([2, 0, 0, 0, 0, 1]));
+        put_attr(&mut list, IFLA_VF_INFO | NLA_F_NESTED, &info);
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac([2, 0, 0, 0, 0, 2]));
+        put_attr(&mut list, IFLA_VF_INFO | NLA_F_NESTED, &info);
+        let mut body = ifinfomsg(5);
+        put_attr(&mut body, IFLA_VFINFO_LIST | NLA_F_NESTED, &list);
+        let mut out = Vec::new();
+        collect_vf_macs(&body, &mut out);
+        assert_eq!(
+            out,
+            vec![(5, [2, 0, 0, 0, 0, 1]), (5, [2, 0, 0, 0, 0, 2])],
+            "a kernel that stamps NLA_F_NESTED must not empty the VF list"
+        );
+
         // A message about no interface contributes nothing.
         let mut bad = ifinfomsg(0);
         put_attr(&mut bad, IFLA_VFINFO_LIST, &list);
@@ -1997,6 +2025,47 @@ mod tests {
         // Nothing queued reads as nothing, not as an error.
         let quiet = sock.recv_events().unwrap();
         assert!(quiet.fdb.is_empty() && !quiet.links_changed);
+    }
+
+    /// The kernel filter's DROP direction, which is its whole reason to
+    /// exist and had no test: an off-by-one in the hand-coded jump offsets
+    /// degrades silently to accept-everything, every suite stays green, and
+    /// the measured zero-wakeups-under-ARP-storm property is quietly dead.
+    /// AF_UNIX datagram pairs honour SO_ATTACH_FILTER with the production
+    /// semantics, so the program itself can be put on the wire here. The
+    /// deliver direction needs no twin: the daemon attaches this filter in
+    /// production, so a filter that dropped bridge events would fail every
+    /// event scenario in the netns suite.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn the_noise_filter_drops_what_it_exists_to_drop() {
+        let (mut sock, kernel) = kernel_pair();
+        attach_noise_filter(sock.fd.as_raw_fd()).expect("the filter attaches");
+
+        // An AF_INET neighbour - ARP chatter, the noise the filter is for.
+        let mut arp = ndmsg(4, 0x02, 0, Some([2, 0, 0, 0, 0, 7]), None);
+        arp[0] = libc::AF_INET as u8;
+        send_raw(&kernel, &msg(RTM_NEWNEIGH, 0, &arp));
+        // An AF_BRIDGE neighbour - the bridge talking, must get through.
+        send_raw(
+            &kernel,
+            &msg(
+                RTM_NEWNEIGH,
+                0,
+                &ndmsg(4, 0x02, 0, Some([2, 0, 0, 0, 0, 8]), Some(9)),
+            ),
+        );
+
+        // Only the bridge entry arrives; the ARP datagram never wakes us.
+        let ev = sock.recv_events().unwrap();
+        assert_eq!(
+            ev.fdb.len(),
+            1,
+            "the ARP neighbour reached userspace - the filter is accept-everything"
+        );
+        assert_eq!(ev.fdb[0].1.mac, [2, 0, 0, 0, 0, 8]);
+        let quiet = sock.recv_events().unwrap();
+        assert!(quiet.fdb.is_empty(), "nothing else should be queued");
     }
 
     /// The registration request, byte for byte, and both answers to it. The

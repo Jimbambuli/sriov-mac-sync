@@ -218,7 +218,8 @@ usage: sriov-mac-sync [options]
   --check         test whether the uplink accepts unicast filter entries
   --flush         remove every address this daemon registered
   --dry-run       report changes without applying them
-  --timings       after every pass, say what each phase cost and what it
+  --timings       with the daemon or --once: after every pass, say what
+                  each phase cost and what it
                   found, and name anything that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  full reconciliation interval (default 300)
@@ -605,7 +606,13 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
             Err(e) => {
                 syncer.forget_check_probe(&pair.dev, &probe);
                 note!(
-                    "{} ({driver}): FAILED - the driver refuses unicast filter entries: {e}",
+                    // "the kernel refused", not "the driver refuses": the
+                    // errno does not say which layer said no - EPERM
+                    // arrives for capability problems as well as for
+                    // drivers that reject the operation - and blaming the
+                    // driver sends an operator with a rights problem down
+                    // the wrong road.
+                    "{} ({driver}): FAILED - the kernel refused the unicast filter entry: {e}",
                     pair.dev
                 );
                 ok = false;
@@ -657,8 +664,6 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
     ok
 }
 
-/// A millisecond count the way an operator reads one: seconds under two
-/// minutes, minutes under two hours, hours beyond.
 /// A silence, in days, hours, minutes and seconds.
 ///
 /// Every unit from the largest non-zero one down to seconds, and no
@@ -1379,9 +1384,10 @@ mod tests {
 
     /// The two modes that print addresses say the same thing about them.
     ///
-    /// `--status` writes to stdout and `--once` to stderr, so they cannot
-    /// share a print; they share the rendering instead, and this is what
-    /// keeps a second spelling from growing beside the first.
+    /// Both modes write to stdout (`note!` says why), but in different
+    /// places of their output - so they cannot share a print; they share
+    /// the rendering instead, and this is what keeps a second spelling
+    /// from growing beside the first.
     #[test]
     fn the_address_lines_name_the_quiet_ones() {
         let detail = sync::Detail {

@@ -1,5 +1,19 @@
 # Contributing
 
+## Where to start reading
+
+`src/sync/mod.rs` is the core and carries the canon: the three numbered
+invariants and the project vocabulary live in its module doc. From there:
+
+    main.rs      CLI, conf file, the modes (--status/--once/--check/--flush)
+    daemon.rs    the loop: Schedule, Picture, run_pass, handle_batch
+    sync/mod.rs  the decisions: reconcile, the fast path, both valves
+    sync/notes.rs the ownership files: locks, atomicity, the quiet memory
+    netlink.rs   the wire format, hand-rolled and fuzz-tested
+    topology.rs  the interface graph and autodetection
+    devlink.rs   one question: the card's filter capacity
+    hash.rs      the map/set wrappers (seeded hashing, deterministic tests)
+
 ## Build
 
 ```

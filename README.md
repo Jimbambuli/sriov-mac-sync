@@ -58,6 +58,11 @@ dpkg -i sriov-mac-sync_amd64.deb
 # (the stock image has uclient-fetch, not curl: uclient-fetch -O <file> <url>)
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.apk
 apk add --allow-untrusted --force-non-repository ./sriov-mac-sync_x86_64.apk
+# The flags are the price of a package outside a repository. If you want to
+# verify what you are installing: the builds are reproducible — CI builds the
+# same artefacts from the same tree on every push, and rebuilding a tag with
+# the rustc named inside the binary yields byte-identical files (SHA256SUMS
+# ships with every release).
 
 # OpenWrt 23.05 and older (opkg)
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.ipk
@@ -85,9 +90,11 @@ sriov-mac-sync --status             what is detected, wanted and registered
 If `--check` passes and `--dry-run` names the addresses you expected, enable the
 unit. `--check` only proves the *kernel* took the entry — whether the card acts
 on it is [a question for traffic](#does-it-work-on-your-card). Note that
-`--check` writes: it puts a real unicast entry into the live card, takes it out
-again, and leaves a note file behind. If the removal fails it says so, and the
-entry stays until you remove it. `--dry-run` and `--status` write nothing.
+`--check` writes: it offers a real unicast entry to the live card and takes it
+back out, and an ownership note travels with the entry — gone again on the
+ordinary path. If the take-back fails, the entry stays *noted*, so a running
+daemon's next pass (or `--flush`) removes it; only a host with no daemon at
+all needs a hand `bridge fdb del`. `--dry-run` and `--status` write nothing.
 
 ```
 sriov-mac-sync --once               reconcile and exit; the exit code says
@@ -103,7 +110,15 @@ sriov-mac-sync --exclude <macs>     never register these
 sriov-mac-sync -v, --verbose ...    explain what is skipped; with --status or
                                     --once, list the addresses and the port
                                     each was learnt behind, longest silence
-                                    last
+                                    last:
+
+                                      bc:24:11:06:4b:52 veth105i0
+                                      bc:24:11:fc:0a:fd tap210i0
+                                      bc:24:11:6a:ad:a1 veth106i0  (quiet, silent     4m 34s)
+                                      04:7b:cb:c9:f4:4c nic3       (quiet, silent 2h 49m  7s)
+
+                                    On a virtualisation host the port names
+                                    the guest: veth106i0 is container 106.
 sriov-mac-sync --version            print the version
 ```
 
@@ -153,7 +168,7 @@ hardware are welcome; those four steps are the whole test.
   registering is all-or-nothing, and an address learnt on the uplink in *any*
   VLAN is left out entirely. A kept quiet address is VLAN-blind the same way:
   behind the bridge in one VLAN and out on the wire in another, the keep
-  re-asserts the behind view once both learns age - bounded, and healed by
+  re-asserts the behind view once both learns age — bounded, and healed by
   the peer's next frame.
 - **A quiet guest stays registered.** Bridge entries age out, 300 s by
   default, but a router that caches ARP longer keeps sending unicast without
@@ -161,14 +176,14 @@ hardware are welcome; those four steps are the whole test.
   wire. A miss is a delivery only for peers on the uplink port's own wire;
   everywhere the bridge would have carried the frame, it is a blackhole. So
   an aged-out address is simply kept while the port it was learnt behind
-  still hangs in the bridge - ageing is the bridge managing its table, not
+  still hangs in the bridge — ageing is the bridge managing its table, not
   news about the device. The entry goes when its port goes, when the
   address moves out to the wire, or under filter pressure: as the list
   nears its capacity the entries silent longest are released first, and
   every fresh learn makes an entry young again. What the daemon remembers
   is written down beside its notes, so an update or a restart hands the
   keeps to the next process instead of unregistering every quiet guest on
-  its first pass. A reboot does start from nothing - `/run` is a tmpfs, and
+  its first pass. A reboot does start from nothing — `/run` is a tmpfs, and
   the card's filter went with the power. `EXTRA` still pins an address
   outright. How the pressure is measured, and what it costs, is in
   [docs/internals.md](docs/internals.md).
@@ -213,7 +228,18 @@ something could not be measured, it says so.
 Dated: `YEAR.MONTH.N`, where `N` counts releases within that month — the number
 tells you how old a build is, which is the question people ask about a daemon.
 Releases up to 1.5.0 used semantic versions; `dpkg`, `apk` and cargo all order
-2026 after 1, so upgrading works.
+2026 after 1, so upgrading works. What changed in each release lives in the
+annotated tags (`git tag -n99`) and on the
+[releases page](https://github.com/Jimbambuli/sriov-mac-sync/releases) —
+deliberately not in a CHANGELOG file, which would be a third prose copy with
+the weakest test coverage in the tree.
+
+## Status
+
+Finished, in the sense that matters: the scope is deliberately this one,
+verified on four driver families, and there is no roadmap. Bug reports and
+hardware reports are read; the four `bridge fdb` steps under
+[Does it work on your card](#does-it-work-on-your-card) are the whole test.
 
 ## License
 

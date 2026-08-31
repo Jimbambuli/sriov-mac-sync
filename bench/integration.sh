@@ -12,7 +12,12 @@
 #
 # Needs root and iproute2, creates the namespace "sms-it", and uses the real
 # /run/sriov-mac-sync - so it refuses to run where a daemon is already
-# working. Everything it creates is removed on exit, pass or fail.
+# working. Everything it creates is removed on exit, pass or fail - except
+# the scenario logs under /tmp/sms-it-*.log, which are the evidence a failed
+# (or noted) run is read by and are overwritten by the next one.
+#
+# Scenario letters (S6b, S6c, ...) are stable IDs in insertion order, not
+# execution order; trial.py numbers its own, separate circle.
 #
 #   sudo bench/integration.sh target/release/sriov-mac-sync
 set -u

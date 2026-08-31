@@ -1,3 +1,6 @@
+//! Tests for `--extra`/`EXTRA` pinning - "extra" as in the option, not as
+//! in "additional tests".
+
 use super::tests::*;
 use super::*;
 use crate::topology::fixture::mac;

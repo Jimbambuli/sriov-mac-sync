@@ -25,17 +25,17 @@ and the graph carries both directions of each edge, so "what sits on top of this
 bridge" is one walk rather than one per interface.
 
 The daemon works from notifications. An address is registered as soon as the
-kernel says a bridge learnt it, dropped when the bridge ages it out - unless
+kernel says a bridge learnt it, dropped when the bridge ages it out — unless
 its port testifies otherwise: the pass remembers which bridge port
 each owned address was last learnt behind, and an aged-out address whose port
-still exists in the bridge is kept - for a guest the kernel deletes the veth
+still exists in the bridge is kept — for a guest the kernel deletes the veth
 or tap with its endpoint, so the port existing is the guest existing, and a
 device behind a physical port in the bridge is blackholed by ageing all the
 same. What bounds the keep is capacity, not time: nearing the filter's limit,
 the entries silent longest are released first, and every fresh learn makes
 an entry young again. The pressure is measured against the card's own
-unicast list, read back each pass - foreign entries occupy real slots and
-count - and the event path carries that count between passes, surrendering
+unicast list, read back each pass — foreign entries occupy real slots and
+count — and the event path carries that count between passes, surrendering
 the longest-silent keep synchronously when a burst would not fit: past its
 limit the card drops arbitrarily, and 200 ms of overflow is 200 ms of
 somebody unreachable. What stays free below the limit is a few slots of
@@ -45,33 +45,33 @@ its port goes or the address moves out to the wire.
 That memory outlives the process. It is written to `.<dev>.owned.ports`
 beside the note, under the same lock and through the same temp-and-rename.
 Its first line names the format, so a file whose numbers meant something
-else is ignored rather than misread - that mistake was made once, when the
+else is ignored rather than misread — that mistake was made once, when the
 stamps changed from missing-since to last-seen.
 Then one line per address: the port by name *and* index, and the boot-clock
-reading at which the bridge was last seen holding it - milliseconds,
+reading at which the bridge was last seen holding it — milliseconds,
 because between two passes the daemon is blind anyway and a finer digit
 would claim a precision the observation has not got. Every pass refreshes
 that stamp for everything it finds learnt, and so does every learn on the
-event path - which is what makes "quiet" a fact rather than a guess: an
+event path — which is what makes "quiet" a fact rather than a guess: an
 address whose stamp predates the last pass is one the last pass did not
 see. The same number orders the pressure valve's evictions, and it records
 when the guest last *spoke* rather than when the daemon noticed the
 silence, so two addresses that fall out between the same two passes are
 told apart by their traffic instead of by their names. Two passes may
-never share a stamp - everything would then read as loud - so a pass whose
+never share a stamp — everything would then read as loud — so a pass whose
 clock reading matches its predecessor's takes the next number up rather
 than a finer clock being asked for.
 
 The bridge's own deletions refine that stamp. A bridge forgets an address
 exactly its ageing time after the last frame from it, so `RTM_DELNEIGH`
-arriving now says the guest spoke one ageing time ago - which the daemon
+arriving now says the guest spoke one ageing time ago — which the daemon
 reads out of the same link dump the topology comes from
 (`IFLA_BR_AGEING_TIME`). It is taken only when it places that frame
 *later* than the last pass did: a vlan-aware bridge holds one entry per
 VLAN and ages them apart, so a deletion may well concern an address that
 spoke in another VLAN a moment ago, and our own observation is then the
 better one. So the event can say "it went on speaking after you last
-looked" and never the reverse - which is also why a deletion is still no
+looked" and never the reverse — which is also why a deletion is still no
 reason to unregister anything, only to look.
 
 Forward-only is the rule for every stamp, not just that one, and it is
@@ -80,10 +80,10 @@ do not share a clock reading: a pass stamp is nudged past its
 predecessor and can sit a millisecond ahead of the clock a learn moments
 later reads, and a deletion's date is deliberately older than now. The
 number means "the most recent moment there is evidence for", so an older
-observation is not evidence against a newer one - it is simply nothing
+observation is not evidence against a newer one — it is simply nothing
 new. A restart is mostly an update,
 and an update that forgot its keeps would unregister every quiet guest on
-its first pass - the outage the keep exists to prevent, delivered by our
+its first pass — the outage the keep exists to prevent, delivered by our
 own package. A line is believed only where it still describes this kernel,
 which is what the name-and-index pair is for: an interface replaced under
 the same name does not inherit somebody else's keeps. The clock is
@@ -92,7 +92,8 @@ and cannot step under NTP; the file shares the notes' tmpfs, so a stamp and
 the clock that reads it always come from the same boot. Losing the file
 costs the keeps and nothing else: a write that fails is one warning per
 device and a carry on, and a file that cannot be read or parsed is simply
-no memory - the fall back to what every build before it did.
+no memory — the daemon then falls back to what every build before the file
+existed did.
 
 The whole picture is rebuilt whenever an interface appears, disappears or is
 reconfigured. What notifications do *not* cover is a VF's address changing
@@ -146,6 +147,22 @@ a reboot would undo it. Only autodetection may draw that conclusion, because
 only autodetection sees every uplink; naming pairs by hand says nothing about
 the pairs it omits. Notes are written 0600 in a 0700 directory — a note another
 user can write is a note that decides what a root daemon takes out of a card.
+
+**Ownership lives in files because the card cannot carry it.** A unicast
+list entry has no owner field — read back, our entry and one somebody else
+put there are the same bytes. So the question "did we add this?" can only be
+answered by a record we keep ourselves, and a file beside the daemon is the
+record that survives a crash of the daemon. (This is about the self/uc path
+specifically; the bridge's own FDB does attribute entries to ports, but the
+port is not an owner either.)
+
+**A second daemon converges rather than fights.** There is no instance lock,
+deliberately: every write is per-device under the note's flock, so two
+daemons interleave the way a daemon and a hand-run `--once` do — each pass
+converges on the same desired set, and the loser of any race is corrected by
+its own next pass. The failure mode of a lock (a stale lock file wedging the
+service after a crash) would be worse than the cost of the race (a few
+redundant netlink writes).
 
 **An address is noted before the card takes it** — the order `--check` has
 always used, now used everywhere. Written the other way round, a crash between
@@ -212,6 +229,11 @@ again on the strength of how sensible they sound:
 * **Keeping the interface graph and updating it from link events** — not done,
   and now pointless: reading it afresh costs 0.185 ms, and a stale graph is a
   class of silent error no test would catch.
+* **`// SAFETY:` tags on the unsafe blocks** — not done, deliberately. Every
+  non-trivial block carries its soundness argument as prose where the
+  argument belongs; tagging the ~20 trivial libc wrappers as well would bury
+  that signal (today: bare means trivial, a paragraph means read it), and
+  the enforcing lint would weld the build to a comment-detection heuristic.
 
 ## Putting it on trial
 
@@ -223,7 +245,9 @@ python3 bench/trial.py vmbr1 --vlan 22
 ```
 
 Nine scenarios: addresses learnt one at a time, in close succession, and as a
-burst of sixteen; a hundred cold `--once` passes with the CPU governor logged;
+burst of sixteen; a hundred cold `--once` passes with the CPU governor pinned
+to `performance` for the run and put back after (`--governor leave` measures
+the machine as found; either way the choice is logged);
 an address of ours turning up on the uplink's own port (a guest that moved
 host); a VF's own address learnt behind the bridge; a guest going quiet whose
 entry has to stay — the keep, proven on the real eSwitch; the port's removal;
@@ -247,7 +271,7 @@ If a failed run leaves test entries behind (prefixes `02:be:5c` and
 `bridge fdb del <mac> dev <uplink> self permanent` and leave the note files
 alone: the daemon heals its own notes through the ENOENT path on the next pass.
 After a hard kill the bridge entries age out within 300 s and the daemon takes
-the registrations back by itself - except those whose guest port lives on,
+the registrations back by itself — except those whose guest port lives on,
 which is the point of the quiet-keep; the trial's own veth goes with the
 teardown, so its entries do come back out.
 
