@@ -1078,6 +1078,43 @@ mod tests {
     ///
     /// Skipped where a netlink socket cannot be opened at all - some build
     /// containers - because there is then nothing to compare against.
+    /// The kernel counts the ageing time in clock_t - hundredths of a
+    /// second - and everything above works in milliseconds. The factor is
+    /// the whole of the conversion, and getting it wrong by ten dates every
+    /// deletion thirty seconds or fifty minutes into the past instead of
+    /// five minutes. Both harnesses build their bridges at the default,
+    /// where the dating provably cannot move a stamp, so nothing else here
+    /// would notice.
+    #[test]
+    fn the_ageing_time_arrives_in_milliseconds() {
+        let topo = Topology::from_links(vec![crate::netlink::LinkInfo {
+            index: 10,
+            name: "vmbr1".into(),
+            mac: None,
+            master: None,
+            link: None,
+            kind: Some("bridge".into()),
+            parent_dev: None,
+            ageing: Some(30_000),
+        }]);
+        assert_eq!(
+            topo.at(10).and_then(|l| l.ageing_ms),
+            Some(300_000),
+            "30000 clock_t is five minutes, the kernel's default"
+        );
+        let none = Topology::from_links(vec![crate::netlink::LinkInfo {
+            index: 10,
+            name: "vmbr1".into(),
+            mac: None,
+            master: None,
+            link: None,
+            kind: Some("bridge".into()),
+            parent_dev: None,
+            ageing: None,
+        }]);
+        assert_eq!(none.at(10).and_then(|l| l.ageing_ms), None);
+    }
+
     #[test]
     fn the_kernel_and_the_filesystem_describe_the_same_host() {
         let mut sock = match crate::netlink::Socket::new() {

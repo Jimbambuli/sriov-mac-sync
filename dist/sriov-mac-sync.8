@@ -164,8 +164,9 @@ the entry is, so a crash cannot leave an entry nobody owns. Beside each note,
 a record of the uplink's interface index, so the note can follow a renamed
 interface, and the quiet\-keep memory
 .RI ( .DEV .owned.ports ):
-which port each address was learnt behind and since when it has been missing,
-so an update hands the keeps to the next process. Kept across a restart on
+one line per owned address \(em live ones included \(em naming the port it was
+learnt behind and when the bridge was last seen holding it, so an update hands
+the keeps to the next process. Kept across a restart on
 purpose; a reboot clears it, which is right, because the card's filter is
 empty by then too. On OpenWrt, which has no
 .IR /run ,

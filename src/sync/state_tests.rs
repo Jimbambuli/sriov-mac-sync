@@ -3743,50 +3743,76 @@ fn an_empty_memory_leaves_no_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A stamp from after now is a clock that was tampered with or a file from
-/// another boot - clamped to "missing since now", the youngest there is,
-/// not believed as ancient: ancient is the valve's FIRST victim, and a
-/// bogus stamp must not nominate one.
+/// A stamp from the future is brought back to now, not believed.
+///
+/// The clock counts from boot, so a memory file that outlives a reboot
+/// carries stamps that are hours ahead of a freshly started machine's.
+/// Believed, such a stamp says "spoke since the last pass" for the life of
+/// the process - which is not a harmless "youngest": an address that is
+/// never quiet is never a candidate the pressure valve can surrender, so
+/// the slot is held until the guest itself leaves the bridge, which is
+/// exactly the deadlock the valve exists to prevent.
 #[test]
 fn a_future_stamp_is_clamped_not_believed() {
     let dir = scratch("quiet-future-stamp");
-    let honest: Mac = [0x02, 0xe7, 0, 0, 0, 2];
-    let bogus: Mac = [0x02, 0xe7, 0, 0, 0, 1];
+    let a: Mac = [0x02, 0xe7, 0, 0, 0, 1];
+    let b: Mac = [0x02, 0xe7, 0, 0, 0, 2];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = kernel(vec![learned(4, 10, honest), learned(4, 10, bogus)]);
+    let mut sock = kernel(vec![learned(4, 10, a), learned(4, 10, b)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    // `honest` goes quiet and earns a real clock; then the file is doctored
-    // so `bogus` carries a stamp from the far future.
-    let mut sock2 = kernel(vec![card_holds(2, honest), learned(4, 10, bogus)]);
-    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     drop(s);
-    std::thread::sleep(Dur::from_millis(20));
+
+    // Both stamps are doctored to lie far ahead - the shape a memory file
+    // that outlived a reboot has, since the clock counts from boot.
     let path = dir.join(".nic1.owned.ports");
-    let doctored = fs::read_to_string(&path)
+    let doctored: String = fs::read_to_string(&path)
         .unwrap()
-        .replace(" -", " 18446744073709551615");
+        .lines()
+        .map(|l| {
+            let mut f: Vec<&str> = l.split(' ').collect();
+            if f.len() == 4 {
+                f[3] = "18446744073709551615";
+            }
+            format!("{}\n", f.join(" "))
+        })
+        .collect();
     fs::write(&path, doctored).unwrap();
 
-    // Both quiet, room for one keep: the honest clock is older than a
-    // clamped future stamp, so `honest` is the one shed - a believed
-    // future stamp would wrap into the distant past and shed `bogus`...
-    // except the tiebreak would too. The discriminating assert is that the
-    // load itself does not panic and `bogus` is NOT shed first despite a
-    // stamp that, taken at face value, dwarfs every honest one.
-    let mut restarted = br0_syncer(&dir);
-    restarted.max_macs = 6;
-    let mut sock3 = kernel(vec![card_holds(2, honest), card_holds(2, bogus)]);
-    restarted
-        .reconcile(&mut sock3, true, &topo, Dur::ZERO)
-        .unwrap();
-    assert!(
-        sock3.removed.iter().any(|(_, m)| *m == honest),
-        "the honestly-oldest entry is the valve's victim"
-    );
-    assert!(
-        !sock3.removed.iter().any(|(_, m)| *m == bogus),
-        "a clamped future stamp must count as the youngest, not the oldest"
+    // Restart with room to spare: both are silent now, both are kept.
+    let mut s = br0_syncer(&dir);
+    let mut sock2 = kernel(vec![card_holds(2, a), card_holds(2, b)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(s.carried["nic1"].quiet.len(), 2, "both should be kept");
+    assert!(sock2.removed.is_empty(), "there was no pressure yet");
+    // A clamped stamp reads as "spoke just now" for exactly one pass; the
+    // second one leaves it behind, and from there it ages honestly. The
+    // sleep is what makes that second pass's stamp certainly later: both
+    // land in the same millisecond otherwise, and which of the two the
+    // clock ticks between decides the outcome.
+    std::thread::sleep(Dur::from_millis(5));
+    let mut sock2b = kernel(vec![card_holds(2, a), card_holds(2, b)]);
+    s.reconcile(&mut sock2b, true, &topo, Dur::ZERO).unwrap();
+
+    // Now the room runs out and a newcomer arrives. One of the two silent
+    // addresses has to pay for it.
+    s.max_macs = 7;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xe7, 0, 0, 0, 9];
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert_eq!(
+        sock3.removed.len(),
+        1,
+        "a believed future stamp is never quiet, so the valve found nothing to surrender"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -4733,7 +4759,10 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
     // Long enough that the deletion's date lands after the pass, so the
     // only-if-later guard lets it through and the number is really this
     // code's arithmetic rather than the pass's stamp.
-    std::thread::sleep(Dur::from_millis(260));
+    // Twice the ageing time, so that the two answers are far apart: dated,
+    // the silence comes out at one ageing time; undated, it is the whole
+    // wait. A window that admits both is a window that pins nothing.
+    std::thread::sleep(Dur::from_millis(400));
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let mut ev = FakeSock::default();
     s.fast_apply(&mut ev, &topo, &[(RTM_DELNEIGH, learned(4, 10, m))])
@@ -4747,8 +4776,9 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
         .find(|(a, _)| *a == m)
         .expect("the address should be held quiet");
     assert!(
-        (150..=400).contains(silent),
-        "the silence should be about the bridge's 200 ms ageing time, was {silent} ms"
+        (190..=310).contains(silent),
+        "the silence should be the bridge's 200 ms ageing time, not the 400 ms \
+         since the pass - was {silent} ms"
     );
 }
 
@@ -4768,11 +4798,19 @@ fn a_stamp_never_moves_backwards_whoever_writes_it() {
     let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
-    // Two passes back to back land in one millisecond, so the second
-    // one's stamp is nudged past the clock the next learn will read.
+    // A pass stamp is `max(clock, previous + 1)`, so a run of passes
+    // inside one millisecond walks ahead of the clock. Two passes back to
+    // back usually do that by themselves - usually is not a premise, and
+    // for two years of this test's life it silently did not hold - so the
+    // predecessor is set a minute ahead and the nudge is certain.
+    s.last_pass_at = Syncer::boot_millis() + 60_000;
     let mut sock2 = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     let after_pass = s.carried_ports["nic1"][&m].1;
+    assert!(
+        after_pass > Syncer::boot_millis(),
+        "the premise: the pass stamp has to be ahead of the clock a learn reads"
+    );
 
     // A learn now: evidence the guest is alive, and it must not read as
     // older than what the pass already recorded.
@@ -4796,6 +4834,232 @@ fn a_stamp_never_moves_backwards_whoever_writes_it() {
     assert!(
         s.carried_ports["nic1"][&m].1 >= before_del,
         "a deletion set the stamp back"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A registration the card refused with a hard error is NOT in the card,
+/// and must not be recorded as if it were. The grow-gate reads
+/// owned-and-present as "re-learning this grows nothing" and skips the
+/// fresh driver question - so a wrongly-present address lets the next
+/// re-learn write a virtual function's own address into the filter.
+#[test]
+fn a_refused_registration_is_not_recorded_as_present() {
+    let dir = scratch("present-honest");
+    let m: Mac = [0x02, 0xf8, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+
+    // The card refuses the add outright. The note keeps the line for the
+    // retry - that is the crash posture and deliberate.
+    let mut fail = crate::hash::map();
+    fail.insert(m, libc::EBUSY);
+    let mut sock = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fail_add: fail,
+        ..Default::default()
+    };
+    s.fast_apply(&mut sock, &topo, &[(RTM_NEWNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert!(
+        s.load_owned("nic1").contains(&m),
+        "a refused add keeps its note line for the retry"
+    );
+    assert!(
+        !s.carried["nic1"].present.contains(&m),
+        "an address the card refused was recorded as present"
+    );
+
+    // The re-learn is therefore a growth, and a growth asks the driver.
+    let mut sock2 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut sock2, &topo, &[(RTM_NEWNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert!(
+        sock2.vf_asked >= 1,
+        "putting an address the card never took back in is a growth and has to ask"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The event path's valve surrenders from the same pool the pass's does -
+/// the pass's keeps - so it can never reach an address the pass would
+/// refuse to shed. A pinned EXTRA that has aged out of the bridge is
+/// exactly such an address: `quiet_survivors` skips everything still
+/// wanted, so the pass would never surrender it, and neither may a burst.
+#[test]
+fn the_fast_valve_never_sheds_a_pinned_address() {
+    let dir = scratch("shed-spares-pinned");
+    let pinned: Mac = [0x02, 0xf9, 0, 0, 0, 1];
+    let ordinary: Mac = [0x02, 0xf9, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    s.extra.insert(pinned);
+    let mut sock = kernel(vec![learned(4, 10, pinned), learned(4, 10, ordinary)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Both fall silent. `pinned` stays wanted because EXTRA pins it, so
+    // it is not a keep; `ordinary` is.
+    let mut sock2 = kernel(vec![card_holds(2, pinned), card_holds(2, ordinary)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // Room for one: `ordinary` has to pay, whatever the addresses sort
+    // like - `pinned` sorts first and would go if the pool were the whole
+    // port memory.
+    s.max_macs = 7;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xf9, 0, 0, 0, 9];
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == pinned),
+        "the burst surrendered a pinned address the pass would have kept"
+    );
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == ordinary),
+        "the ordinary keep should have paid instead"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A pass that could not read its note refreshes no stamp, so it must not
+/// advance the ground stamps are judged against either - every live guest
+/// would read as quiet afterwards and the event path would delete a
+/// speaking guest's entry to make room.
+#[test]
+fn a_blind_pass_does_not_move_the_ground() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = scratch("blind-pass-ground");
+    let m: Mac = [0x02, 0xfa, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let ground = s.carried["nic1"].passed_at;
+
+    // The note is replaced by one this daemon cannot read.
+    let note = dir.join("nic1.owned");
+    let tmp = dir.join(".nic1.owned.swap");
+    fs::write(&tmp, fs::read_to_string(&note).unwrap()).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::rename(&tmp, &note).unwrap();
+
+    let mut sock2 = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(
+        s.carried["nic1"].passed_at, ground,
+        "a pass that saw nothing moved the ground its stamps are judged against"
+    );
+    assert!(
+        s.carried["nic1"].quiet.is_empty(),
+        "a pass that could not read its note keeps nothing"
+    );
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The memory only ever learns about addresses this daemon registered.
+///
+/// A deletion arrives for every address the bridge forgets, ours or not,
+/// and `date_the_silence` dates them all - but an address with no entry
+/// yet gets one only when a port comes with it, and a deletion carries
+/// none. Without that, the neighbour's printer would sit in the memory,
+/// and the pressure valve draws its victims from there: it would send a
+/// `bridge fdb del` for an entry this daemon never put in the card, which
+/// is the one thing the removal path may never do.
+#[test]
+fn a_deletion_alone_never_puts_an_address_into_the_memory() {
+    let dir = scratch("memory-owned-only");
+    let ours: Mac = [0x02, 0xfb, 0, 0, 0, 1];
+    let stranger: Mac = [0x02, 0xfb, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, ours)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+
+    // The bridge forgets both: one of ours, and one that was never ours
+    // to begin with.
+    let mut ev = FakeSock::default();
+    s.fast_apply(
+        &mut ev,
+        &topo,
+        &[
+            (RTM_DELNEIGH, learned(4, 10, ours)),
+            (RTM_DELNEIGH, learned(4, 10, stranger)),
+        ],
+    )
+    .unwrap();
+    assert!(
+        s.carried_ports["nic1"].contains_key(&ours),
+        "our own address should still be remembered"
+    );
+    assert!(
+        !s.carried_ports["nic1"].contains_key(&stranger),
+        "a deletion put a foreign address into the memory the valve deletes from"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What the valve surrenders, it also stops counting.
+///
+/// The occupancy is what the next burst measures its room against, and
+/// `present` is what tells the decide phase an address is already in the
+/// card. A shed entry that stays in either makes the valve believe it
+/// freed nothing - so it sheds again, and again, one guest per burst,
+/// while the card never gets any emptier.
+#[test]
+fn a_shed_entry_stops_being_counted() {
+    let dir = scratch("shed-bookkeeping");
+    let old: Mac = [0x02, 0xfc, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, old)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    let mut sock2 = kernel(vec![card_holds(2, old)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    let before = s.carried["nic1"].occupancy;
+    assert!(s.carried["nic1"].present.contains(&old));
+
+    s.max_macs = 5;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xfc, 0, 0, 0, 9];
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
+        .unwrap();
+    assert!(
+        ev.removed.iter().any(|(_, m)| *m == old),
+        "the silent entry should have been surrendered"
+    );
+    assert!(
+        !s.carried["nic1"].present.contains(&old),
+        "a surrendered address is still counted as being in the card"
+    );
+    assert!(
+        !s.carried["nic1"].quiet.contains(&old),
+        "a surrendered address is still offered to the next burst"
+    );
+    // One out, one in: the count says exactly that.
+    assert_eq!(
+        s.carried["nic1"].occupancy, before,
+        "the occupancy did not follow what the valve did"
     );
     let _ = fs::remove_dir_all(&dir);
 }

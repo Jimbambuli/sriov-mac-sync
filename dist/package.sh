@@ -166,6 +166,22 @@ if [ "$1" = remove ]; then
 		deb-systemd-invoke stop sriov-mac-sync.service >/dev/null 2>&1 \
 			|| systemctl stop sriov-mac-sync.service >/dev/null 2>&1 || true
 	fi
+	# Stopping is not the same as stopped. deb-systemd-invoke exits 0
+	# without doing anything when a policy-rc.d says services may not be
+	# touched - a container image build, a chroot - so the fallback never
+	# runs and the check below is the only thing between a live daemon
+	# and a --flush it would undo on its next pass, with the binary gone
+	# by then and nothing left able to take the entries out.
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -x sriov-mac-sync >/dev/null 2>&1 || break
+		sleep 0.5
+	done
+	if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
+		echo "sriov-mac-sync did not stop; not flushing - run" >&2
+		echo "  sriov-mac-sync --flush" >&2
+		echo "once it is down, or its entries stay in the card." >&2
+		exit 0
+	fi
 	[ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
 fi
 EOF
@@ -226,8 +242,18 @@ if [ "${PKG_UPGRADE:-0}" = 1 ]; then
 	# operator switched off deliberately stays off.
 	ls /etc/rc.d/[SK]??sriov-mac-sync >/dev/null 2>&1 &&
 		/etc/init.d/sriov-mac-sync enable
-	/etc/init.d/sriov-mac-sync restart 2>/dev/null
-	echo "sriov-mac-sync restarted on the new binary."
+	# And restart only what was running. `restart` starts a stopped
+	# service, so an operator who took the daemon down on purpose - to
+	# hand the card to something else, to debug - would find it back and
+	# writing to the filter after an unrelated `opkg upgrade`. The old
+	# daemon is still up at this point, which is what makes the question
+	# answerable here.
+	if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
+		/etc/init.d/sriov-mac-sync restart 2>/dev/null
+		echo "sriov-mac-sync restarted on the new binary."
+	else
+		echo "sriov-mac-sync was not running; left stopped."
+	fi
 	exit 0
 fi
 /etc/init.d/sriov-mac-sync enable
@@ -337,7 +363,11 @@ EOF
 #!/bin/sh
 ls /etc/rc.d/[SK]??sriov-mac-sync >/dev/null 2>&1 &&
 	/etc/init.d/sriov-mac-sync enable
-/etc/init.d/sriov-mac-sync restart 2>/dev/null
+# Only what was running, for the reason the .ipk post-install spells out:
+# `restart` would start a daemon the operator stopped on purpose.
+if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
+	/etc/init.d/sriov-mac-sync restart 2>/dev/null
+fi
 exit 0
 EOF
 

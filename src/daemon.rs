@@ -217,6 +217,12 @@ impl Schedule {
     /// forwarding change five seconds later.
     fn retry_soon(&mut self, now: Instant) {
         self.next_full = now + RETRY_AFTER;
+        // The attempt counts as a pass for pacing, though not for the
+        // trigger name: `last_pass` is what bounds the rate, and a
+        // refusal streak that left it standing let every notification buy
+        // another whole-table dump - on a host that is already unable to
+        // read one.
+        self.last_pass = now;
     }
 
     /// A pass that ran. The next belongs to the timer until something claims
@@ -326,21 +332,37 @@ impl Picture {
     /// from a picture one link message out of date still beats not answering
     /// it. The cost is carried to the pass a few milliseconds later, which
     /// works from this same reading rather than paying for its own.
-    fn for_batch<W: World>(&mut self, world: &mut W) -> Option<Topology> {
+    fn for_batch<W: World>(&mut self, world: &mut W) -> Look {
         if !self.needs_reading() {
-            return None;
+            return Look::Current;
         }
         match self.read(world) {
             Ok((cost, previous)) => {
                 self.carried_load += cost;
-                previous
+                Look::Replaced(previous)
             }
             Err(e) => {
                 eprintln!("warning: {e}");
-                None
+                Look::Refused
             }
         }
     }
+}
+
+/// What a fast-path look at the topology yielded.
+///
+/// Three answers, because a caller that has to fail closed cannot do it on
+/// two: "nothing was replaced" and "nothing could be read" are the same
+/// `None` and opposite facts. The picture the fast path holds after a
+/// refusal is the very one whose staleness asked for the read.
+enum Look {
+    /// The picture was already current. Nothing was replaced, and what is
+    /// held answers for both sides of the comparison.
+    Current,
+    /// A fresh reading took over from this one.
+    Replaced(Option<Topology>),
+    /// The reading was refused; what is held is known stale.
+    Refused,
 }
 
 /// "Believe nothing carried": the picture and the driver's VF answer go
@@ -603,15 +625,25 @@ pub(crate) fn handle_batch<W: World>(
     // What the batch's link messages were about is judged against the picture
     // as it stands - before it is read again, because an interface that has
     // just gone is only in that one.
-    let previous = picture.for_batch(world);
-    if !events.changed_links.is_empty()
-        && sync::vf_may_have_changed(
-            previous.as_ref(),
-            picture.held.as_ref(),
-            &events.changed_links,
-        )
-    {
-        syncer.vf_stale = true;
+    let look = picture.for_batch(world);
+    if !events.changed_links.is_empty() {
+        let may = match look {
+            // Nothing readable to judge with. A link message arrived and
+            // the one thing that could say what it meant is unavailable,
+            // so the carried virtual-function answer is spent.
+            Look::Refused => true,
+            Look::Current => {
+                sync::vf_may_have_changed(None, picture.held.as_ref(), &events.changed_links)
+            }
+            Look::Replaced(previous) => sync::vf_may_have_changed(
+                previous.as_ref(),
+                picture.held.as_ref(),
+                &events.changed_links,
+            ),
+        };
+        if may {
+            syncer.vf_stale = true;
+        }
     }
 
     // Whether the batch left anything for a pass to do. A pass dumps the
@@ -1338,6 +1370,45 @@ mod tests {
             assert_eq!(
                 syncer.max_macs, 64,
                 "the card's answer has to reach the pressure valve"
+            );
+        }
+
+        /// A link message arrived and the topology could not be read. The
+        /// held picture is then the very one whose staleness asked for the
+        /// read, and answering "does this interface have virtual functions"
+        /// out of it is answering out of the past - the carried driver
+        /// answer has to be spent instead.
+        #[test]
+        fn an_unreadable_picture_spends_the_carried_driver_answer() {
+            let (mut syncer, _opts, _dir) = setup("blind-link-change", 300);
+            let mut world = FakeWorld::new(5);
+            let mut picture = Picture::new();
+            // What is held says index 2 has no functions. It is out of date -
+            // that is why the read was asked for - but it is confident.
+            picture.held = Some(
+                crate::topology::fixture::Builder::new()
+                    .add("nic1", 2, Some(mac(1)))
+                    .build(),
+            );
+            picture.stale = false;
+            syncer.vf_stale = false;
+            world.topo_fails = true;
+            let started = world.base;
+
+            handle_batch(
+                &mut world,
+                &mut syncer,
+                &mut picture,
+                &netlink::Events {
+                    links_changed: true,
+                    changed_links: vec![2],
+                    ..Default::default()
+                },
+                started,
+            );
+            assert!(
+                syncer.vf_stale,
+                "a link change judged out of an unreadable picture kept the carried answer"
             );
         }
 

@@ -79,6 +79,22 @@ pub enum Urgency {
     Now,
 }
 
+/// What a registration attempt actually achieved.
+struct Registered {
+    /// Addresses this call put into the card.
+    put: Vec<Mac>,
+    /// Addresses the card is now known to hold because of this call - the
+    /// ones it took, plus the ones it refused with EEXIST because they
+    /// were already there. Anything else was NOT written: a hard error
+    /// leaves the note naming it and the card without it, and recording
+    /// it as present would make the next re-learn look like a re-learn of
+    /// something already in - which skips the fresh driver question that
+    /// keeps a VF's own address out of the filter.
+    held: Vec<Mac>,
+    /// What went wrong, for a caller that reports.
+    failures: Vec<String>,
+}
+
 /// What one pass left behind about an uplink's filter.
 #[derive(Default)]
 struct Carried {
@@ -90,6 +106,17 @@ struct Carried {
     /// link-down leaves addresses noted but absent, and putting one back
     /// is a growth that must ask the driver afresh.
     present: Set<Mac>,
+    /// The addresses that pass decided to keep: ours, aged out of the
+    /// bridge, and held because their port lives. The one pool BOTH
+    /// valves surrender from - the pass's own and the event path's - so
+    /// the event path cannot reach anything the pass would not. Being
+    /// built from the pass's `kept` it is by construction free of
+    /// everything that must never be shed: pinned EXTRA addresses and
+    /// anything else still wanted, foreign entries, and addresses the
+    /// note does not name. A pass that could not read its note keeps
+    /// nothing, so the set is empty and the event path shed nothing
+    /// either - which is the honest answer when the ledger is unreadable.
+    quiet: Set<Mac>,
     /// When that pass ran, in the same boot-clock the addresses are
     /// stamped in. This is what makes "quiet" a fact rather than a
     /// guess: every pass refreshes the stamp of everything the bridge
@@ -873,14 +900,19 @@ impl Syncer {
         }
         let mut ports: Map<Mac, (u32, u64)> = crate::hash::map();
         let mut lines: Vec<String> = Vec::new();
+        let now = Self::boot_millis();
         for (mac, name, index, seen) in self.read_ports(dev) {
             if topo.index_of(&name) != Some(index) {
                 continue;
             }
-            // A stamp from the future - a tampered clock, a file from
-            // another boot - is defused where ages are computed: every
-            // reader subtracts saturating, so it counts as the youngest,
-            // never as the valve's first victim.
+            // A stamp from the future - a file from another boot, since the
+            // clock counts from it - is brought back to now. Left standing
+            // it says "spoke after the last pass" for the life of the
+            // process, which is not merely the youngest: it is never quiet,
+            // so the valve can never reach it and the slot is held until
+            // the address leaves the bridge. Clamped, it costs one pass of
+            // being thought current and then ages like everything else.
+            let seen = seen.min(now);
             ports.insert(mac, (index, seen));
             lines.push(Self::ports_line(&mac, &name, index, seen));
         }
@@ -1036,9 +1068,11 @@ impl Syncer {
     ///
     /// Not every deletion is an ageing - a flush, a port going down and a
     /// hand-run `bridge fdb del` look the same from here - so this is an
-    /// estimate, and a wrong one only ever makes an address look older
-    /// than it is: it is then evicted sooner under pressure, which for an
-    /// address the bridge has genuinely dropped is the right direction.
+    /// estimate. Because it is only ever taken when it moves the stamp
+    /// forward, a wrong one can only make an address look *younger* than
+    /// it is and be surrendered later than it deserves; it can never make
+    /// one look older, and so can never cost a live guest its entry.
+    /// Erring towards keeping is the direction to err in.
     fn date_the_silence(&mut self, topo: &Topology, events: &[(u16, FdbEntry)]) {
         let now = Self::boot_millis();
         for (kind, entry) in events {
@@ -1128,8 +1162,9 @@ impl Syncer {
         dev: &str,
         index: u32,
         macs: &[Mac],
-    ) -> Option<(Vec<Mac>, Vec<String>)> {
+    ) -> Option<Registered> {
         let mut put: Vec<Mac> = Vec::new();
+        let mut held: Vec<Mac> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         let refused = self.locked(dev, || {
             let Some(fresh) = self.append_owned_locked(dev, macs) else {
@@ -1139,7 +1174,10 @@ impl Syncer {
             let mut unclaim: Vec<Mac> = Vec::new();
             for mac in macs {
                 match sock.set_self_fdb(index, mac, true) {
-                    Ok(()) => put.push(*mac),
+                    Ok(()) => {
+                        put.push(*mac);
+                        held.push(*mac);
+                    }
                     // The dump a moment ago said it was absent, so somebody
                     // else put it there in between - the same call from a
                     // --once in a second terminal is somebody else.
@@ -1148,6 +1186,10 @@ impl Syncer {
                     // that predates it stays, because it was ours all
                     // along.
                     Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                        // Somebody else's entry, but an entry: it fills a
+                        // slot, and the next batch must not read it as
+                        // room.
+                        held.push(*mac);
                         if fresh.contains(mac) {
                             unclaim.push(*mac);
                         }
@@ -1175,10 +1217,14 @@ impl Syncer {
         if refused {
             return None;
         }
-        Some((put, failures))
+        Some(Registered {
+            put,
+            held,
+            failures,
+        })
     }
 
-    /// Surrender up to `need` kept addresses, longest-missing first -
+    /// Surrender up to `need` kept addresses, longest-silent first -
     /// card, note and memory in the same breath, under the note's lock
     /// like every other removal. The fast path's arm of the pressure
     /// valve: a burst that would overflow the card cannot wait the 200 ms
@@ -1205,26 +1251,28 @@ impl Syncer {
         }
         // No pass yet, no ground to judge quietness on - and nothing was
         // registered by this process either, so there is nothing to shed.
-        let Some(passed_at) = self.carried.get(dev).map(|c| c.passed_at) else {
+        // No pass yet, no ground to judge on - and nothing this process
+        // registered either, so there is nothing to shed.
+        let Some(carried) = self.carried.get(dev) else {
             return 0;
         };
+        let (passed_at, quiet) = (carried.passed_at, &carried.quiet);
         let Some(ports) = self.carried_ports.get(dev) else {
             return 0;
         };
-        let mut cands: Vec<(u64, Mac)> = ports
+        // The pass's own keeps, and nothing else. That set is what the
+        // pass's valve surrenders from, so both valves reach exactly the
+        // same addresses: never a pinned EXTRA or anything else still
+        // wanted, never a foreign entry, never one the note does not
+        // name. On top of it, the freshness test - a stamp older than the
+        // last pass means the last pass did not find the address, so it
+        // is still quiet now; a learn since then has stamped it forward
+        // and taken it out of reach, which is also why an address this
+        // very batch is registering can never be its own victim.
+        let mut cands: Vec<(u64, Mac)> = quiet
             .iter()
-            // Only the quiet: an address with no missing-stamp is one the
-            // bridge still knows, and shedding a live guest to make room
-            // for another is not a trade this daemon makes. Quiet is a
-            // fact here, not a guess: every pass refreshes the stamp of
-            // everything the bridge holds, so a stamp older than the last
-            // pass means the last pass did not find it. The batch's own
-            // addresses need no second guard either - the caller stamps
-            // them first, so an address being registered right now is
-            // never a candidate; deleting it to add it back would free no
-            // slot at all.
-            .filter(|(_, &(_, seen))| seen < passed_at)
-            .map(|(m, &(_, seen))| (seen, *m))
+            .filter_map(|m| ports.get(m).map(|&(_, seen)| (seen, *m)))
+            .filter(|(seen, _)| *seen < passed_at)
             .collect();
         // Smallest stamp = longest since it last spoke; the address is
         // the tiebreak, as in the pass's valve.
@@ -1260,6 +1308,9 @@ impl Syncer {
             c.occupancy = c.occupancy.saturating_sub(dropped.len());
             for mac in &dropped {
                 c.present.remove(mac);
+                // Surrendered is no longer kept: a second batch in the
+                // same window must not count it as room it can free again.
+                c.quiet.remove(mac);
             }
         }
         note!(
@@ -1304,7 +1355,7 @@ impl Syncer {
     /// to the uplink port's own wire. Anything the bridge must carry - a
     /// device on another NIC as much as a guest - blackholes. So an aged
     /// address is simply kept; the honest limit is filter capacity, and the
-    /// pressure valve collects it from the longest-missing entries first.
+    /// pressure valve collects it from the longest-silent entries first.
     ///
     /// A port that is GONE keeps nothing: the kernel deletes a veth or tap
     /// with its endpoint, and a vanished physical port took its segment
@@ -1736,9 +1787,10 @@ impl Syncer {
 
             // Kept addresses cost filter slots, and past its capacity the
             // card drops entries silently - so they are the first
-            // surrendered as the list nears the limit, longest-missing
-            // first: every fresh learn makes an entry young again, so what
-            // goes is what has not been heard from for the longest. A
+            // surrendered as the list nears the limit, longest-silent
+            // first: every entry carries the stamp of when the bridge was
+            // last seen holding it, so what goes is what has not been
+            // heard from for the longest. A
             // surrendered keep is exactly the old behaviour, never worse.
             //
             // The limit is measured, not assumed: the pass reads the card's
@@ -1798,6 +1850,11 @@ impl Syncer {
             let mut removed = 0usize;
             let mut foreign = 0usize;
 
+            // What the card is known to hold because of this pass's own
+            // additions - the ones it took and the ones it refused as
+            // already there. What a hard error left out is deliberately
+            // absent.
+            let mut landed: Vec<Mac> = Vec::new();
             let mut to_add: Vec<Mac> = Vec::new();
             for mac in &want {
                 if present.contains(mac) {
@@ -1819,10 +1876,11 @@ impl Syncer {
                 added = to_add.len();
             } else if !to_add.is_empty() {
                 match self.register_batch_locked(sock, &pair.dev, dev_index, &to_add) {
-                    Some((put, mut failed)) => {
-                        added = put.len();
-                        owned.extend(put);
-                        timings.failures.append(&mut failed);
+                    Some(mut r) => {
+                        added = r.put.len();
+                        owned.extend(r.put);
+                        landed = r.held;
+                        timings.failures.append(&mut r.failures);
                     }
                     None => {
                         eprintln!(
@@ -1852,10 +1910,12 @@ impl Syncer {
             // off - an entry in the card that no note names, the permanent
             // orphan. `stale` was computed from THIS pass's reading, so a
             // line somebody appends meanwhile is not in it and survives.
+            // Outlives the block: what the card really let go decides what
+            // the next batch may count as room.
+            let mut dropped: Vec<Mac> = Vec::new();
             if apply && !self.dry_run && !stale.is_empty() {
                 let mut evict: Vec<Mac> = Vec::new();
                 let mut failures: Vec<String> = Vec::new();
-                let mut dropped: Vec<Mac> = Vec::new();
                 self.locked(&pair.dev, || {
                     for mac in &stale {
                         removed += 1;
@@ -1975,19 +2035,32 @@ impl Syncer {
             // what this pass leaves behind - the additions below land, the
             // stale loop above took its removals out - plus the foreign
             // entries nobody here may touch.
-            let mut holds: Set<Mac> = want.iter().copied().collect();
-            holds.extend(
-                present
-                    .iter()
-                    .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
-                    .copied(),
-            );
+            // What the card holds when this pass is done, observed rather
+            // than intended: what the dump found, plus what this pass's
+            // own additions really landed, minus what its removals really
+            // took out. An address a hard error left out of the card is
+            // absent from all three and so stays absent here - the
+            // grow-gate must ask the driver afresh when it comes back.
+            let mut holds: Set<Mac> = present.iter().copied().collect();
+            holds.extend(landed);
+            for mac in &dropped {
+                holds.remove(mac);
+            }
             self.carried.insert(
                 pair.dev.clone(),
                 Carried {
-                    occupancy: occupied,
+                    occupancy: holds.len(),
                     present: holds,
-                    passed_at: pass_at,
+                    quiet: kept.clone(),
+                    // A pass that could not read its note refreshed no
+                    // stamp, so it must not advance the ground they are
+                    // judged against either: every live guest would read
+                    // as quiet afterwards.
+                    passed_at: if owned_was_readable {
+                        pass_at
+                    } else {
+                        self.carried.get(&pair.dev).map_or(0, |c| c.passed_at)
+                    },
                 },
             );
 
@@ -2255,6 +2328,7 @@ impl Syncer {
                     c.occupancy = c.occupancy.saturating_sub(taken_back.len());
                     for mac in &taken_back {
                         c.present.remove(mac);
+                        c.quiet.remove(mac);
                     }
                 }
                 // And out of the written-down memory too: an eviction that
@@ -2436,8 +2510,8 @@ impl Syncer {
                 }
             }
             self.note_index(&dev, fp.index);
-            let put = match self.register_batch_locked(sock, &dev, fp.index, &macs) {
-                Some((put, _failed)) => put.len(),
+            let held = match self.register_batch_locked(sock, &dev, fp.index, &macs) {
+                Some(r) => r.held,
                 None => {
                     // A batch of ours already bought the pass, which says
                     // the held-back count out loud and retries.
@@ -2446,17 +2520,22 @@ impl Syncer {
                          ownership note has to take them first and could not",
                         macs.len()
                     );
-                    0
+                    Vec::new()
                 }
             };
-            // The card really holds `put` more slots now, and holds every
-            // address of this batch either way - EEXIST means somebody
-            // else's entry is in, which occupies a slot just the same, and
-            // the next batch must not read it as new. The next pass's
-            // read-back corrects any drift.
+            // Only what the card is now KNOWN to hold: what it took, and
+            // what it refused as already there. An address a hard error
+            // left out must not be recorded as present - the grow-gate
+            // reads owned-and-present as "re-learning this grows nothing"
+            // and would then skip the fresh driver question that keeps a
+            // virtual function's own address out of the filter. The next
+            // pass's read-back corrects any drift.
             let c = self.carried.entry(dev.clone()).or_default();
-            c.occupancy += put;
-            c.present.extend(macs.iter().copied());
+            for mac in held {
+                if c.present.insert(mac) {
+                    c.occupancy += 1;
+                }
+            }
         }
         Ok(urgency)
     }

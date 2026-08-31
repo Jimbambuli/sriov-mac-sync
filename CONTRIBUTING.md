@@ -22,8 +22,11 @@ one you built on, `RUSTFLAGS="-C target-feature=+crt-static" cargo build
 
 ## Packaging
 
-Everything a release ships — static binaries, `.deb` and `.ipk`, for both
-architectures — from a machine with the two musl targets installed:
+Everything a release ships — static binaries, `.deb`, `.ipk` and `.apk`, for
+both architectures — from a machine with the two musl targets installed. The
+`.apk` is what OpenWrt 24.10 and newer install, and the README's download URL
+names it, so `APK=` is not optional: without it `package.sh` builds everything
+else and the release ships a documented download that 404s.
 
 ```
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -40,7 +43,8 @@ build, and that is not an oversight: SR-IOV needs a PCIe root complex that
 implements it, and hardware pairing that with an armv7 CPU is not something you
 will meet. The `.ipk` is built for `x86_64` and `aarch64_generic`; because the
 binary is static, `opkg install --force-architecture` puts the aarch64 one on a
-`cortex-a53` or `cortex-a72` build just as well.
+`cortex-a53` or `cortex-a72` build just as well. The `.apk` is built for the
+same two.
 
 ## Tests
 

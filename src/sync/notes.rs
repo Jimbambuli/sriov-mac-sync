@@ -89,16 +89,20 @@ impl Syncer {
     }
 
     /// The quiet memory as it was last written: which bridge port each owned
-    /// address was learnt behind, and since when it has been missing from
-    /// the forwarding table.
+    /// address was learnt behind, and when the bridge was last seen holding
+    /// it. Every owned learnt address has a line, the live ones included -
+    /// what makes one quiet is that its stamp is older than the last pass.
     ///
     /// Beside the note rather than in it, so the note stays a plain list of
     /// addresses that any build of this program can read - the same
-    /// reasoning as the index record. A line is
+    /// reasoning as the index record. The first line is the format marker
+    /// `sriov-mac-sync ports 3`, without which the whole file is ignored;
+    /// each line after it is
     ///
-    ///     <address> <port-name> <port-ifindex> <missing-since|->
+    ///     <address> <port-name> <port-ifindex> <last-seen-millis>
     ///
-    /// and the port is written both ways on purpose: the index is what the
+    /// where the stamp counts from boot. The port is written both ways on
+    /// purpose: the index is what the
     /// pass works in, and the caller only believes a line whose name still
     /// carries that very index. An interface that was replaced under the
     /// same name, or a name that moved, therefore loses its memory rather
@@ -335,8 +339,13 @@ impl Syncer {
             } else if self.note_is_readable(dev) {
                 // Readable, but it moved while we read it. The set is
                 // whatever we got; the next look reads again rather than
-                // trusting it.
+                // trusting it. The index record lives beside the note and
+                // moves with it - a --flush from a second terminal
+                // unlinks both - so the cached index goes too, or
+                // note_index short-circuits for the life of the process
+                // and a later rename is read as a disappearance.
                 self.notes.borrow_mut().remove(dev);
+                self.indices.borrow_mut().remove(dev);
                 return f(&set);
             } else {
                 // The read failed, and what `read_owned` returns then is an

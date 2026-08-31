@@ -92,10 +92,14 @@ jobs:
         run: APK=/tmp/apk-tools/build/src/apk ./dist/package.sh
       - name: Both binaries are static
         run: |
+          # readelf, not ldd: an x86 ldd prints no "=>" line for an aarch64
+          # file whatever it is linked against, so the aarch64 half of this
+          # check could not fail. A PT_INTERP segment is the fact - a
+          # static binary has none.
           for a in x86_64 aarch64; do
             file "dist/out/sriov-mac-sync-$a"
-            ! ldd "dist/out/sriov-mac-sync-$a" 2>/dev/null | grep -q "=>" \
-              || (echo "$a binary still has dynamic dependencies" && exit 1)
+            ! readelf -l "dist/out/sriov-mac-sync-$a" | grep -q INTERP \
+              || (echo "$a binary still has a dynamic loader" && exit 1)
           done
       - name: The aarch64 binary runs
         run: |
@@ -124,6 +128,12 @@ jobs:
           # that programs a NIC has anything to do, and policy-rc.d is allowed
           # to stop it.
           test "$(systemctl is-enabled sriov-mac-sync)" = enabled
+          # The removal path has the same refusal the .ipk one carries, for
+          # the same reason: `deb-systemd-invoke stop` exits 0 without
+          # stopping anything when a policy-rc.d forbids it.
+          dpkg -e dist/out/sriov-mac-sync_amd64.deb /tmp/debctl
+          grep -q "not flushing" /tmp/debctl/prerm \
+            || (echo ".deb prerm flushes without checking the daemon is down" && exit 1)
           systemctl is-active sriov-mac-sync || echo "(not running here, fine)"
           # The upgrade path the quiet-keep memory exists for: installing
           # the same .deb again runs old-prerm "upgrade" + postinst with
@@ -170,6 +180,9 @@ jobs:
             # did not stop - a live one puts the entries straight back.
             ar p "$f" control.tar.gz | tar xzOf - ./prerm | grep -q "not flushing" \
               || (echo "$f: prerm flushes without checking the daemon is down" && exit 1)
+            # An upgrade must not start a daemon the operator stopped.
+            ar p "$f" control.tar.gz | tar xzOf - ./postinst | grep -q "left stopped" \
+              || (echo "$f: postinst restarts unconditionally on upgrade" && exit 1)
           done
       - name: The .apk is one OpenWrt would take
         run: |

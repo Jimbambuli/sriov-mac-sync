@@ -1771,6 +1771,49 @@ mod tests {
         put_attr(&mut nested, IFLA_INFO_KIND, b"vlan\0");
         put_attr(&mut body, IFLA_LINKINFO, &nested);
 
+        // A bridge's ageing time rides one level deeper still, inside
+        // IFLA_INFO_DATA. Nothing else in the tree reads it, so a wrong
+        // attribute id here is invisible everywhere else: the deletion
+        // dating simply stops moving stamps and every test still passes.
+        // The two ids are written as the numbers the kernel headers give
+        // - IFLA_INFO_DATA is 2, IFLA_BR_AGEING_TIME is 4 - and not as
+        // this file's constants, which would let the test agree with a
+        // decoder that reads the wrong attribute.
+        let mut br_data = Vec::new();
+        put_attr(&mut br_data, 4, &30_000u32.to_ne_bytes());
+        let mut br_info = Vec::new();
+        put_attr(&mut br_info, IFLA_INFO_KIND, b"bridge\0");
+        put_attr(&mut br_info, 2, &br_data);
+        let mut br = ifinfomsg(10);
+        put_attr(&mut br, IFLA_IFNAME, b"vmbr1\0");
+        put_attr(&mut br, IFLA_LINKINFO, &br_info);
+        let b = parse_link(&br).expect("a bridge message parses");
+        assert_eq!(b.kind.as_deref(), Some("bridge"));
+        assert_eq!(
+            b.ageing,
+            Some(30_000),
+            "the bridge's ageing time has to come out of IFLA_INFO_DATA, \
+             in the kernel's clock_t - 30000 is the default five minutes"
+        );
+
+        // A bridge that does not report one, and a truncated value, both
+        // leave the dating without a number rather than with a wrong one.
+        let mut plain = ifinfomsg(10);
+        put_attr(&mut plain, IFLA_IFNAME, b"vmbr1\0");
+        let mut only_kind = Vec::new();
+        put_attr(&mut only_kind, IFLA_INFO_KIND, b"bridge\0");
+        put_attr(&mut plain, IFLA_LINKINFO, &only_kind);
+        assert_eq!(parse_link(&plain).expect("parses").ageing, None);
+        let mut short = Vec::new();
+        put_attr(&mut short, 4, &[1u8, 2]);
+        let mut short_info = Vec::new();
+        put_attr(&mut short_info, IFLA_INFO_KIND, b"bridge\0");
+        put_attr(&mut short_info, 2, &short);
+        let mut trunc = ifinfomsg(10);
+        put_attr(&mut trunc, IFLA_IFNAME, b"vmbr1\0");
+        put_attr(&mut trunc, IFLA_LINKINFO, &short_info);
+        assert_eq!(parse_link(&trunc).expect("parses").ageing, None);
+
         let l = parse_link(&body).expect("a well-formed link message parses");
         assert_eq!(l.index, 7);
         assert_eq!(l.name, "nic1", "the kernel's trailing NUL stays out");
