@@ -226,7 +226,8 @@ usage: sriov-mac-sync [options]
                   quiet keeps as the list nears it (default 128)
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
-  -v, --verbose   explain what is skipped and why
+  -v, --verbose   explain what is skipped and why; with --status or --once,
+                  list every wanted address and how long each has been quiet
   -h, --help      this text
       --version   print the version
 
@@ -668,6 +669,31 @@ fn human_duration(ms: u64) -> String {
     }
 }
 
+/// The addresses an uplink wants, one per line, marking the ones held
+/// through a silence with how long each has been silent.
+///
+/// Returned rather than printed: `--status` writes to stdout and `--once`
+/// to stderr, beside the report line each belongs under, and the wording
+/// must not drift between the two.
+fn address_lines(detail: &sync::Detail) -> Vec<String> {
+    let ages: std::collections::BTreeMap<_, _> = detail.quiet_ages.iter().copied().collect();
+    let mut wanted = detail.wanted.clone();
+    wanted.sort();
+    wanted
+        .iter()
+        .map(|mac| match ages.get(mac) {
+            // The question the 502 hunt actually asked: which of these is
+            // a keep, and for how long has nobody heard from it.
+            Some(ms) => format!(
+                "    {} (quiet, silent {})",
+                format_mac(mac),
+                human_duration(*ms)
+            ),
+            None => format!("    {}", format_mac(mac)),
+        })
+        .collect()
+}
+
 fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigger: &str) {
     for r in reports {
         if verbose && r.foreign > 0 {
@@ -751,9 +777,10 @@ fn run() -> Result<bool, String> {
 
     let mut syncer = Syncer::new(pairs.clone(), state_dir());
     syncer.dry_run = opts.dry_run;
-    // Only --status prints the per-address half of a report, and only it
-    // pays for building one.
-    syncer.detail = opts.mode == Mode::Status;
+    // Only the modes that print the per-address half of a report pay for
+    // building one. Both are a single pass run by hand; the daemon, which
+    // would build it once a pass for ever, is not among them.
+    syncer.detail = matches!(opts.mode, Mode::Status | Mode::Once);
     // Only autodetection sees every uplink, so only autodetection may conclude
     // that a leftover note belongs to none of them.
     syncer.authoritative = opts.pairs.is_empty();
@@ -796,26 +823,13 @@ fn run() -> Result<bool, String> {
                         r.stacked.join(" ")
                     }
                 );
-                // The per-address half is built only for this mode, so
-                // the daemon does not copy the whole desired set and walk
-                // every silence once a pass for numbers nothing prints.
+                // The per-address half is built only for the two modes
+                // that print it, so the daemon does not copy the whole
+                // desired set and walk every silence once a pass for
+                // numbers nothing prints.
                 if let (true, Some(detail)) = (opts.verbose, r.detail.as_ref()) {
-                    let ages: std::collections::BTreeMap<_, _> =
-                        detail.quiet_ages.iter().copied().collect();
-                    let mut wanted = detail.wanted.clone();
-                    wanted.sort();
-                    for mac in &wanted {
-                        match ages.get(mac) {
-                            // The question the 502 hunt actually asked:
-                            // which of these is a keep, and for how long
-                            // has nobody heard from it.
-                            Some(ms) => println!(
-                                "    {} (quiet, silent {})",
-                                format_mac(mac),
-                                human_duration(*ms)
-                            ),
-                            None => println!("    {}", format_mac(mac)),
-                        }
+                    for line in address_lines(detail) {
+                        println!("{line}");
                     }
                 }
             }
@@ -826,6 +840,27 @@ fn run() -> Result<bool, String> {
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, opts.verbose, "once");
+            // On the same stream as the report lines: a single pass by
+            // hand is exactly when somebody wants to see WHICH addresses,
+            // and it is the one mode where the list cannot scroll a
+            // journal away. Each list gets its own heading rather than
+            // sitting under the report line above it - that line appears
+            // only when something changed, so on a quiet host two uplinks'
+            // lists would have run into each other unlabelled.
+            if opts.verbose {
+                for r in &reports {
+                    let Some(detail) = r.detail.as_ref() else {
+                        continue;
+                    };
+                    if detail.wanted.is_empty() {
+                        continue;
+                    }
+                    note!("{}: {} address(es) wanted", r.dev, r.wanted);
+                    for line in address_lines(detail) {
+                        note!("{line}");
+                    }
+                }
+            }
             if opts.timings {
                 note!("{}", syncer.timings.report().trim_end());
             }
@@ -1214,6 +1249,45 @@ mod tests {
                 "the README never mentions {opt}, which the help offers"
             );
         }
+    }
+
+    /// The two modes that print addresses say the same thing about them.
+    ///
+    /// `--status` writes to stdout and `--once` to stderr, so they cannot
+    /// share a print; they share the rendering instead, and this is what
+    /// keeps a second spelling from growing beside the first.
+    #[test]
+    fn the_address_lines_name_the_quiet_ones() {
+        let detail = sync::Detail {
+            wanted: vec![[2, 0, 0, 0, 0, 2], [2, 0, 0, 0, 0, 1]],
+            quiet_ages: vec![([2, 0, 0, 0, 0, 1], 720_000)],
+        };
+        let lines = address_lines(&detail);
+        assert_eq!(
+            lines,
+            vec![
+                "    02:00:00:00:00:01 (quiet, silent 12m)".to_string(),
+                "    02:00:00:00:00:02".to_string(),
+            ],
+            "sorted, indented, and only the kept ones marked"
+        );
+    }
+
+    /// And both are offered by the help text, or an operator has no way to
+    /// know the list exists.
+    #[test]
+    fn the_help_says_which_modes_list_addresses() {
+        let help = usage_text();
+        let line = help
+            .lines()
+            .skip_while(|l| !l.contains("--verbose"))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            line.contains("--status") && line.contains("--once"),
+            "the help does not say which modes list addresses: {line}"
+        );
     }
 
     #[test]

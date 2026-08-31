@@ -100,7 +100,8 @@ sriov-mac-sync --timings            after every pass, what each phase cost
 sriov-mac-sync --extra <macs>       register these unconditionally, for a
                                     device that never speaks first
 sriov-mac-sync --exclude <macs>     never register these
-sriov-mac-sync -v, --verbose ...    explain what is skipped, and list addresses
+sriov-mac-sync -v, --verbose ...    explain what is skipped; with --status or
+                                    --once, list the addresses too
 sriov-mac-sync --version            print the version
 ```
 

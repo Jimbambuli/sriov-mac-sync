@@ -211,9 +211,14 @@ check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 say "S3: --dry-run touches nothing"
 $NS bridge fdb add $M2 dev veth-g1 master dynamic
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)
-$NS "$BIN" --once --dry-run --pair veth-up:br0 >/tmp/sms-it-s3.log 2>&1
+$NS "$BIN" --once --dry-run -v --pair veth-up:br0 >/tmp/sms-it-s3.log 2>&1
 check "M2 NOT in the filter" "! has_self $M2"
 check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
+# -v on a single pass lists the addresses themselves, under a heading that
+# names the uplink - the report line above it appears only when something
+# changed, so on a quiet host it is not there to name anything.
+check "the addresses are listed" "grep -q '^    $M2$' /tmp/sms-it-s3.log"
+check "the list is headed" "grep -q 'veth-up: .* address(es) wanted' /tmp/sms-it-s3.log"
 
 say "S4: the daemon's fast path registers within seconds"
 $NS "$BIN" --pair veth-up:br0 >/tmp/sms-it-s4.log 2>&1 &
