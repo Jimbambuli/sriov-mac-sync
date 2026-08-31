@@ -232,10 +232,11 @@ impl Schedule {
     fn retry_soon(&mut self, now: Instant) {
         self.next_full = now + RETRY_AFTER;
         // The attempt counts as a pass for pacing, though not for the
-        // trigger name: `last_pass` is what bounds the rate, and a
-        // refusal streak that left it standing let every notification buy
-        // another whole-table dump - on a host that is already unable to
-        // read one.
+        // trigger name. What `last_pass` bounds is the 200 ms floor that
+        // `handle_batch` puts under every batch-bought pass - not the five
+        // seconds above, which only govern when an unprompted retry comes.
+        // Left standing during a refusal streak, every notification bought
+        // another attempt, on a host that is already unable to answer one.
         self.last_pass = now;
     }
 
@@ -302,12 +303,18 @@ impl Picture {
     /// for changes. Not marked replaced: the first pass has not missed an
     /// autodetection it needs to redo, because there was no picture before
     /// this one.
-    fn seeded(topo: Topology) -> Self {
+    ///
+    /// The cost comes with it. Dropping it made the first pass report
+    /// `topology 0.000 ms` for a reading it really did - which is the very
+    /// thing `carried_load` exists to prevent, and on a host with hundreds
+    /// of interfaces it is the pass's largest phase missing from its own
+    /// total.
+    fn seeded(topo: Topology, cost: Duration) -> Self {
         Self {
             held: Some(topo),
             stale: false,
             replaced_since_pass: false,
-            carried_load: Duration::ZERO,
+            carried_load: cost,
         }
     }
 
@@ -417,14 +424,14 @@ pub(crate) fn daemon_loop<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
     opts: &Options,
-    seed: Option<Topology>,
+    seed: Option<(Topology, Duration)>,
 ) {
     let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
     // A reading the caller already took, if it took one after subscribing:
     // a daemon start otherwise read the interfaces twice within a
     // millisecond of itself.
     let mut picture = match seed {
-        Some(topo) => Picture::seeded(topo),
+        Some((topo, cost)) => Picture::seeded(topo, cost),
         None => Picture::new(),
     };
     let mut wait_failures = 0u32;
@@ -1449,6 +1456,44 @@ mod tests {
             );
         }
 
+        /// A refused pass keeps its rate bound, not just its deadline.
+        ///
+        /// `last_pass` is what `handle_batch` puts its 200 ms floor under.
+        /// Left standing while passes are being refused, every notification
+        /// bought another attempt at once - the failing host answering more
+        /// often the less it can answer.
+        #[test]
+        fn a_refused_pass_still_paces_the_batches_behind_it() {
+            let (mut syncer, opts, _dir) = setup("retry-brake", 300);
+            let mut world = FakeWorld::new(3);
+            world.topo_fails = true;
+            // Ten notifications inside one second, each one asking for a
+            // pass that cannot run.
+            for i in 1..=10 {
+                world.script.push_back((
+                    Duration::from_millis(i * 100),
+                    Ok(Events {
+                        fdb: vec![(
+                            crate::netlink::RTM_NEWNEIGH,
+                            crate::sync::tests::learned(4, 10, [2, 0, 0, 0, 0, 9]),
+                        )],
+                        links_changed: false,
+                        changed_links: Vec::new(),
+                    }),
+                ));
+            }
+            daemon_loop(&mut world, &mut syncer, &opts, None);
+            // Each batch reads the picture for itself (the failed read
+            // leaves nothing to carry), so ten of these are the batches;
+            // the rest are the pass attempts behind them. Measured: 16 with
+            // the bound, 21 without.
+            assert!(
+                world.topo_calls <= 18,
+                "a refusal streak was answered {} times in three seconds",
+                world.topo_calls
+            );
+        }
+
         /// A wait that keeps failing does not become a hot loop.
         ///
         /// The first failure buys a prompt recovery pass. From the second
@@ -1487,12 +1532,25 @@ mod tests {
         fn a_seeded_start_does_not_read_the_interfaces_twice() {
             let (mut syncer, opts, _dir) = setup("seeded-start", 300);
             let mut world = FakeWorld::new(1);
-            daemon_loop(&mut world, &mut syncer, &opts, Some(host(mac(1))));
+            daemon_loop(
+                &mut world,
+                &mut syncer,
+                &opts,
+                Some((host(mac(1)), Duration::from_millis(3))),
+            );
             assert_eq!(
                 world.topo_calls, 0,
                 "the daemon re-read a picture it was handed"
             );
             assert!(!world.passes.is_empty(), "the first pass never ran");
+            // And it reports what that reading cost, rather than 0.000 ms
+            // for a picture it did not pay for itself - the very thing
+            // `carried_load` exists to prevent.
+            assert_eq!(
+                syncer.timings.topology,
+                Duration::from_millis(3),
+                "the seeded start reported a topology cost it was handed as zero"
+            );
         }
 
         /// A pass that read for itself does not also buy an autodetect.

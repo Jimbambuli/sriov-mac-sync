@@ -36,7 +36,7 @@ the entries silent longest are released first, and every fresh learn makes
 an entry young again. The pressure is measured against the card's own
 unicast list, read back each pass - foreign entries occupy real slots and
 count - and the event path carries that count between passes, surrendering
-the longest-missing keep synchronously when a burst would not fit: past its
+the longest-silent keep synchronously when a burst would not fit: past its
 limit the card drops arbitrarily, and 200 ms of overflow is 200 ms of
 somebody unreachable. What stays free below the limit is a few slots of
 counting drift, not the blind tenth it once was. The entry also goes when

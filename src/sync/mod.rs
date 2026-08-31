@@ -98,9 +98,11 @@ struct Registered {
 /// What one pass left behind about an uplink's filter.
 #[derive(Default)]
 struct Carried {
-    /// How many unicast slots the card holds, foreign entries included.
-    occupancy: usize,
-    /// WHICH addresses those are. The note is not a substitute: it says
+    /// WHICH addresses the card holds, foreign entries included - and
+    /// therefore, by its length, how many slots. A separate count lived
+    /// here and was written at exactly the same three places as this set,
+    /// never once from anywhere else; two names for one fact are two
+    /// things to keep in step. The note is not a substitute: it says
     /// what is ours, this says what is in the card, and the two part
     /// company exactly where it hurts - a driver that cleared its list on
     /// link-down leaves addresses noted but absent, and putting one back
@@ -346,6 +348,13 @@ pub struct Syncer {
     /// the event rate, and the same warning five times a second is how an
     /// operator learns to stop reading exactly the journal that matters.
     warned_over: Set<String>,
+    /// The fast path's own say-once mark. Separate from `warned_over` on
+    /// purpose: the two speak at different thresholds - the pass at "past
+    /// max_macs", the batch at "past max_macs minus the headroom" - so one
+    /// shared mark meant the pass cleared, in the four-slot band between
+    /// them, exactly what the batch had just set, and "once per uplink per
+    /// stay" became once per batch.
+    warned_tight: Set<String>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -507,6 +516,7 @@ impl Syncer {
             noted_quiet: crate::hash::map(),
             last_pass_at: 0,
             warned_over: crate::hash::set(),
+            warned_tight: crate::hash::set(),
             carried: crate::hash::map(),
             warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -592,65 +602,91 @@ impl Syncer {
                 if let Some((index, new_name)) = self.renamed_target(&dev, topo) {
                     if !apply || self.dry_run {
                         note!("{dev}: now called {new_name}; its note would follow");
-                    } else if self.migrate_note(&dev, &new_name, index) {
-                        note!("{dev}: now called {new_name}, its note follows the interface");
-                        // The port memory follows the note, or a rename
-                        // would silently forget exactly the quiet guests.
-                        if let Some(ports) = self.carried_ports.remove(&dev) {
-                            self.carried_ports.insert(new_name.clone(), ports);
+                    } else {
+                        // Read the old name's memory BEFORE the note moves.
+                        // `migrate_note` unlinks the old note and, with it,
+                        // `.<old>.owned.ports` - and in a fresh process
+                        // nothing is carried in RAM to move instead, because
+                        // `load_ports` only ever runs for a name that is
+                        // still a pair. Without this the warm case (rename
+                        // while the daemon watched) carried the keeps and
+                        // the cold one (rename while it was stopped) lost
+                        // them, which is the case a rename actually happens
+                        // in. Reading is enough: the lines land in
+                        // `carried_ports` under the old name and the move
+                        // below picks them up.
+                        self.load_ports(&dev, topo, false);
+                        let moved = self.migrate_note(&dev, &new_name, index);
+                        if moved {
+                            note!("{dev}: now called {new_name}, its note follows the interface");
+                            // The port memory follows the note, or a rename
+                            // would silently forget exactly the quiet guests.
+                            if let Some(ports) = self.carried_ports.remove(&dev) {
+                                self.carried_ports.insert(new_name.clone(), ports);
+                                // And the new name counts as read, or the fast
+                                // path stops stamping a map it fully owns while
+                                // the valve goes on judging it. Inside this
+                                // block on purpose: marking a name whose memory
+                                // was NOT migrated would suppress the real read
+                                // and lose the file the line above exists for.
+                                self.ports_loaded.insert(new_name.clone());
+                            }
+                            // The written-down copy went with the old note; the
+                            // new name has nothing on file yet, so forget what
+                            // was written there and let the next pass put the
+                            // carried map down under the new name.
+                            self.ports_loaded.remove(&dev);
+                            self.ports_written.remove(&dev);
+                            self.ports_written.remove(&new_name);
+                            // The said-once mark travels too, or the same keeps
+                            // are announced a second time under the new name.
+                            if let Some(said) = self.noted_quiet.remove(&dev) {
+                                self.noted_quiet.insert(new_name.clone(), said);
+                            }
+                            // The wire set follows for the same reason: the fast
+                            // path would otherwise judge the renamed uplink
+                            // against an empty set - or the old name's set
+                            // against whoever inherits it.
+                            if let Some(wire) = self.carried_wire.remove(&dev) {
+                                self.carried_wire.insert(new_name.clone(), wire);
+                            }
+                            if self.warned_over.remove(&dev) {
+                                self.warned_over.insert(new_name.clone());
+                            }
+                            if self.warned_tight.remove(&dev) {
+                                self.warned_tight.insert(new_name.clone());
+                            }
+                            // The capacity arithmetic follows too. Usually
+                            // moot - the pass that migrates the note also
+                            // reconciles the new name and writes both of these
+                            // fresh - but not when that pass skips the pair
+                            // (no bridge, no port in this reading) while the
+                            // event path keeps registering for it.
+                            if let Some(c) = self.carried.remove(&dev) {
+                                self.carried.insert(new_name.clone(), c);
+                            }
+                            // The two say-once sets follow as well. Nothing
+                            // decides anything on them - they only keep a
+                            // warning from being repeated every pass - but a
+                            // rename made the daemon say both again, once, for
+                            // a device that had not changed.
+                            if self.warned_unknown_vf.remove(&dev) {
+                                self.warned_unknown_vf.insert(new_name.clone());
+                            }
+                            if let Some(said) = self.warned_extra.remove(&dev) {
+                                self.warned_extra.insert(new_name.clone(), said);
+                            }
+                            // And onto disk under the new name at once: the old
+                            // file went with the old note, and a crash before
+                            // the pair's next pass would otherwise forget the
+                            // very keeps the migration carried over.
+                            // The pass stamp, like every other caller: a
+                            // fresh clock reading here is later than every
+                            // stamp in the map, so the memo recorded each line
+                            // as quiet and the next pass rewrote the file for
+                            // nothing.
+                            self.save_ports(&new_name, topo, self.last_pass_at);
                         }
-                        // The written-down copy went with the old note; the
-                        // new name has nothing on file yet, so forget what
-                        // was written there and let the next pass put the
-                        // carried map down under the new name.
-                        self.ports_loaded.remove(&dev);
-                        self.ports_written.remove(&dev);
-                        self.ports_written.remove(&new_name);
-                        // The said-once mark travels too, or the same keeps
-                        // are announced a second time under the new name.
-                        if let Some(said) = self.noted_quiet.remove(&dev) {
-                            self.noted_quiet.insert(new_name.clone(), said);
-                        }
-                        // The wire set follows for the same reason: the fast
-                        // path would otherwise judge the renamed uplink
-                        // against an empty set - or the old name's set
-                        // against whoever inherits it.
-                        if let Some(wire) = self.carried_wire.remove(&dev) {
-                            self.carried_wire.insert(new_name.clone(), wire);
-                        }
-                        if self.warned_over.remove(&dev) {
-                            self.warned_over.insert(new_name.clone());
-                        }
-                        // The capacity arithmetic follows too. Usually
-                        // moot - the pass that migrates the note also
-                        // reconciles the new name and writes both of these
-                        // fresh - but not when that pass skips the pair
-                        // (no bridge, no port in this reading) while the
-                        // event path keeps registering for it.
-                        if let Some(c) = self.carried.remove(&dev) {
-                            self.carried.insert(new_name.clone(), c);
-                        }
-                        // The two say-once sets follow as well. Nothing
-                        // decides anything on them - they only keep a
-                        // warning from being repeated every pass - but a
-                        // rename made the daemon say both again, once, for
-                        // a device that had not changed.
-                        if self.warned_unknown_vf.remove(&dev) {
-                            self.warned_unknown_vf.insert(new_name.clone());
-                        }
-                        if let Some(said) = self.warned_extra.remove(&dev) {
-                            self.warned_extra.insert(new_name.clone(), said);
-                        }
-                        // And onto disk under the new name at once: the old
-                        // file went with the old note, and a crash before
-                        // the pair's next pass would otherwise forget the
-                        // very keeps the migration carried over.
-                        // The pass stamp, like every other caller: a
-                        // fresh clock reading here is later than every
-                        // stamp in the map, so the memo recorded each line
-                        // as quiet and the next pass rewrote the file for
-                        // nothing.
-                        self.save_ports(&new_name, topo, self.last_pass_at);
                     }
                     // Worked, or waits (an unreadable note, an unwritable
                     // new one - both said out loud where they happened, and
@@ -727,6 +763,7 @@ impl Syncer {
             // greets a device that returns.
             self.carried_wire.remove(&dev);
             self.warned_over.remove(&dev);
+            self.warned_tight.remove(&dev);
             self.carried.remove(&dev);
             // remove_note took the file; a device that returns as a pair
             // reads afresh rather than believing this run's leftovers.
@@ -939,8 +976,12 @@ impl Syncer {
             .into_iter()
             .filter(|(_, name, index, _)| topo.index_of(name) == Some(*index))
             .collect();
-        // Stamps from the future - a file that outlived a reboot, since the
-        // clock counts from one - are brought back. Left standing, such a
+        // Stamps from the future are brought back. Not from a reboot: the
+        // state directory is a tmpfs and the file dies with the clock it
+        // was written against. What does reach here is the pass stamp's own
+        // lead - `max(clock, previous + 1)` walks ahead of the clock when
+        // passes crowd into one millisecond - read back by a process that
+        // restarted inside the same boot. Left standing, such a
         // stamp says "spoke after the last pass" for the life of the
         // process, which is not merely the youngest: it is never quiet, so
         // the valve can never reach it and the slot is held until the
@@ -1343,7 +1384,7 @@ impl Syncer {
     pub fn fullest_filter(&self) -> usize {
         self.carried
             .values()
-            .map(|c| c.occupancy)
+            .map(|c| c.present.len())
             .max()
             .unwrap_or(0)
     }
@@ -1359,9 +1400,7 @@ impl Syncer {
     fn card_now_holds(&mut self, dev: &str, macs: impl IntoIterator<Item = Mac>) {
         let c = self.carried.entry(dev.to_string()).or_default();
         for mac in macs {
-            if c.present.insert(mac) {
-                c.occupancy += 1;
-            }
+            c.present.insert(mac);
         }
     }
 
@@ -1378,9 +1417,7 @@ impl Syncer {
             return;
         };
         for mac in macs {
-            if c.present.remove(mac) {
-                c.occupancy = c.occupancy.saturating_sub(1);
-            }
+            c.present.remove(mac);
             c.quiet.remove(mac);
         }
     }
@@ -1465,6 +1502,23 @@ impl Syncer {
             }
         }
         self.save_ports(dev, topo, passed_at);
+        // Counted BEFORE the bookkeeping is told, because that is what the
+        // answer is about: how many slots this really freed. Candidates come
+        // from the pass's keeps, which are read off the note - and the note
+        // deliberately keeps an address whose registration failed outright.
+        // Such an address is not in the card, so deleting it frees nothing,
+        // and reporting it as freed let the caller believe it had made room
+        // and skip the warning that says the card is being written past its
+        // limit.
+        //
+        // They are still deleted, all of them: filtering the candidates
+        // against what the card holds would make an address the card never
+        // took unsheddable for ever - it would stay owned, stay kept, be
+        // loudly re-registered by every pass, and the pass's own valve would
+        // surrender real keeps for a slot nobody occupies.
+        let freed = self.carried.get(dev).map_or(0, |c| {
+            dropped.iter().filter(|m| c.present.contains(*m)).count()
+        });
         self.card_no_longer_holds(dev, &dropped);
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
@@ -1472,7 +1526,7 @@ impl Syncer {
             self.max_macs,
             dropped.len()
         );
-        dropped.len()
+        freed
     }
 
     /// One spelling of "what the filter should hold": the desired set with
@@ -2186,6 +2240,13 @@ impl Syncer {
                 } else {
                     self.warned_over.remove(&pair.dev);
                 }
+                // The tight-fit mark re-arms only once the list is back
+                // under the headroom the batch measures against, or the
+                // pass would clear it while the batch is still in the band
+                // that set it.
+                if occupied + CAPACITY_HEADROOM <= self.max_macs {
+                    self.warned_tight.remove(&pair.dev);
+                }
             }
             // What the fast path counts from until the next pass corrects
             // it: how many slots, and which addresses fill them. `want` is
@@ -2206,7 +2267,6 @@ impl Syncer {
             self.carried.insert(
                 pair.dev.clone(),
                 Carried {
-                    occupancy: holds.len(),
                     present: holds,
                     quiet: kept.clone(),
                     // A pass that could not read its note refreshed no
@@ -2654,7 +2714,7 @@ impl Syncer {
                 }
             }
             let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);
-            let est = self.carried.get(&dev).map_or(0, |c| c.occupancy);
+            let est = self.carried.get(&dev).map_or(0, |c| c.present.len());
             // Only what would take a NEW slot. An address the card already
             // holds costs nothing to re-register - counting it would shed
             // keeps to make room for something that is already in.
@@ -2669,13 +2729,13 @@ impl Syncer {
                 // limit the card drops silently and arbitrarily, and an
                 // operator who never hears about it looks for the fault in
                 // the guest.
-                if self.warned_over.insert(dev.clone()) {
+                if self.warned_tight.insert(dev.clone()) {
                     eprintln!(
                         "warning: {dev}: no room for {} new address(es) and no \
-                         quiet ones left to release - the card is at its {} \
-                         limit and drops silently past it",
-                        macs.len(),
-                        self.max_macs
+                         quiet ones left to release - the list is within {} \
+                         of the {} the card holds, and past that it drops \
+                         silently",
+                        fresh_slots, CAPACITY_HEADROOM, self.max_macs
                     );
                 }
             }

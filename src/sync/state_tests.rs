@@ -2815,7 +2815,7 @@ fn a_replaced_port_does_not_inherit_the_memory() {
 }
 
 /// The clock survives with the memory: an address that went quiet before a
-/// restart keeps its age, so the valve still sheds the longest-missing
+/// restart keeps its age, so the valve still sheds the longest-silent
 /// first rather than treating every survivor as newborn. Asserted through
 /// the valve, because ordering evictions is the only thing the number is
 /// for - reading it back out of the file would pass even if the loading
@@ -3126,7 +3126,7 @@ fn the_pressure_valve_sheds_keeps_first() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Under pressure the longest-missing entry yields first, and a fresh
+/// Under pressure the longest-silent entry yields first, and a fresh
 /// learn makes an entry young again: what goes is what has not been heard
 /// from for the longest, not whoever happens to sort first.
 #[test]
@@ -3146,13 +3146,13 @@ fn the_pressure_valve_sheds_the_longest_missing_first() {
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // Now both are quiet, and the limit leaves room for only some of the
-    // list: the longest-missing - `old` - is the one surrendered.
+    // list: the longest-silent - `old` - is the one surrendered.
     s.max_macs = 6;
     let mut sock3 = kernel(vec![card_holds(2, old), card_holds(2, young)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock3.removed.iter().any(|(_, m)| *m == old),
-        "pressure has to cost the longest-missing entry"
+        "pressure has to cost the longest-silent entry"
     );
     assert!(
         !sock3.removed.iter().any(|(_, m)| *m == young),
@@ -3521,7 +3521,7 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
     s.reconcile(&mut sock4, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock4.removed.iter().any(|(_, m)| *m == old),
-        "the longest-missing entry has to be the one shed"
+        "the longest-silent entry has to be the one shed"
     );
     assert!(
         !sock4.removed.iter().any(|(_, m)| *m == young),
@@ -3919,7 +3919,7 @@ fn the_pressure_valve_counts_foreign_entries() {
 }
 
 /// The fast path is capacity-aware: a learn that would not fit surrenders
-/// the longest-missing keep synchronously - card, note and memory in one
+/// the longest-silent keep synchronously - card, note and memory in one
 /// breath - because 200 ms of overflow is 200 ms of the card dropping
 /// arbitrarily, possibly the very guest that is speaking.
 #[test]
@@ -4041,7 +4041,7 @@ fn a_relearn_buys_no_slot_and_sheds_nothing() {
 }
 
 /// The shedder never surrenders a guest that is speaking: only addresses
-/// with a missing-stamp are candidates, the longest-missing goes first,
+/// with a missing-stamp are candidates, the longest-silent goes first,
 /// and an address the batch itself is registering is spared - deleting it
 /// to add it back frees no slot at all.
 #[test]
@@ -4100,7 +4100,7 @@ fn the_shedder_spares_the_live_and_the_incoming() {
     .unwrap();
     assert!(
         sock4.removed.iter().any(|(_, m)| *m == old),
-        "the longest-missing keep was not the one surrendered"
+        "the longest-silent keep was not the one surrendered"
     );
     assert!(
         !sock4.removed.iter().any(|(_, m)| *m == young),
@@ -5038,7 +5038,7 @@ fn a_shed_entry_stops_being_counted() {
     std::thread::sleep(Dur::from_millis(5));
     let mut sock2 = kernel(vec![card_holds(2, old)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    let before = s.carried["nic1"].occupancy;
+    let before = s.carried["nic1"].present.len();
     assert!(s.carried["nic1"].present.contains(&old));
 
     s.max_macs = 5;
@@ -5064,7 +5064,8 @@ fn a_shed_entry_stops_being_counted() {
     );
     // One out, one in: the count says exactly that.
     assert_eq!(
-        s.carried["nic1"].occupancy, before,
+        s.carried["nic1"].present.len(),
+        before,
         "the occupancy did not follow what the valve did"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -5274,7 +5275,7 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let before = s.carried["nic1"].occupancy;
+    let before = s.carried["nic1"].present.len();
     assert!(s.carried["nic1"].present.contains(&m));
 
     // It turns up on the wire, so the daemon takes it back out - and the
@@ -5294,7 +5295,7 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
         "an entry the card said it did not have was still counted as present"
     );
     assert_eq!(
-        s.carried["nic1"].occupancy,
+        s.carried["nic1"].present.len(),
         before - 1,
         "the slot it never occupied was never given back"
     );
@@ -5455,6 +5456,374 @@ fn a_batch_before_the_first_pass_does_not_shadow_the_memory_file() {
     assert!(
         !sock3.removed.iter().any(|(_, m)| *m == quiet),
         "the quiet guest was unregistered because its memory went unread"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A rename that happened while nothing was running still carries the keeps.
+///
+/// The warm case - the daemon watched the rename - was covered, and it is
+/// the easy one: the memory is in RAM and the move takes it. The cold case
+/// is the one a rename actually happens in (a udev rule, an `ip link set
+/// name` between boots of the service), and there nothing is carried:
+/// `load_ports` only ever runs for a name that is still a pair, so the old
+/// name's map is empty and `migrate_note` unlinks the file it would have
+/// come from.
+#[test]
+fn a_rename_while_stopped_carries_the_quiet_memory_too() {
+    let dir = scratch("rename-cold");
+    let quiet: Mac = [0x02, 0xd4, 0, 0, 0, 1];
+    let before = small_host();
+
+    // A process registers the guest and lets it go quiet.
+    let mut first = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
+    first
+        .reconcile(&mut sock, true, &before, Dur::ZERO)
+        .unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    let mut sock2 = kernel(vec![card_holds(2, quiet)]);
+    first
+        .reconcile(&mut sock2, true, &before, Dur::ZERO)
+        .unwrap();
+    drop(first);
+    assert!(dir.join(".nic1.owned.ports").exists());
+
+    // Nothing runs, and the interface is renamed. A fresh process comes up
+    // and sees only the new name - it never had nic1 in RAM.
+    let after = Builder::new()
+        .add("nicX", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nicX")
+        .lower("vetha")
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nicX".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock3 = kernel(vec![card_holds(2, quiet)]);
+    let reports = s.reconcile(&mut sock3, true, &after, Dur::ZERO).unwrap();
+
+    assert!(
+        s.carried_ports
+            .get("nicX")
+            .is_some_and(|p| p.contains_key(&quiet)),
+        "the rename lost the quiet memory: {:?}",
+        s.carried_ports.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        s.ports_loaded.contains("nicX"),
+        "the new name has to count as read, or the fast path stops stamping it"
+    );
+    assert_eq!(reports[0].quiet, 1, "the quiet guest should have been kept");
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == quiet),
+        "the quiet guest was unregistered across the rename"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A rename whose pass never reaches the pair loop still marks the new name
+/// as read.
+///
+/// Normally `load_ports` does that at the top of the pair loop, which makes
+/// the line in the rename block look redundant. It is not: the pair loop
+/// has three fail-closed exits before it, and a pass that migrates the note
+/// and then bails on one of them leaves a fully carried memory that nothing
+/// counts as read - so the fast path stops stamping it while the valve goes
+/// on judging it against the pass stamp, and a guest that just spoke is
+/// named longest-silent.
+#[test]
+fn a_rename_marks_the_new_name_even_when_the_pass_bails() {
+    let dir = scratch("rename-bails");
+    let quiet: Mac = [0x02, 0xd5, 0, 0, 0, 1];
+    let before = small_host();
+    let mut first = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
+    first
+        .reconcile(&mut sock, true, &before, Dur::ZERO)
+        .unwrap();
+    drop(first);
+
+    // The interface is renamed AND its bridge is missing from this reading -
+    // an ifreload caught halfway. drop_orphans migrates the note; the pair
+    // loop then gives up on the missing bridge before load_ports.
+    let half = Builder::new()
+        .add("nicX", 2, Some(mac(1)))
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .build();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nicX".into(),
+            bridge: "br0".into(),
+        }],
+        dir.clone(),
+    );
+    s.authoritative = true;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut sock2 = kernel(vec![]);
+    s.reconcile(&mut sock2, true, &half, Dur::ZERO).unwrap();
+
+    assert!(
+        s.carried_ports.contains_key("nicX"),
+        "the memory should have moved with the note"
+    );
+    assert!(
+        s.ports_loaded.contains("nicX"),
+        "the migrated name was never counted as read, so nothing stamps it"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A keep the card never took frees no slot, and the valve says so.
+///
+/// The candidates come from the pass's keeps, which are read off the note -
+/// and the note deliberately holds on to an address whose registration
+/// failed outright, because that is the crash posture. Deleting such an
+/// address frees nothing. Reporting it as freed made the caller believe it
+/// had made room, so the warning that says the card is being written past
+/// its limit stayed silent.
+#[test]
+fn a_keep_the_card_never_took_frees_no_slot() {
+    let dir = scratch("phantom-keep");
+    let phantom: Mac = [0x02, 0xd6, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, phantom)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The card loses it and refuses to take it back - noted, but absent.
+    std::thread::sleep(Dur::from_millis(5));
+    let mut fail = crate::hash::map();
+    fail.insert(phantom, libc::EINVAL);
+    let mut sock2 = FakeSock {
+        fail_add: fail,
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.load_owned("nic1").contains(&phantom), "still noted");
+    assert!(
+        !s.carried["nic1"].present.contains(&phantom),
+        "and not in the card"
+    );
+
+    // Now a newcomer arrives with no room. The phantom is the only
+    // candidate; surrendering it frees nothing, so the warning has to come.
+    s.max_macs = 5;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xd6, 0, 0, 0, 9];
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
+        .unwrap();
+    assert!(
+        s.warned_tight.contains("nic1"),
+        "the valve reported a slot it did not free, so the warning stayed silent"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The two warnings keep their own marks.
+///
+/// They speak at different thresholds - the pass at "past max_macs", the
+/// batch at "past max_macs minus the headroom" - so a shared say-once mark
+/// meant every pass in the four-slot band between them cleared what the
+/// batch had just set, and "once per uplink per stay" became once per batch.
+#[test]
+fn the_two_capacity_warnings_do_not_clear_each_other() {
+    let dir = scratch("two-warnings");
+    let old: Mac = [0x02, 0xd7, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, old)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // A batch that cannot make room sets the tight-fit mark.
+    s.max_macs = 5;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut ev,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, [0x02, 0xd7, 0, 0, 0, 9]))],
+    )
+    .unwrap();
+    assert!(
+        s.warned_tight.contains("nic1"),
+        "the batch should have said it"
+    );
+
+    // A pass follows while the list is still inside the headroom band. It
+    // has nothing of its own to say - occupied is under max_macs - but it
+    // must not clear the batch's mark either.
+    let mut sock2 = kernel(vec![learned(4, 10, old)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        s.warned_tight.contains("nic1"),
+        "the pass cleared a mark set at a threshold it does not measure"
+    );
+
+    // Room again: now it re-arms.
+    s.max_macs = 128;
+    let mut sock3 = kernel(vec![learned(4, 10, old)]);
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !s.warned_tight.contains("nic1"),
+        "with the list well under the limit the warning has to re-arm"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The pass records what the card holds, not what it wanted to hold.
+///
+/// `holds` is built from the card's own read-back plus what the
+/// registrations landed, minus what the stale loop took out. Recording the
+/// intent instead - or forgetting the removals - leaves the count high, and
+/// the count is what the next burst measures its room against and what
+/// decides whether an ageing batch is answered at the fast rate.
+#[test]
+fn a_pass_records_the_card_not_its_intent() {
+    let dir = scratch("holds-observed");
+    let stale: Mac = [0x02, 0xd8, 0, 0, 0, 1];
+    let live: Mac = [0x02, 0xd8, 0, 0, 0, 2];
+    // Two guest ports, so that one can go without taking the other with it.
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("vethb", 5, Some(mac(5)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .lower("vethb")
+        .build();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(5, 10, stale), learned(4, 10, live)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let both = s.carried["nic1"].present.len();
+
+    // `stale` leaves the bridge AND its port goes, so the pass removes it.
+    // `live` stays learnt behind vetha.
+    let gone = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut sock2 = FakeSock {
+        fdb: vec![card_holds(2, stale), learned(4, 10, live)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock2, true, &gone, Dur::ZERO).unwrap();
+
+    assert!(
+        sock2.removed.iter().any(|(_, m)| *m == stale),
+        "the address whose port went should have been removed"
+    );
+    assert!(
+        !s.carried["nic1"].present.contains(&stale),
+        "a removed address is still counted as being in the card"
+    );
+    assert_eq!(
+        s.carried["nic1"].present.len(),
+        both - 1,
+        "the count did not follow the removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The notes never copy a foreign file into the journal.
+///
+/// `noted_devices` lists the state directory, and until now it asked only
+/// what a name ended in. A symlink called `<x>.owned` pointing somewhere
+/// else was therefore read as a note - by a daemon running as root - and
+/// every line it could not parse went into the warning verbatim. Two
+/// answers: such an entry is not an ordinary file and is skipped, and an
+/// unreadable line is reported by number and length, never by content.
+#[test]
+fn a_foreign_file_in_the_state_directory_is_not_read_out_loud() {
+    let dir = scratch("state-symlink");
+    fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("secret");
+    fs::write(&secret, "root:$6$verytopsecrethash:20000:0:99999:7:::\n").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("zzz.owned")).unwrap();
+
+    let s = Syncer::new(Vec::new(), dir.clone());
+    assert!(
+        !s.noted_devices_or_none().iter().any(|d| d == "zzz"),
+        "a symlink was taken for one of our notes"
+    );
+    assert_eq!(
+        s.registered(),
+        0,
+        "and nothing was counted out of somebody else's file"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap(),
+        "root:$6$verytopsecrethash:20000:0:99999:7:::\n",
+        "the file it pointed at must be untouched"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A note that is gone takes its cached index record with it.
+///
+/// The index record lives beside the note and moves with it: `--flush` from
+/// a second terminal unlinks both. Keeping the cached index then makes
+/// `note_index` short-circuit for the life of the process, so the record is
+/// never written again - and a later rename of that uplink is read as a
+/// disappearance, because `renamed_target` has nothing to match on.
+#[test]
+fn a_vanished_note_clears_the_cached_index() {
+    let dir = scratch("index-cache");
+    let m: Mac = [0x02, 0xd9, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        dir.join(".nic1.owned.index").exists(),
+        "the record is written"
+    );
+
+    // Somebody else flushes: note and index record both go. That is the
+    // "readable but it moved" branch - with no file at all, the stat before
+    // and the stat after are both None and the read is not steady.
+    fs::remove_file(dir.join("nic1.owned")).unwrap();
+    fs::remove_file(dir.join(".nic1.owned.index")).unwrap();
+    let _ = s.load_owned("nic1");
+
+    // Registering again has to write the record afresh.
+    let mut sock2 = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        dir.join(".nic1.owned.index").exists(),
+        "the index record was never written again, so a rename would read as a loss"
     );
     let _ = fs::remove_dir_all(&dir);
 }

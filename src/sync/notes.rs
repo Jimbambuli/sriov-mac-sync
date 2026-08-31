@@ -431,7 +431,7 @@ impl Syncer {
         let mut set = crate::hash::set();
         match fs::read_to_string(self.state_path(dev)) {
             Ok(text) => {
-                for line in text.lines() {
+                for (no, line) in text.lines().enumerate() {
                     match crate::netlink::parse_mac(line.trim()) {
                         Some(mac) => {
                             set.insert(mac);
@@ -441,9 +441,20 @@ impl Syncer {
                         // take back out of the card. Saying so is all that can
                         // be done, but silence would look like health.
                         None => eprintln!(
-                            "warning: {}: unreadable line in the ownership note, \
-                             the entry it named is now nobody's: {line}",
-                            self.state_path(dev).display()
+                            // Its NUMBER and LENGTH, never its bytes. What
+                            // is being read here is whatever file carries
+                            // the device's name, and `noted_devices` lists
+                            // the state directory without asking what kind
+                            // of file it found: a symlink called
+                            // `zzz.owned` pointing at /etc/shadow would
+                            // otherwise have its contents copied into the
+                            // journal, line by line, by a daemon that runs
+                            // as root.
+                            "warning: {}: unreadable line {} ({} bytes) in the \
+                             ownership note, the entry it named is now nobody's",
+                            self.state_path(dev).display(),
+                            no + 1,
+                            line.len()
                         ),
                     }
                 }
@@ -508,6 +519,13 @@ impl Syncer {
                 .create(true)
                 .append(true)
                 .mode(0o600)
+                // Never through a symlink, like every other opener here.
+                // Nothing is ever written to this file - it exists to be
+                // flocked - but a state directory that was group-writable
+                // before `ensure_state_dir` narrowed it can hold links
+                // planted earlier, and a refusal here is a degradation the
+                // caller already handles.
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&path)
         };
         let file = open().or_else(|e| {
@@ -1000,6 +1018,14 @@ impl Syncer {
             Ok(rd) => {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
+                    // Only ordinary files. A symlink named `<x>.owned` is
+                    // not a note this program wrote, and treating it as one
+                    // means reading, and possibly rewriting, whatever it
+                    // points at - as root. `file_type` on the directory
+                    // entry does not follow the link.
+                    if !e.file_type().is_ok_and(|t| t.is_file()) {
+                        continue;
+                    }
                     if let Some(dev) = name.strip_suffix(".owned") {
                         out.push(dev.to_string());
                     }

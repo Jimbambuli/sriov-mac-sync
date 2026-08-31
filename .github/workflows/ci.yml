@@ -90,13 +90,16 @@ jobs:
           /tmp/apk-tools/build/src/apk --version
       - name: Build the artefacts
         run: APK=/tmp/apk-tools/build/src/apk ./dist/package.sh
-      - name: The shell we ship is checked
+      - name: The shell in this repository is checked
         run: |
           sudo apt-get update -qq && sudo apt-get install -qq -y shellcheck
-          # Three scripts that run as root on other people's machines. The
-          # quoting and word-splitting class of bug is exactly what this
-          # catches, and package.sh already carried a hand-added disable
-          # comment - somebody ran it once and nothing kept it clean.
+          # Of these three, only the OpenWrt init script is shipped to
+          # anybody; package.sh and the harness run here and on a
+          # maintainer's machine. The eight maintainer scripts INSIDE
+          # package.sh - postinst, prerm and their .ipk and .apk twins - are
+          # quoted here-documents, so shellcheck sees data, not code. What
+          # covers those is the install/upgrade/remove run in the .deb step
+          # and the grep assertions in the package step.
           shellcheck -S warning dist/package.sh bench/integration.sh \
             dist/openwrt/sriov-mac-sync.init
 

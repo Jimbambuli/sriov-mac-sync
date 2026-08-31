@@ -935,7 +935,7 @@ fn run() -> Result<bool, String> {
             // than paid for twice. It was taken after the subscription was
             // opened, so anything that changed since is on its way as an
             // event.
-            daemon_loop(&mut world, &mut syncer, &opts, Some(topo));
+            daemon_loop(&mut world, &mut syncer, &opts, Some((topo, topo_load)));
 
             // Deliberately without a flush - catch_signals says why. Say how
             // much is left behind, so nobody has to wonder.

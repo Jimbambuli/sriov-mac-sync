@@ -136,8 +136,24 @@ if [ "$1" = configure ]; then
 		# running the old binary, and `start` on a running unit is a no-op -
 		# the fix the upgrade brings would wait for a reboot.
 		if [ -n "$2" ]; then
-			deb-systemd-invoke restart sriov-mac-sync.service >/dev/null 2>&1 \
-				|| systemctl restart sriov-mac-sync.service || true
+			# Only what was running, the rule the .ipk and .apk got at
+			# the same time. Asked of ActiveState, not of
+			# `is-active --quiet`: a unit in restart backoff
+			# (Restart=always, RestartSec=5) is "activating", and
+			# leaving it stopped would mean the upgrade carrying its
+			# crash fix is the one that keeps it down. The old
+			# process is still up at this point, which is what makes
+			# the question answerable.
+			was=$(systemctl show -p ActiveState --value sriov-mac-sync.service 2>/dev/null)
+			case "$was" in
+			active|activating|reloading|deactivating)
+				deb-systemd-invoke restart sriov-mac-sync.service >/dev/null 2>&1 \
+					|| systemctl restart sriov-mac-sync.service || true
+				;;
+			*)
+				echo "sriov-mac-sync was not running; left stopped."
+				;;
+			esac
 		elif [ -x /usr/bin/deb-systemd-invoke ]; then
 			deb-systemd-invoke start sriov-mac-sync.service || true
 		else
@@ -177,9 +193,12 @@ if [ "$1" = remove ]; then
 		sleep 0.5
 	done
 	if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
-		echo "sriov-mac-sync did not stop; not flushing - run" >&2
-		echo "  sriov-mac-sync --flush" >&2
-		echo "once it is down, or its entries stay in the card." >&2
+		echo "sriov-mac-sync did not stop; not flushing." >&2
+		echo "Its entries stay in the card, and this package is about to go," >&2
+		echo "so name them from the notes it leaves behind:" >&2
+		echo "  cat /run/sriov-mac-sync/*.owned" >&2
+		echo "  bridge fdb del <address> dev <uplink> self permanent" >&2
+		echo "A reboot clears them too - the filter does not survive one." >&2
 		exit 0
 	fi
 	[ -x /usr/sbin/sriov-mac-sync ] && /usr/sbin/sriov-mac-sync --flush || true
@@ -283,9 +302,16 @@ done
 # which puts them straight back - and the package is gone by then, so
 # nothing owns what stays in the card. Say so and leave it alone.
 if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
-	echo "sriov-mac-sync did not stop; not flushing - run" >&2
-	echo "  sriov-mac-sync --flush" >&2
-	echo "once it is down, or its entries stay in the card." >&2
+	# Disabled first: the refusal returns 0 so the removal goes on, and an
+	# rc.d symlink left behind here points at a script the package takes
+	# with it.
+	/etc/init.d/sriov-mac-sync disable 2>/dev/null
+	echo "sriov-mac-sync did not stop; not flushing." >&2
+	echo "Its entries stay in the card, and this package is about to go," >&2
+	echo "so name them from the notes it leaves behind:" >&2
+	echo "  cat /var/run/sriov-mac-sync/*.owned" >&2
+	echo "  bridge fdb del <address> dev <uplink> self permanent" >&2
+	echo "A reboot clears them too - the filter does not survive one." >&2
 	exit 0
 fi
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
@@ -347,9 +373,16 @@ done
 # which puts them straight back - and the package is gone by then, so
 # nothing owns what stays in the card. Say so and leave it alone.
 if pgrep -x sriov-mac-sync >/dev/null 2>&1; then
-	echo "sriov-mac-sync did not stop; not flushing - run" >&2
-	echo "  sriov-mac-sync --flush" >&2
-	echo "once it is down, or its entries stay in the card." >&2
+	# Disabled first: the refusal returns 0 so the removal goes on, and an
+	# rc.d symlink left behind here points at a script the package takes
+	# with it.
+	/etc/init.d/sriov-mac-sync disable 2>/dev/null
+	echo "sriov-mac-sync did not stop; not flushing." >&2
+	echo "Its entries stay in the card, and this package is about to go," >&2
+	echo "so name them from the notes it leaves behind:" >&2
+	echo "  cat /var/run/sriov-mac-sync/*.owned" >&2
+	echo "  bridge fdb del <address> dev <uplink> self permanent" >&2
+	echo "A reboot clears them too - the filter does not survive one." >&2
 	exit 0
 fi
 /etc/init.d/sriov-mac-sync disable 2>/dev/null
