@@ -671,12 +671,17 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
 fn human_duration(ms: u64) -> String {
     let s = ms / 1000;
     let (d, h, m, sec) = (s / 86_400, (s / 3600) % 24, (s / 60) % 60, s % 60);
+    // Every unit but the leading one is two wide, so that the unit letters
+    // land in the same columns whatever the numbers are. The leading unit
+    // is left alone: the caller right-aligns the whole thing against its
+    // longest neighbour, which absorbs its width and lines the columns up
+    // from the seconds end.
     if d > 0 {
-        format!("{d}d {h}h {m}m {sec}s")
+        format!("{d}d {h:>2}h {m:>2}m {sec:>2}s")
     } else if h > 0 {
-        format!("{h}h {m}m {sec}s")
+        format!("{h}h {m:>2}m {sec:>2}s")
     } else if m > 0 {
-        format!("{m}m {sec}s")
+        format!("{m}m {sec:>2}s")
     } else {
         format!("{sec}s")
     }
@@ -705,13 +710,22 @@ fn address_lines(detail: &sync::Detail) -> Vec<String> {
         );
         sa.cmp(&sb).then(a.cmp(b))
     });
+    // One column for the silences, as wide as the longest of them: the
+    // numbers are what the eye compares down the list, and a column that
+    // shifts sideways from line to line is a column nobody can compare.
+    let widest = detail
+        .quiet_ages
+        .iter()
+        .map(|(_, ms)| human_duration(*ms).len())
+        .max()
+        .unwrap_or(0);
     wanted
         .iter()
         .map(|mac| match ages.get(mac) {
             // The question the 502 hunt actually asked: which of these is
             // a keep, and for how long has nobody heard from it.
             Some(ms) => format!(
-                "    {} (quiet, silent {})",
+                "    {} (quiet, silent {:>widest$})",
                 format_mac(mac),
                 human_duration(*ms)
             ),
@@ -1289,18 +1303,56 @@ mod tests {
             (999, "0s"),
             (1_000, "1s"),
             (59_000, "59s"),
-            (60_000, "1m 0s"),
+            (60_000, "1m  0s"),
             (90_500, "1m 30s"),
             // The example from the day this changed: 112 minutes.
-            (6_720_000, "1h 52m 0s"),
-            (7_200_000, "2h 0m 0s"),
+            (6_720_000, "1h 52m  0s"),
+            (7_200_000, "2h  0m  0s"),
             // Just under three hours - the old form called this "2h" too.
-            (10_740_000, "2h 59m 0s"),
-            (86_400_000, "1d 0h 0m 0s"),
-            (183_845_000, "2d 3h 4m 5s"),
+            (10_740_000, "2h 59m  0s"),
+            (86_400_000, "1d  0h  0m  0s"),
+            (183_845_000, "2d  3h  4m  5s"),
         ] {
             assert_eq!(human_duration(ms), want, "{ms} ms");
         }
+    }
+
+    /// And a column of them lines up, whatever the numbers are.
+    ///
+    /// The unit letters have to land under each other: this list is read
+    /// down, comparing one silence against the next, and a column that
+    /// shifts sideways from line to line cannot be compared at a glance.
+    #[test]
+    fn a_column_of_silences_lines_up() {
+        let detail = sync::Detail {
+            wanted: vec![[2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2], [2, 0, 0, 0, 0, 3]],
+            quiet_ages: vec![
+                ([2, 0, 0, 0, 0, 1], 9_000),
+                ([2, 0, 0, 0, 0, 2], 6_720_000),
+                ([2, 0, 0, 0, 0, 3], 183_845_000),
+            ],
+        };
+        let lines = address_lines(&detail);
+        let at = |l: &str, c: char| l.rfind(c).expect("the unit is there");
+        // Every line ends on its seconds, and the minute and hour letters
+        // sit in the same columns as the longest line's.
+        let longest = lines.last().expect("three lines").clone();
+        for l in &lines {
+            assert_eq!(l.len(), longest.len(), "ragged line: {l:?}");
+            assert_eq!(at(l, 's'), at(&longest, 's'), "seconds moved: {l:?}");
+        }
+        assert_eq!(
+            at(&lines[1], 'm'),
+            at(&longest, 'm'),
+            "the minutes moved: {:?}",
+            lines[1]
+        );
+        assert_eq!(
+            at(&lines[1], 'h'),
+            at(&longest, 'h'),
+            "the hours moved: {:?}",
+            lines[1]
+        );
     }
 
     /// The two modes that print addresses say the same thing about them.
@@ -1331,8 +1383,8 @@ mod tests {
             vec![
                 "    02:00:00:00:00:02".to_string(),
                 "    02:00:00:00:00:03".to_string(),
-                "    02:00:00:00:00:04 (quiet, silent 1m 0s)".to_string(),
-                "    02:00:00:00:00:01 (quiet, silent 12m 0s)".to_string(),
+                "    02:00:00:00:00:04 (quiet, silent  1m  0s)".to_string(),
+                "    02:00:00:00:00:01 (quiet, silent 12m  0s)".to_string(),
             ],
             "the live ones first by address, then rising silence, \
              and only the kept ones marked"
