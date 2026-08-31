@@ -170,6 +170,16 @@ pub struct Detail {
     /// the kept addresses, with how long each has been silent -
     /// milliseconds since the bridge last held it
     pub quiet_ages: Vec<(Mac, u64)>,
+    /// the bridge port each address was last learnt behind, where one is
+    /// known. Already in hand - the quiet memory records it per address so
+    /// that a keep can be judged by whether its port still lives - and on a
+    /// virtualisation host it is the guest's identity: `veth106i0` is
+    /// container 106, `tap210i0` is virtual machine 210. Nothing else this
+    /// program could reach names a guest as cheaply. The addresses with no
+    /// port are the structural ones (the bridge's own, the uplink's ward,
+    /// anything pinned by EXTRA) and whatever a previous process registered
+    /// without leaving a memory.
+    pub learnt_behind: Vec<(Mac, String)>,
 }
 
 /// What the syncer needs from the kernel, as a trait so the bookkeeping can
@@ -2290,6 +2300,19 @@ impl Syncer {
                     .into_iter()
                     .map(|(silent, m)| (m, silent))
                     .collect(),
+                learnt_behind: self
+                    .carried_ports
+                    .get(&pair.dev)
+                    .map(|ports| {
+                        ports
+                            .iter()
+                            .filter(|(m, _)| want.contains(*m))
+                            .filter_map(|(m, &(index, _))| {
+                                topo.name_of(index).map(|n| (*m, n.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
             reports.push(Report {
                 dev: pair.dev.clone(),

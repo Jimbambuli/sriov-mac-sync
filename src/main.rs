@@ -227,7 +227,8 @@ usage: sriov-mac-sync [options]
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
   -v, --verbose   explain what is skipped and why; with --status or --once,
-                  list every wanted address, longest silence last
+                  list every wanted address with the port it was learnt
+                  behind, longest silence last
   -h, --help      this text
       --version   print the version
 
@@ -719,17 +720,37 @@ fn address_lines(detail: &sync::Detail) -> Vec<String> {
         .map(|(_, ms)| human_duration(*ms).len())
         .max()
         .unwrap_or(0);
+    // And one for the port each was learnt behind, which the daemon already
+    // knows: a bare address says nothing about whose it is, and on a
+    // virtualisation host the port name is the guest - `veth106i0` is
+    // container 106. Nothing is looked up for this. The neighbour table
+    // would add an address, but it is emptiest exactly where this list is
+    // most interesting: an address is quiet because nobody has talked to
+    // it, and that is also why it has been reaped from the cache.
+    let ports: std::collections::BTreeMap<_, _> = detail
+        .learnt_behind
+        .iter()
+        .map(|(m, p)| (*m, p.as_str()))
+        .collect();
+    let port_col = ports.values().map(|p| p.len()).max().unwrap_or(0);
     wanted
         .iter()
-        .map(|mac| match ages.get(mac) {
-            // The question the 502 hunt actually asked: which of these is
-            // a keep, and for how long has nobody heard from it.
-            Some(ms) => format!(
-                "    {} (quiet, silent {:>widest$})",
-                format_mac(mac),
-                human_duration(*ms)
-            ),
-            None => format!("    {}", format_mac(mac)),
+        .map(|mac| {
+            let port = ports.get(mac).copied().unwrap_or("");
+            // Trailing blanks would be invisible noise on a line with no
+            // silence, so the row is trimmed at the end rather than padded
+            // to a shape nothing fills.
+            let line = match ages.get(mac) {
+                // The question the 502 hunt actually asked: which of these
+                // is a keep, and for how long has nobody heard from it.
+                Some(ms) => format!(
+                    "    {} {port:<port_col$}  (quiet, silent {:>widest$})",
+                    format_mac(mac),
+                    human_duration(*ms)
+                ),
+                None => format!("    {} {port:<port_col$}", format_mac(mac)),
+            };
+            line.trim_end().to_string()
         })
         .collect()
 }
@@ -1331,6 +1352,7 @@ mod tests {
                 ([2, 0, 0, 0, 0, 2], 6_720_000),
                 ([2, 0, 0, 0, 0, 3], 183_845_000),
             ],
+            learnt_behind: Vec::new(),
         };
         let lines = address_lines(&detail);
         let at = |l: &str, c: char| l.rfind(c).expect("the unit is there");
@@ -1376,18 +1398,24 @@ mod tests {
                 ([2, 0, 0, 0, 0, 4], 60_000),
                 ([2, 0, 0, 0, 0, 1], 720_000),
             ],
+            // Two of the four have a known port; the rest are structural.
+            learnt_behind: vec![
+                ([2, 0, 0, 0, 0, 1], "veth106i0".to_string()),
+                ([2, 0, 0, 0, 0, 3], "tap210i0".to_string()),
+            ],
         };
         let lines = address_lines(&detail);
         assert_eq!(
             lines,
             vec![
+                // No port, no silence: the row stops after the address.
                 "    02:00:00:00:00:02".to_string(),
-                "    02:00:00:00:00:03".to_string(),
-                "    02:00:00:00:00:04 (quiet, silent  1m  0s)".to_string(),
-                "    02:00:00:00:00:01 (quiet, silent 12m  0s)".to_string(),
+                "    02:00:00:00:00:03 tap210i0".to_string(),
+                "    02:00:00:00:00:04            (quiet, silent  1m  0s)".to_string(),
+                "    02:00:00:00:00:01 veth106i0  (quiet, silent 12m  0s)".to_string(),
             ],
-            "the live ones first by address, then rising silence, \
-             and only the kept ones marked"
+            "the live ones first by address, then rising silence, only the \
+             kept ones marked, and the port each was learnt behind"
         );
     }
 

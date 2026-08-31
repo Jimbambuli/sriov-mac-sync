@@ -106,17 +106,32 @@ Explain what is skipped and why. With
 .B \-\-status
 or
 .BR \-\-once ,
-it also lists every wanted address, longest silence last \(em the list ends
-where the pressure valve begins, so the bottom of it is what the filter gives
-up first \(em marking the ones held through a silence with how long each has
-been silent, in days, hours, minutes and seconds down from the largest that
-applies, in one column so that the numbers can be compared down the list:
+it also lists every wanted address with the bridge port it was last learnt
+behind, longest silence last \(em the list ends where the pressure valve
+begins, so the bottom of it is what the filter gives up first \(em marking the
+ones held through a silence with how long each has been silent, in days,
+hours, minutes and seconds down from the largest that applies, in one column
+so that the numbers can be compared down the list:
 .PP
 .EX
-    02:aa:bb:cc:dd:03
-    02:aa:bb:cc:dd:02 (quiet, silent    11m 49s)
-    02:aa:bb:cc:dd:01 (quiet, silent 1h 52m  0s)
+    02:aa:bb:cc:dd:03 nic2
+    02:aa:bb:cc:dd:02 veth106i0  (quiet, silent    11m 49s)
+    02:aa:bb:cc:dd:01 nic2       (quiet, silent 1h 52m  0s)
 .EE
+.PP
+The port is what the daemon already knows \(em it records one per owned
+address so that a keep can be judged by whether its port still lives \(em and
+on a virtualisation host it names the guest: a Proxmox
+.I veth106i0
+is container 106, a
+.I tap210i0
+is virtual machine 210. Addresses with no port are the structural ones: the
+bridge's own address, the uplink's ward, anything pinned by
+.BR EXTRA .
+Nothing is looked up for this line, and no address is shown: the neighbour
+table would offer one, but it is emptiest exactly where this list is most
+interesting, because an address is quiet for the same reason it has been
+reaped from the cache.
 .PP
 A reported silence can be up to one bridge ageing time longer than anything
 this program itself witnessed: when the bridge announces that it has forgotten

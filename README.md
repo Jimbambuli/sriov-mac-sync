@@ -101,7 +101,8 @@ sriov-mac-sync --extra <macs>       register these unconditionally, for a
                                     device that never speaks first
 sriov-mac-sync --exclude <macs>     never register these
 sriov-mac-sync -v, --verbose ...    explain what is skipped; with --status or
-                                    --once, list the addresses, longest silence
+                                    --once, list the addresses and the port
+                                    each was learnt behind, longest silence
                                     last
 sriov-mac-sync --version            print the version
 ```
