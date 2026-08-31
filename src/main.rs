@@ -227,7 +227,7 @@ usage: sriov-mac-sync [options]
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
   -v, --verbose   explain what is skipped and why; with --status or --once,
-                  list every wanted address, longest silence first
+                  list every wanted address, longest silence last
   -h, --help      this text
       --version   print the version
 
@@ -679,18 +679,18 @@ fn human_duration(ms: u64) -> String {
 fn address_lines(detail: &sync::Detail) -> Vec<String> {
     let ages: std::collections::BTreeMap<_, _> = detail.quiet_ages.iter().copied().collect();
     let mut wanted = detail.wanted.clone();
-    // By age, longest silence first: that is the order the pressure valve
-    // surrenders in, so the top of the list is what goes first if the
-    // filter fills up, and the addresses worth asking about are where the
-    // eye lands. An address the bridge still holds has no silence at all
-    // and comes last; the address itself is the tiebreak, so the list does
-    // not shuffle between two runs that saw the same thing.
+    // By age, longest silence LAST: the list ends where the pressure valve
+    // begins, so the bottom of it is what the filter gives up first - and
+    // on a terminal that is the part still on screen. An address the bridge
+    // still holds has no silence at all and comes first; the address itself
+    // is the tiebreak, so the list does not shuffle between two runs that
+    // saw the same thing.
     wanted.sort_by(|a, b| {
         let (sa, sb) = (
             ages.get(a).copied().unwrap_or(0),
             ages.get(b).copied().unwrap_or(0),
         );
-        sb.cmp(&sa).then(a.cmp(b))
+        sa.cmp(&sb).then(a.cmp(b))
     });
     wanted
         .iter()
@@ -1279,22 +1279,23 @@ mod tests {
                 [2, 0, 0, 0, 0, 4],
             ],
             quiet_ages: vec![
-                // The younger keep sorts FIRST by address and LAST by age:
-                // an ordering that went by address would put it on top.
-                ([2, 0, 0, 0, 0, 1], 60_000),
-                ([2, 0, 0, 0, 0, 4], 720_000),
+                // The younger keep sorts FIRST by address and by age; the
+                // older one sorts first by neither. An ordering that went
+                // by address alone would put them the other way round.
+                ([2, 0, 0, 0, 0, 4], 60_000),
+                ([2, 0, 0, 0, 0, 1], 720_000),
             ],
         };
         let lines = address_lines(&detail);
         assert_eq!(
             lines,
             vec![
-                "    02:00:00:00:00:04 (quiet, silent 12m)".to_string(),
-                "    02:00:00:00:00:01 (quiet, silent 60s)".to_string(),
                 "    02:00:00:00:00:02".to_string(),
                 "    02:00:00:00:00:03".to_string(),
+                "    02:00:00:00:00:04 (quiet, silent 60s)".to_string(),
+                "    02:00:00:00:00:01 (quiet, silent 12m)".to_string(),
             ],
-            "longest silence first, the live ones last by address, \
+            "the live ones first by address, then rising silence, \
              and only the kept ones marked"
         );
     }

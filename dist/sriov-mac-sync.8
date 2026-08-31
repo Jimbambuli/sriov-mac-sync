@@ -106,13 +106,14 @@ Explain what is skipped and why. With
 .B \-\-status
 or
 .BR \-\-once ,
-it also lists every wanted address, longest silence first \(em the order the
-filter is surrendered in when it fills up \(em marking the ones held through a
-silence with how long each has been silent:
+it also lists every wanted address, longest silence last \(em the list ends
+where the pressure valve begins, so the bottom of it is what the filter gives
+up first \(em marking the ones held through a silence with how long each has
+been silent:
 .PP
 .EX
-    02:aa:bb:cc:dd:01 (quiet, silent 12m)
     02:aa:bb:cc:dd:02
+    02:aa:bb:cc:dd:01 (quiet, silent 12m)
 .EE
 .PP
 A reported silence can be up to one bridge ageing time longer than anything
