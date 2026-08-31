@@ -42,7 +42,7 @@ impl Note {
 /// mean. Bumped whenever that changes, so an older or newer file is
 /// ignored rather than misread - losing it costs the keeps for one ARP
 /// cycle, which is what every build before the file existed did anyway.
-const PORTS_FORMAT: &str = "sriov-mac-sync ports 2";
+const PORTS_FORMAT: &str = "sriov-mac-sync ports 3";
 
 impl Syncer {
     pub(super) fn state_path(&self, dev: &str) -> PathBuf {
@@ -57,7 +57,7 @@ impl Syncer {
         self.state_dir.join(format!(".{dev}.owned.ports"))
     }
 
-    /// Nanoseconds since this boot, the clock the quiet memory is stamped
+    /// Milliseconds since this boot, the clock the quiet memory is stamped
     /// in.
     ///
     /// `Instant` cannot be written down and read back, and a wall clock can
@@ -67,14 +67,14 @@ impl Syncer {
     /// starts empty after a reboot, so a stamp and the clock that reads it
     /// always come from the same boot.
     ///
-    /// Nanoseconds rather than something coarser because two readings
-    /// have to be told apart whenever they are two: the valve orders by
-    /// this, and - since a pass now stamps what it saw and judges quiet
-    /// by "older than this pass" - two passes falling into one tick would
-    /// make everything look loud. At whole seconds the order fell back to
-    /// the addresses themselves; at milliseconds two passes of a busy
-    /// daemon can still share a tick.
-    pub(super) fn boot_nanos() -> u64 {
+    /// Milliseconds, not something finer: between two passes this daemon
+    /// is blind anyway, so the resolution that matters is the pass
+    /// cadence, and finer digits would only claim a precision the
+    /// observation does not have. Two passes landing in one tick - which
+    /// would make everything read as loud, since quiet means "stamped
+    /// before the last pass" - are told apart by the caller nudging the
+    /// pass stamp past its predecessor, not by counting nanoseconds.
+    pub(super) fn boot_millis() -> u64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -84,8 +84,8 @@ impl Syncer {
         // a zero answer would only make everything look equally young.
         unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
         (ts.tv_sec.max(0) as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec.max(0) as u64)
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec.max(0) as u64 / 1_000_000)
     }
 
     /// The quiet memory as it was last written: which bridge port each owned

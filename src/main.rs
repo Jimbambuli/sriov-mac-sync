@@ -663,10 +663,10 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
     ok
 }
 
-/// A nanosecond count the way an operator reads one: seconds under two
+/// A millisecond count the way an operator reads one: seconds under two
 /// minutes, minutes under two hours, hours beyond.
-fn human_duration(ns: u64) -> String {
-    let s = ns / 1_000_000_000;
+fn human_duration(ms: u64) -> String {
+    let s = ms / 1000;
     if s < 120 {
         format!("{s}s")
     } else if s < 7200 {
@@ -797,10 +797,10 @@ fn run() -> Result<bool, String> {
                             // The question the 502 hunt actually asked:
                             // which of these is a keep, and for how long
                             // has nobody heard from it.
-                            Some(ns) => println!(
+                            Some(ms) => println!(
                                 "    {} (quiet, silent {})",
                                 format_mac(mac),
-                                human_duration(*ns)
+                                human_duration(*ms)
                             ),
                             None => println!("    {}", format_mac(mac)),
                         }

@@ -46,16 +46,21 @@ That memory outlives the process. It is written to `.<dev>.owned.ports`
 beside the note, under the same lock and through the same temp-and-rename.
 Its first line names the format, so a file whose numbers meant something
 else is ignored rather than misread - that mistake was made once, when the
-stamps changed from missing-since-milliseconds to last-seen-nanoseconds.
+stamps changed from missing-since to last-seen.
 Then one line per address: the port by name *and* index, and the boot-clock
-reading at which the bridge was last seen holding it. Every pass refreshes
+reading at which the bridge was last seen holding it - milliseconds,
+because between two passes the daemon is blind anyway and a finer digit
+would claim a precision the observation has not got. Every pass refreshes
 that stamp for everything it finds learnt, and so does every learn on the
 event path - which is what makes "quiet" a fact rather than a guess: an
 address whose stamp predates the last pass is one the last pass did not
 see. The same number orders the pressure valve's evictions, and it records
 when the guest last *spoke* rather than when the daemon noticed the
 silence, so two addresses that fall out between the same two passes are
-told apart by their traffic instead of by their names. A restart is mostly an update,
+told apart by their traffic instead of by their names. Two passes may
+never share a stamp - everything would then read as loud - so a pass whose
+clock reading matches its predecessor's takes the next number up rather
+than a finer clock being asked for. A restart is mostly an update,
 and an update that forgot its keeps would unregister every quiet guest on
 its first pass - the outage the keep exists to prevent, delivered by our
 own package. A line is believed only where it still describes this kernel,

@@ -126,7 +126,7 @@ pub struct Report {
     /// aged out of the bridge, kept because their guest ports live on
     pub quiet: usize,
     /// the kept addresses themselves, with how long each has been silent -
-    /// nanoseconds since the bridge last held it - which is what
+    /// milliseconds since the bridge last held it - which is what
     /// --status -v marks them with
     pub quiet_ages: Vec<(Mac, u64)>,
 }
@@ -259,7 +259,7 @@ pub struct Syncer {
     /// nothing to keep.
     ///
     /// The value is the port and when the bridge was last seen holding
-    /// the address, in nanoseconds since boot. Every pass refreshes the
+    /// the address, in milliseconds since boot. Every pass refreshes the
     /// stamp of everything it finds learnt, and so does every learn on
     /// the event path - so "quiet" needs no guessed window: an address
     /// whose stamp predates the last pass is one the last pass did not
@@ -289,6 +289,16 @@ pub struct Syncer {
     /// paying a dump per batch. Corrected against the read-back every
     /// pass; the fast path adjusts it as it adds and removes.
     carried: Map<String, Carried>,
+    /// The stamp the last pass wrote, whichever uplink it was for. Two
+    /// passes must never share one - "quiet" means "stamped before the
+    /// last pass", so a shared stamp would make every address read as
+    /// loud and the valve would find nothing to shed. The clock alone
+    /// cannot promise that: milliseconds are the right resolution for
+    /// something observed once per pass, and two passes of a busy daemon
+    /// can land in one tick. So the pass stamp is nudged past its
+    /// predecessor when it has to be - at most a millisecond of drift,
+    /// gone again the moment real time catches up.
+    last_pass_at: u64,
     /// Uplinks already warned about exceeding the filter capacity, re-armed
     /// when the count drops back under: an overloaded bridge buys passes at
     /// the event rate, and the same warning five times a second is how an
@@ -452,6 +462,7 @@ impl Syncer {
             ports_written: crate::hash::map(),
             max_macs: DEFAULT_MAX_MACS,
             noted_quiet: crate::hash::map(),
+            last_pass_at: 0,
             warned_over: crate::hash::set(),
             carried: crate::hash::map(),
             warned_extra: crate::hash::map(),
@@ -580,7 +591,7 @@ impl Syncer {
                         // file went with the old note, and a crash before
                         // the pair's next pass would otherwise forget the
                         // very keeps the migration carried over.
-                        self.save_ports(&new_name, topo, Self::boot_nanos());
+                        self.save_ports(&new_name, topo, Self::boot_millis());
                     }
                     // Worked, or waits (an unreadable note, an unwritable
                     // new one - both said out loud where they happened, and
@@ -975,7 +986,7 @@ impl Syncer {
         }
     }
 
-    /// How long each of these has been silent, in nanoseconds - the
+    /// How long each of these has been silent, in milliseconds - the
     /// valve orders evictions by it and --status -v shows it. An address
     /// this process never saw learnt counts as silent since boot: nothing
     /// is known in its favour.
@@ -1501,8 +1512,10 @@ impl Syncer {
 
         // One reading for the whole pass: the ground every stamp written
         // here is judged against later, and what makes "quiet" a fact
-        // rather than a guess.
-        let pass_at = Self::boot_nanos();
+        // rather than a guess. Strictly after the last pass's, so no two
+        // passes can share a stamp.
+        let pass_at = Self::boot_millis().max(self.last_pass_at + 1);
+        self.last_pass_at = pass_at;
         let mut reports = Vec::new();
         let mark = Instant::now();
         self.drop_orphans(sock, topo, apply, &mut timings.failures);
@@ -1661,7 +1674,7 @@ impl Syncer {
                 .count();
             let mut occupied = want.len() + foreign_extra;
             if !kept.is_empty() && occupied + CAPACITY_HEADROOM > self.max_macs {
-                let mut order = self.silence_of(&pair.dev, &kept, Self::boot_nanos());
+                let mut order = self.silence_of(&pair.dev, &kept, Self::boot_millis());
                 // Longest silent first; the address is the tiebreak.
                 order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let mut shed = 0usize;
@@ -1917,7 +1930,7 @@ impl Syncer {
                 foreign,
                 quiet: kept.len(),
                 quiet_ages: self
-                    .silence_of(&pair.dev, &kept, Self::boot_nanos())
+                    .silence_of(&pair.dev, &kept, Self::boot_millis())
                     .into_iter()
                     .map(|(silent, m)| (m, silent))
                     .collect(),
@@ -2311,7 +2324,7 @@ impl Syncer {
             // one that spoke seconds ago still wore the stamp of its last
             // silence, and the shedder would name it first, deleting an
             // entry the very next line puts back.
-            let now = Self::boot_nanos();
+            let now = Self::boot_millis();
             if let Some(ports) = self.carried_ports.get_mut(&dev) {
                 for mac in &macs {
                     if let Some(slot) = ports.get_mut(mac) {
