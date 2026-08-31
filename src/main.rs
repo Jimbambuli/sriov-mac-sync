@@ -658,14 +658,27 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
 
 /// A millisecond count the way an operator reads one: seconds under two
 /// minutes, minutes under two hours, hours beyond.
+/// A silence, in days, hours, minutes and seconds.
+///
+/// Every unit from the largest non-zero one down to seconds, and no
+/// rounding: the form before this said "2h" for anything between two hours
+/// and three, so two entries fifty minutes apart printed the same thing and
+/// there was no way to tell which of them the pressure valve would take
+/// first. Below a minute it is seconds alone.
+///
+/// No weeks and no months. Days already carry that, and a unit whose length
+/// is a matter of opinion is a unit an operator has to convert back.
 fn human_duration(ms: u64) -> String {
     let s = ms / 1000;
-    if s < 120 {
-        format!("{s}s")
-    } else if s < 7200 {
-        format!("{}m", s / 60)
+    let (d, h, m, sec) = (s / 86_400, (s / 3600) % 24, (s / 60) % 60, s % 60);
+    if d > 0 {
+        format!("{d}d {h}h {m}m {sec}s")
+    } else if h > 0 {
+        format!("{h}h {m}m {sec}s")
+    } else if m > 0 {
+        format!("{m}m {sec}s")
     } else {
-        format!("{}h", s / 3600)
+        format!("{sec}s")
     }
 }
 
@@ -1264,6 +1277,32 @@ mod tests {
         }
     }
 
+    /// A silence is read off, not decoded.
+    ///
+    /// The form this replaced named one unit and truncated, so "2h" meant
+    /// anything from two hours to three - and the whole point of the number
+    /// is to say which of two keeps the valve will take first.
+    #[test]
+    fn a_silence_is_spelled_out_to_the_second() {
+        for (ms, want) in [
+            (0u64, "0s"),
+            (999, "0s"),
+            (1_000, "1s"),
+            (59_000, "59s"),
+            (60_000, "1m 0s"),
+            (90_500, "1m 30s"),
+            // The example from the day this changed: 112 minutes.
+            (6_720_000, "1h 52m 0s"),
+            (7_200_000, "2h 0m 0s"),
+            // Just under three hours - the old form called this "2h" too.
+            (10_740_000, "2h 59m 0s"),
+            (86_400_000, "1d 0h 0m 0s"),
+            (183_845_000, "2d 3h 4m 5s"),
+        ] {
+            assert_eq!(human_duration(ms), want, "{ms} ms");
+        }
+    }
+
     /// The two modes that print addresses say the same thing about them.
     ///
     /// `--status` writes to stdout and `--once` to stderr, so they cannot
@@ -1292,8 +1331,8 @@ mod tests {
             vec![
                 "    02:00:00:00:00:02".to_string(),
                 "    02:00:00:00:00:03".to_string(),
-                "    02:00:00:00:00:04 (quiet, silent 60s)".to_string(),
-                "    02:00:00:00:00:01 (quiet, silent 12m)".to_string(),
+                "    02:00:00:00:00:04 (quiet, silent 1m 0s)".to_string(),
+                "    02:00:00:00:00:01 (quiet, silent 12m 0s)".to_string(),
             ],
             "the live ones first by address, then rising silence, \
              and only the kept ones marked"
