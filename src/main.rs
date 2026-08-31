@@ -461,7 +461,7 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                 std::process::exit(0);
             }
             "--version" => {
-                println!("sriov-mac-sync {VERSION}");
+                note!("sriov-mac-sync {VERSION}");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown option: {other} (try --help)")),
@@ -566,11 +566,11 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
     let mut ok = true;
     for pair in pairs {
         let Some(link) = topo.get(&pair.dev) else {
-            println!("{}: skipped - the interface is gone", pair.dev);
+            note!("{}: skipped - the interface is gone", pair.dev);
             continue;
         };
         let Some(mut probe) = link.mac else {
-            println!(
+            note!(
                 "{}: skipped - it has no address to derive a probe from",
                 pair.dev
             );
@@ -587,7 +587,7 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
         // note could not take is not written at all: the healing story
         // held only when this call happened to succeed, and nothing said so.
         if !syncer.note_check_probe(&pair.dev, link.index, &probe) {
-            println!(
+            note!(
                 "{} ({driver}): cannot check - the probe could not be noted in \
                  {STATE_DIR} first, and an unnoted probe would outlive a killed \
                  check as a foreign entry",
@@ -603,7 +603,7 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
             Err(e) => {
                 syncer.forget_check_probe(&pair.dev, &probe);
-                println!(
+                note!(
                     "{} ({driver}): FAILED - the driver refuses unicast filter entries: {e}",
                     pair.dev
                 );
@@ -618,7 +618,7 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
                 .iter()
                 .any(|e| e.is_self() && e.ifindex == link.index && e.mac == probe),
             Err(e) => {
-                println!(
+                note!(
                     "{} ({driver}): inconclusive - the entry was accepted, but the \
                      forwarding table could not be read back: {e}",
                     pair.dev
@@ -631,13 +631,13 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
             }
         };
         if listed {
-            println!(
+            note!(
                 "{} ({driver}): ok - accepts unicast filter entries \
                  (kernel side only; confirm with traffic)",
                 pair.dev
             );
         } else {
-            println!(
+            note!(
                 "{} ({driver}): FAILED - entry accepted but not listed",
                 pair.dev
             );
@@ -672,9 +672,10 @@ fn human_duration(ms: u64) -> String {
 /// The addresses an uplink wants, one per line, marking the ones held
 /// through a silence with how long each has been silent.
 ///
-/// Returned rather than printed: `--status` writes to stdout and `--once`
-/// to stderr, beside the report line each belongs under, and the wording
-/// must not drift between the two.
+/// Returned rather than printed, because the two callers emit it in
+/// different places - under `--status`'s uplink block, and under the report
+/// lines of a `--once` - and the wording must not drift between them. Both
+/// go to stdout: this is normal operation, and `note!` says why.
 fn address_lines(detail: &sync::Detail) -> Vec<String> {
     let ages: std::collections::BTreeMap<_, _> = detail.quiet_ages.iter().copied().collect();
     let mut wanted = detail.wanted.clone();
@@ -798,24 +799,24 @@ fn run() -> Result<bool, String> {
                 .reconcile(&mut sock, false, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             for r in &reports {
-                println!("{} on {} ({})", r.dev, r.bridge, r.driver);
+                note!("{} on {} ({})", r.dev, r.bridge, r.driver);
                 if r.port != r.dev {
-                    println!("  enslaved through  : {}", r.port);
+                    note!("  enslaved through  : {}", r.port);
                 }
                 // "wanted", not "behind the bridge": EXTRA-pinned
                 // addresses are in this number precisely because they are
                 // NOT in the bridge's table, and the count must not
                 // disagree with `bridge fdb show` over them.
-                println!("  wanted in filter  : {}", r.wanted);
-                println!("  registered by us  : {}", r.owned);
+                note!("  wanted in filter  : {}", r.wanted);
+                note!("  registered by us  : {}", r.owned);
                 // Worth a line only when there are any: the memory this
                 // reads is the running daemon's, taken from the file it
                 // writes, so a fresh --status can now answer for it.
                 if r.quiet > 0 {
-                    println!("  held quiet        : {}", r.quiet);
+                    note!("  held quiet        : {}", r.quiet);
                 }
-                println!("  unicast list      : {}", r.present);
-                println!(
+                note!("  unicast list      : {}", r.present);
+                note!(
                     "  stacked bridges   : {}",
                     if r.stacked.is_empty() {
                         "none".to_string()
@@ -829,7 +830,7 @@ fn run() -> Result<bool, String> {
                 // numbers nothing prints.
                 if let (true, Some(detail)) = (opts.verbose, r.detail.as_ref()) {
                     for line in address_lines(detail) {
-                        println!("{line}");
+                        note!("{line}");
                     }
                 }
             }
