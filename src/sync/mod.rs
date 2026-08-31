@@ -1023,6 +1023,20 @@ impl Syncer {
         if self.dry_run {
             return;
         }
+        // "Nothing in the map" means two different things, and only one of
+        // them is "nothing to remember". The other is "nobody has looked at
+        // the file yet": `load_ports` runs at exactly one place, in the
+        // pass's pair loop, behind three fail-closed `continue`s and behind
+        // a refused pass - while the reflection path reaches here from a
+        // batch. Told apart by the mark `load_ports` sets before it reads,
+        // because otherwise the empty branch below unlinks the previous
+        // process's memory unread, and the next pass unregisters every
+        // guest that went quiet across the restart. That is the outage this
+        // file exists to prevent. The learn path a few hundred lines down
+        // carries the same guard for the same reason.
+        if !self.ports_loaded.contains(dev) && !self.carried_ports.contains_key(dev) {
+            return;
+        }
         let (mut lines, mut keys): (Vec<String>, Vec<String>) = match self.carried_ports.get(dev) {
             // A port whose index no longer has a name is a port that
             // is gone: the keep is over for it anyway, and a line that

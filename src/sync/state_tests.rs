@@ -5300,3 +5300,161 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A process that has not read the memory file does not delete it.
+///
+/// "Nothing in `carried_ports`" means two things: nothing to remember, and
+/// nobody has looked yet. `load_ports` runs at one place only - the pass's
+/// pair loop, behind three fail-closed `continue`s - while the reflection
+/// path reaches `save_ports` straight from a batch. Told apart wrongly, the
+/// previous process's keeps are unlinked unread, and the next pass
+/// unregisters every guest that went quiet across the restart.
+#[test]
+fn a_reflection_before_the_first_pass_keeps_the_memory_file() {
+    let dir = scratch("reflection-keeps-file");
+    let quiet: Mac = [0x02, 0xd1, 0, 0, 0, 1];
+    let moved: Mac = [0x02, 0xd1, 0, 0, 0, 2];
+    let topo = small_host();
+
+    // A previous process: both addresses registered, `quiet` then ages out
+    // of the bridge and is kept.
+    let mut first = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, quiet), learned(4, 10, moved)]);
+    first.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    let mut sock2 = kernel(vec![card_holds(2, quiet), learned(4, 10, moved)]);
+    first.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    drop(first);
+    let file = dir.join(".nic1.owned.ports");
+    assert!(
+        file.exists(),
+        "the previous process should have left a memory"
+    );
+
+    // The new process answers a batch before any pass reached load_ports:
+    // `moved` turns up on the uplink port itself, so the reflection takes
+    // it back out and saves the memory.
+    let mut s = br0_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(2, 10, moved))])
+        .unwrap();
+    assert!(
+        file.exists(),
+        "the memory file was deleted by a process that had never read it"
+    );
+
+    // And the first pass still takes the keep over.
+    let mut sock3 = kernel(vec![card_holds(2, quiet)]);
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(reports[0].quiet, 1, "the quiet guest should have survived");
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == quiet),
+        "the quiet guest was unregistered after its memory was lost"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A note left mid-address by an unfinished write is cut back, not built on.
+///
+/// `append_owned_locked` is the one writer that works in place. A write that
+/// stops halfway - a full /run, or a process that was killed - leaves the
+/// file ending inside an address with no newline. Appending to that glues
+/// two addresses into one unreadable line: the card gets an entry that no
+/// note names any more, and neither a pass nor `--flush` can reach it,
+/// because both work from the notes. That is hard invariant 3, broken by a
+/// full filesystem.
+#[test]
+fn an_unfinished_note_line_is_cut_back_before_appending() {
+    let dir = scratch("note-halfline");
+    let whole: Mac = [0x02, 0xd2, 0, 0, 0, 1];
+    let added: Mac = [0x02, 0xd2, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, whole)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // The write that did not finish: a whole line, then most of a second.
+    let note = dir.join("nic1.owned");
+    let text = fs::read_to_string(&note).unwrap();
+    fs::write(&note, format!("{text}02:d2:00:00:00:0")).unwrap();
+
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, added))])
+        .unwrap();
+
+    // Every line is a whole address, and the note names what the card holds.
+    let after = fs::read_to_string(&note).unwrap();
+    for line in after.lines().filter(|l| !l.trim().is_empty()) {
+        assert_eq!(
+            line.trim().len(),
+            17,
+            "the note carries a line that is not an address: {line:?} in {after:?}"
+        );
+    }
+    let owned = s.load_owned("nic1");
+    assert!(owned.contains(&whole), "the finished line should survive");
+    assert!(
+        owned.contains(&added),
+        "the appended address has to be readable back: {after:?}"
+    );
+    assert!(
+        ev.added.iter().any(|(_, m)| *m == added),
+        "and it should have reached the card"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The fast path does not make a port memory before the file was read.
+///
+/// `load_ports` bails out when a map is already carried in RAM, so whoever
+/// creates that map first decides whether the previous process's file is
+/// ever read at all. The fast path can get there first: `load_ports` runs
+/// at one place only, in the pass's pair loop behind three fail-closed
+/// `continue`s, while a batch reaches `fast_apply` from the picture alone.
+/// Without the guard the empty map wins and the keeps are lost unread.
+#[test]
+fn a_batch_before_the_first_pass_does_not_shadow_the_memory_file() {
+    let dir = scratch("fastpath-shadow");
+    let quiet: Mac = [0x02, 0xd3, 0, 0, 0, 1];
+    let newcomer: Mac = [0x02, 0xd3, 0, 0, 0, 2];
+    let topo = small_host();
+
+    // A previous process leaves a memory with one quiet guest.
+    let mut first = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
+    first.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    let mut sock2 = kernel(vec![card_holds(2, quiet)]);
+    first.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    drop(first);
+
+    // The new process answers a batch first - the pass that would have read
+    // the file skipped this pair, or was refused.
+    let mut s = br0_syncer(&dir);
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
+        .unwrap();
+
+    // Now the first pass. It must still find the file.
+    let mut sock3 = kernel(vec![card_holds(2, quiet), card_holds(2, newcomer)]);
+    let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        s.carried_ports["nic1"].contains_key(&quiet),
+        "the previous process's memory was shadowed by the batch"
+    );
+    assert_eq!(reports[0].quiet, 1, "the quiet guest should have been kept");
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == quiet),
+        "the quiet guest was unregistered because its memory went unread"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

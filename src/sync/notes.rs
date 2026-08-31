@@ -795,6 +795,43 @@ impl Syncer {
     /// when the card refuses the address as somebody else's. `None` when
     /// the note could not take the addresses, and the caller then must not
     /// write any of them into the card: the note comes first.
+    /// Cut back a line a previous write did not finish, before adding to it.
+    ///
+    /// This is the one writer that works in place; everything else goes
+    /// through `put_file`, where a temporary and a rename make a half-write
+    /// impossible. Here a `write_all` that stops in the middle - a full
+    /// /run, which is where the notes live - leaves the file ending inside
+    /// an address with no newline, and the next append glues the two
+    /// together. The card then holds an entry no note names any more:
+    /// neither a pass nor `--flush` can reach it, because both work from
+    /// the notes. That is the permanent orphan hard invariant 3 exists
+    /// against, out of one full filesystem.
+    ///
+    /// Cutting back rather than rolling back on the error path on purpose:
+    /// the length from before the write is not always known (the cache may
+    /// have been dropped), a stale one would cut a parallel writer's lines,
+    /// and neither helps against the write that never returned at all -
+    /// SIGKILL, a lost machine. Whatever left the file unfinished, the next
+    /// append under this lock is where it gets tidied.
+    fn finish_the_last_line(dev: &str, f: &mut fs::File) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut all = Vec::new();
+        f.seek(SeekFrom::Start(0))?;
+        f.read_to_end(&mut all)?;
+        if all.is_empty() || all.last() == Some(&b'\n') {
+            return Ok(());
+        }
+        // Back to the end of the last line that IS finished. A file with no
+        // newline at all was cut in its first line and keeps nothing.
+        let keep = all.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        eprintln!(
+            "warning: {dev}: the ownership note ended mid-line, {} byte(s) \
+             from a write that did not finish - cut back before appending",
+            all.len() - keep
+        );
+        f.set_len(keep as u64)
+    }
+
     pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> Option<Vec<Mac>> {
         use std::io::Write;
         let mut set = self.load_owned(dev);
@@ -821,6 +858,7 @@ impl Syncer {
         }
         let path = self.state_path(dev);
         let opened = fs::OpenOptions::new()
+            .read(true)
             .append(true)
             // Never through a symlink, for the reason `put_file` gives.
             .custom_flags(libc::O_NOFOLLOW)
@@ -829,6 +867,7 @@ impl Syncer {
                 if e.kind() == io::ErrorKind::NotFound {
                     self.ensure_state_dir()?;
                     fs::OpenOptions::new()
+                        .read(true)
                         .create(true)
                         .append(true)
                         .mode(0o600)
@@ -844,7 +883,10 @@ impl Syncer {
         // left is right - but the copy in memory would then describe a file
         // that no longer exists, and its size is how that shows.
         let was = self.notes.borrow().get(dev).map(|n| n.len);
-        let wrote = opened.and_then(|mut f| f.write_all(text.as_bytes()));
+        let wrote = opened.and_then(|mut f| {
+            Self::finish_the_last_line(dev, &mut f)?;
+            f.write_all(text.as_bytes())
+        });
         match wrote {
             Ok(()) => {
                 let expected = was.map(|w| w + text.len() as u64);

@@ -59,22 +59,40 @@ check_soon() {
 # address does not, and `bridge fdb show dev X self` prints both.
 has_self() { $NS bridge fdb show dev veth-up | grep "$1" | grep -q self; }
 
-# Up and listening, said by the daemon itself rather than guessed at: it
-# prints what it is watching once its first pass is done, and everything a
-# scenario does afterwards depends on that having happened.
+# Up AND past its first pass, said by the daemon itself. The "watching"
+# banner is not that line - main() prints it before the loop starts - and a
+# scenario that begins its work between the two races the start pass: it
+# would register what the scenario is about to hand the fast path, and the
+# fast path would then be tested against a no-op. So the daemons run with
+# --timings and this waits for the pass report, which run_pass prints after
+# the pass is done.
 wait_ready() {
   for _ in $(seq 1 50); do
-    grep -q "watching" "$1" && return 0
+    grep -q 'pass \[start\]' "$1" && return 0
     sleep 0.1
   done
-  echo "   note: the daemon never said what it was watching" >&2
+  echo "   note: the daemon never reported its start pass" >&2
 }
 
 # A scenario daemon on the shared pair, logging to the named file.
 start_daemon() {
-  $NS "$BIN" --pair veth-up:br0 --interval 1 >"$1" 2>&1 &
+  $NS "$BIN" --pair veth-up:br0 --interval 1 --timings >"$1" 2>&1 &
   DPID=$!
   wait_ready "$1"
+}
+
+# How many passes this daemon has finished. The scenarios that assert a
+# property SURVIVES need a pass boundary after the property was established;
+# without one they only ever see the instant it was made.
+passes() { grep -c '^pass \[' "$1" || true; }
+
+# Wait until the daemon has finished N more passes than it had.
+passes_beyond() {
+  for _ in $(seq 1 60); do
+    [ "$(passes "$1")" -gt "$2" ] && return 0
+    sleep 0.1
+  done
+  echo "   note: the daemon did not run another pass" >&2
 }
 
 # Re-create the guest port and M1's registration for whatever follows a
@@ -225,17 +243,33 @@ check "the addresses are listed" "grep -q '^    $M2$' /tmp/sms-it-s3.log"
 check "the list is headed" "grep -q 'veth-up: .* address(es) wanted' /tmp/sms-it-s3.log"
 
 say "S4: the daemon's fast path registers within seconds"
-$NS "$BIN" --pair veth-up:br0 >/tmp/sms-it-s4.log 2>&1 &
+# A FRESH address, added only after the start pass has been reported. M2 is
+# already in the bridge from S3, so the start pass registers it and the
+# learn below would be a no-op: this scenario used to pass with the fast
+# path's registration deleted outright.
+M10=02:be:5c:00:00:1a
+$NS "$BIN" --pair veth-up:br0 --timings >/tmp/sms-it-s4.log 2>&1 &
 DPID=$!
 wait_ready /tmp/sms-it-s4.log
-$NS bridge fdb replace $M2 dev veth-g1 master dynamic
-check_soon "M2 in the filter (fast path)" "has_self $M2"
-check_soon "M2 in the note" "grep -q $M2 $STATE/veth-up.owned"
+check "the fresh address is not registered yet" "! has_self $M10"
+# What makes this the FAST PATH and not just "it got registered": a batch
+# also buys a pass ~200 ms later, and that pass would register M10 all the
+# same - with the fast path's registration deleted outright this scenario
+# used to stay green. So the claim is that M10 is in the card BEFORE any
+# pass has run. Polled at 20 ms, against a fast path that answers in under
+# a millisecond and a pass that cannot come sooner than 200 ms.
+PASSES=$(passes /tmp/sms-it-s4.log)
+$NS bridge fdb replace $M10 dev veth-g1 master dynamic
+for _ in $(seq 1 50); do has_self $M10 && break; sleep 0.02; done
+check "M10 in the filter" "has_self $M10"
+check "and no pass had run yet (so the fast path did it)" \
+  "[ \"\$(passes /tmp/sms-it-s4.log)\" -eq $PASSES ]"
+check_soon "M10 in the note" "grep -q $M10 $STATE/veth-up.owned"
 
 say "S5: an address that moves out onto the wire is unregistered"
-$NS bridge fdb replace $M2 dev veth-up master dynamic
-check_soon "M2 self entry removed" "! has_self $M2"
-check_soon "M2 out of the note" "! grep -q $M2 $STATE/veth-up.owned"
+$NS bridge fdb replace $M10 dev veth-up master dynamic
+check_soon "M10 self entry removed" "! has_self $M10"
+check_soon "M10 out of the note" "! grep -q $M10 $STATE/veth-up.owned"
 check_soon "reflection line in the log" "grep -q 'reflection' /tmp/sms-it-s4.log"
 
 say "S6: SIGTERM stops the daemon promptly and the notes survive"
@@ -287,6 +321,11 @@ $NS bridge fdb del $M2 dev veth-g1 master
 # once the pass that could have removed it has run.
 check_soon "the keep is said" \
   "[ \"\$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6c.log)\" -gt $KEPT_BEFORE ]"
+# And it has to SURVIVE, which is what the scenario title claims: a keep
+# that holds only on the pass that first noticed the silence would pass
+# every check above. So let another pass go by and ask again.
+PASSES=$(passes /tmp/sms-it-s6c.log)
+passes_beyond /tmp/sms-it-s6c.log "$PASSES"
 check "M2 kept after ageing (port lives)" "has_self $M2"
 # The guest actually stops: the veth goes, and the entry must follow.
 $NS ip link del veth-g1
@@ -345,22 +384,27 @@ start_daemon /tmp/sms-it-s6e.log
 M6="02:be:5c:00:00:66"
 $NS bridge fdb replace $M6 dev veth-g1 master dynamic
 check_soon "M6 registered while learnt" "has_self $M6"
-# It ages out, and is kept.
+# It ages out, and is kept. NOT waited on by grepping the memory file for
+# M6: that file carries a line per owned LEARNT address, the live ones
+# included, so M6's line is already there from the pass that registered it -
+# the poll would return before the deletion was ever noticed.
+KEPT_BEFORE=$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6e.log || true)
 $NS bridge fdb del $M6 dev veth-g1 master
-# The handover is the memory file, so the wait is for this process to have
-# really written M6 into it - what the next one reads there is the whole
-# point of the scenario, and a log line about some other address is not it.
-check_soon "M6 is in the handover file" "grep -q $M6 $STATE/.veth-up.owned.ports"
+check_soon "the keep is said" \
+  "[ \"\$(grep -c 'kept \[quiet\]' /tmp/sms-it-s6e.log)\" -gt $KEPT_BEFORE ]"
+PASSES=$(passes /tmp/sms-it-s6e.log)
+passes_beyond /tmp/sms-it-s6e.log "$PASSES"
 check "M6 kept while its port lives" "has_self $M6"
+check "M6 is in the handover file" "grep -q $M6 $STATE/.veth-up.owned.ports"
 # The update: stop, start again, and let the new process run a full pass.
 stop_daemon
 start_daemon /tmp/sms-it-s6e2.log
 check_soon "the takeover is said" "grep -q 'took over' /tmp/sms-it-s6e2.log"
-# And on the keep decision itself having been made - the takeover line is
-# printed as the pass begins, and it is the pass that could unregister M6.
-# Not on a pass REPORT: a pass that changed nothing prints none.
-check_soon "the new process made its keep decision" \
-  "grep -q 'kept \[quiet\]' /tmp/sms-it-s6e2.log"
+# Survival across the handover means surviving a pass of the NEW process,
+# not just the instant it adopted the memory. wait_ready already waited for
+# its start pass; give it one more.
+PASSES=$(passes /tmp/sms-it-s6e2.log)
+passes_beyond /tmp/sms-it-s6e2.log "$PASSES"
 check "M6 survived the restart" "has_self $M6"
 # And the memory is still live in the new process: the port going still ends it.
 $NS ip link del veth-g1
