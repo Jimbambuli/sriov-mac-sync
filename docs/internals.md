@@ -60,7 +60,19 @@ silence, so two addresses that fall out between the same two passes are
 told apart by their traffic instead of by their names. Two passes may
 never share a stamp - everything would then read as loud - so a pass whose
 clock reading matches its predecessor's takes the next number up rather
-than a finer clock being asked for. A restart is mostly an update,
+than a finer clock being asked for.
+
+The bridge's own deletions refine that stamp. A bridge forgets an address
+exactly its ageing time after the last frame from it, so `RTM_DELNEIGH`
+arriving now says the guest spoke one ageing time ago - which the daemon
+reads out of the same link dump the topology comes from
+(`IFLA_BR_AGEING_TIME`). It is taken only when it places that frame
+*later* than the last pass did: a vlan-aware bridge holds one entry per
+VLAN and ages them apart, so a deletion may well concern an address that
+spoke in another VLAN a moment ago, and our own observation is then the
+better one. So the event can say "it went on speaking after you last
+looked" and never the reverse - which is also why a deletion is still no
+reason to unregister anything, only to look. A restart is mostly an update,
 and an update that forgot its keeps would unregister every quiet guest on
 its first pass - the outage the keep exists to prevent, delivered by our
 own package. A line is believed only where it still describes this kernel,

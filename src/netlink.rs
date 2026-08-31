@@ -61,6 +61,11 @@ const IFLA_MASTER: u16 = 10;
 const IFLA_LINK: u16 = 5;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+/// A bridge's ageing time, in the kernel's clock_t - USER_HZ hundredths of
+/// a second, so 30000 is the default five minutes. Inside IFLA_INFO_DATA,
+/// which a plain link dump already carries.
+const IFLA_BR_AGEING_TIME: u16 = 4;
 const IFLA_PARENT_DEV_NAME: u16 = 56;
 const IFLA_LINK_NETNSID: u16 = 37;
 const IFLA_EXT_MASK: u16 = 29;
@@ -145,6 +150,11 @@ pub struct LinkInfo {
     /// is why the kind has to be consulted before believing it
     pub link: Option<u32>,
     pub kind: Option<String>,
+    /// A bridge's ageing time in clock_t hundredths of a second, where the
+    /// kernel offered one. The interval after which the bridge forgets a
+    /// silent address - which is exactly how long ago an address that has
+    /// just aged out last spoke.
+    pub ageing: Option<u32>,
     /// the bus device behind this interface, when the kernel names one. Its
     /// presence answers "is there a device/ directory" without a stat.
     pub parent_dev: Option<String>,
@@ -1162,9 +1172,20 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
             }
             IFLA_LINKINFO => {
                 for (nested, v) in attrs(value) {
-                    if nested == IFLA_INFO_KIND {
-                        let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
-                        out.kind = Some(String::from_utf8_lossy(&v[..end]).into_owned());
+                    match nested {
+                        IFLA_INFO_KIND => {
+                            let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+                            out.kind = Some(String::from_utf8_lossy(&v[..end]).into_owned());
+                        }
+                        IFLA_INFO_DATA => {
+                            for (inner, iv) in attrs(v) {
+                                if inner == IFLA_BR_AGEING_TIME && iv.len() >= 4 {
+                                    out.ageing =
+                                        Some(u32::from_ne_bytes(iv[..4].try_into().unwrap()));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

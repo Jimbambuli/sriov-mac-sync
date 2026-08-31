@@ -4571,3 +4571,183 @@ fn a_memory_file_from_another_format_is_ignored() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A bridge forgets an address exactly its ageing time after the last
+/// frame from it, so the deletion it announces dates that frame: the
+/// guest spoke one ageing time ago. Where the pass had only "it was
+/// still there when I looked", the deletion can say "and it went on
+/// speaking after that" - never the reverse, which is what the
+/// only-if-later guard is for. The valve evicts by this number, so an
+/// address the bridge vouches for outlives one it says nothing about.
+#[test]
+fn a_deletion_says_how_long_after_the_pass_the_guest_spoke() {
+    let dir = scratch("delneigh-dates");
+    // `spoke_later` sorts FIRST, so the address tie-break alone would
+    // name it: only a real date can spare it.
+    let spoke_later: Mac = [0x02, 0xf4, 0, 0, 0, 1];
+    let just_quiet: Mac = [0x02, 0xf4, 0, 0, 0, 2];
+    // A bridge that forgets in 10 ms, so "one ageing time ago" lands
+    // inside a test's lifetime rather than five minutes outside it.
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .ageing(Some(10))
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![
+        learned(4, 10, spoke_later),
+        learned(4, 10, just_quiet),
+    ]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Time passes with no pass in it - the window the daemon is blind in.
+    std::thread::sleep(Dur::from_millis(40));
+
+    // The bridge forgets one of them and says so. Its ageing time places
+    // that guest's last frame 10 ms ago, well after the pass above.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(
+        &mut ev,
+        &topo,
+        &[(RTM_DELNEIGH, learned(4, 10, spoke_later))],
+    )
+    .unwrap();
+
+    // Both are keeps now, and there is room for one.
+    let mut sock2 = kernel(vec![card_holds(2, spoke_later), card_holds(2, just_quiet)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    s.max_macs = 7;
+    let newcomer: Mac = [0x02, 0xf4, 0, 0, 0, 9];
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == just_quiet),
+        "the address nothing vouched for should have paid"
+    );
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == spoke_later),
+        "the address the bridge dated as speaking after the pass was evicted"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The dating never runs backwards. A vlan-aware bridge holds one entry
+/// per VLAN and ages them apart, so a deletion can arrive for an address
+/// that spoke in another VLAN moments ago - and the later word is the
+/// true one. Without the guard the deletion would date it a whole ageing
+/// time into the past and the valve would evict the address that is in
+/// fact the most recently heard of the two.
+#[test]
+fn a_deletion_never_makes_an_address_older_than_it_is() {
+    let dir = scratch("delneigh-no-regress");
+    let a: Mac = [0x02, 0xf5, 0, 0, 0, 1];
+    let b: Mac = [0x02, 0xf5, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, a), learned(4, 10, b)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // `b` falls silent; `a` keeps speaking, so the next pass moves only
+    // `a`'s stamp forward. `a` is now the more recently heard of the two.
+    let mut sock2 = kernel(vec![learned(4, 10, a), card_holds(2, b)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // One of `a`'s VLAN entries ages out and says so. Dating it back a
+    // whole ageing time would put it behind `b`, which is the opposite of
+    // what the bridge just told us about `a`.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(&mut ev, &topo, &[(RTM_DELNEIGH, learned(4, 10, a))])
+        .unwrap();
+    // Now `a` really does fall silent too, so both are keeps.
+    let mut sock3 = kernel(vec![card_holds(2, a), card_holds(2, b)]);
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+
+    // Three slots held, allowed = 3, one newcomer: exactly one keep pays,
+    // and it has to be `b`.
+    s.max_macs = 7;
+    let newcomer: Mac = [0x02, 0xf5, 0, 0, 0, 9];
+    let mut sock4 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock4,
+        &topo,
+        &[(RTM_NEWNEIGH, learned(4, 10, newcomer))],
+    )
+    .unwrap();
+    assert!(
+        sock4.removed.iter().any(|(_, m)| *m == b),
+        "the address silent since the earlier pass should have paid"
+    );
+    assert!(
+        !sock4.removed.iter().any(|(_, m)| *m == a),
+        "a deletion dated an address older than the bridge had just shown it"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The date is the deletion's moment minus the bridge's ageing time, not
+/// the deletion's moment: the bridge gave up now, so the guest spoke one
+/// ageing time ago. Taking the moment itself would credit every aged-out
+/// address with having just spoken - and the valve would then protect the
+/// addresses that have been silent longest.
+#[test]
+fn the_date_is_one_ageing_time_before_the_deletion() {
+    let dir = scratch("delneigh-arithmetic");
+    let m: Mac = [0x02, 0xf6, 0, 0, 0, 1];
+    // A bridge that forgets after 200 ms, so a test can outlive it.
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .master("br0")
+        .vfs(1)
+        .add("vetha", 4, Some(mac(4)))
+        .master("br0")
+        .add("br0", 10, Some(mac(3)))
+        .bridge()
+        .ageing(Some(200))
+        .lower("nic1")
+        .lower("vetha")
+        .build();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Long enough that the deletion's date lands after the pass, so the
+    // only-if-later guard lets it through and the number is really this
+    // code's arithmetic rather than the pass's stamp.
+    std::thread::sleep(Dur::from_millis(260));
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(&mut ev, &topo, &[(RTM_DELNEIGH, learned(4, 10, m))])
+        .unwrap();
+
+    let mut sock2 = kernel(vec![card_holds(2, m)]);
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    let (_, silent) = reports[0]
+        .quiet_ages
+        .iter()
+        .find(|(a, _)| *a == m)
+        .expect("the address should be held quiet");
+    assert!(
+        (150..=400).contains(silent),
+        "the silence should be about the bridge's 200 ms ageing time, was {silent} ms"
+    );
+}

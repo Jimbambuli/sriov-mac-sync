@@ -986,6 +986,54 @@ impl Syncer {
         }
     }
 
+    /// Put a date on a silence the bridge has just announced.
+    ///
+    /// A bridge forgets an address exactly its ageing time after the last
+    /// frame from it, so a deletion arriving now says the guest last spoke
+    /// one ageing time ago - a fact, where the stamp otherwise holds only
+    /// "the last pass still saw it", which can be a whole pass interval
+    /// short of the truth. What the number is for is the order the
+    /// pressure valve evicts in and the silence `--status -v` reports, and
+    /// both get more honest for it.
+    ///
+    /// Never backwards: a vlan-aware bridge holds one entry per VLAN and
+    /// ages them apart, so a deletion can arrive for an address that spoke
+    /// in another VLAN a moment ago. The later stamp is the true one.
+    ///
+    /// Not every deletion is an ageing - a flush, a port going down and a
+    /// hand-run `bridge fdb del` look the same from here - so this is an
+    /// estimate, and a wrong one only ever makes an address look older
+    /// than it is: it is then evicted sooner under pressure, which for an
+    /// address the bridge has genuinely dropped is the right direction.
+    fn date_the_silence(&mut self, topo: &Topology, events: &[(u16, FdbEntry)]) {
+        let now = Self::boot_millis();
+        for (kind, entry) in events {
+            if *kind != crate::netlink::RTM_DELNEIGH {
+                continue;
+            }
+            // The bridge that forgot it decides the interval; a stacked
+            // vnet may age differently from the uplink's own bridge. This
+            // is also what keeps our own filter entries out: a `self`
+            // entry names no master, so a deletion from the card says
+            // nothing here and is stepped over.
+            let Some(ageing) = entry
+                .master
+                .and_then(|m| topo.at(m))
+                .and_then(|l| l.ageing_ms)
+            else {
+                continue;
+            };
+            let spoke = now.saturating_sub(ageing);
+            for ports in self.carried_ports.values_mut() {
+                if let Some(slot) = ports.get_mut(&entry.mac) {
+                    if spoke > slot.1 {
+                        slot.1 = spoke;
+                    }
+                }
+            }
+        }
+    }
+
     /// How long each of these has been silent, in milliseconds - the
     /// valve orders evictions by it and --status -v shows it. An address
     /// this process never saw learnt counts as silent since boot: nothing
@@ -1996,6 +2044,7 @@ impl Syncer {
             .iter()
             .any(|(kind, _)| *kind == crate::netlink::RTM_DELNEIGH)
         {
+            self.date_the_silence(topo, events);
             Urgency::WhenConvenient
         } else {
             Urgency::Nothing

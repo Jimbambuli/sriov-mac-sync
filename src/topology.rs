@@ -45,6 +45,11 @@ pub struct Link {
     /// what is enslaved to, or stacked under, this interface
     pub lowers: Vec<u32>,
     pub is_bridge: bool,
+    /// How long this bridge takes to forget a silent address, in
+    /// milliseconds - and so how long ago an address it has just aged out
+    /// last spoke. Only bridges have one; from the same dump everything
+    /// else here comes from.
+    pub ageing_ms: Option<u64>,
     pub numvfs: u32,
     pub driver: Option<String>,
     /// the PF, when this interface is a virtual function. On a card where one
@@ -312,6 +317,9 @@ impl Topology {
                 master: l.master,
                 lowers,
                 is_bridge: l.kind.as_deref() == Some("bridge"),
+                // clock_t is USER_HZ hundredths of a second on every
+                // architecture this runs on: 30000 is the default 300 s.
+                ageing_ms: l.ageing.map(|c| c as u64 * 10),
                 // Not from the dump. IFLA_NUM_VF is only sent when the
                 // request carries RTEXT_FILTER_VF, which this one does not -
                 // that flag makes every driver with virtual functions answer
@@ -709,6 +717,17 @@ pub(crate) mod fixture {
 
         pub fn bridge(mut self) -> Self {
             self.last().is_bridge = true;
+            // The kernel default, five minutes, unless a test says else -
+            // a bridge without one is a bridge whose kernel did not say,
+            // which is a different state and has its own setter.
+            self.last().ageing_ms = Some(300_000);
+            self
+        }
+
+        /// How long this bridge takes to forget, in milliseconds. `None`
+        /// is the kernel that did not say.
+        pub fn ageing(mut self, ms: Option<u64>) -> Self {
+            self.last().ageing_ms = ms;
             self
         }
 
