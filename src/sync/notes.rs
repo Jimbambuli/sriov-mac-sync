@@ -38,6 +38,12 @@ impl Note {
     }
 }
 
+/// The first line of the quiet-keep memory file: what the numbers in it
+/// mean. Bumped whenever that changes, so an older or newer file is
+/// ignored rather than misread - losing it costs the keeps for one ARP
+/// cycle, which is what every build before the file existed did anyway.
+const PORTS_FORMAT: &str = "sriov-mac-sync ports 2";
+
 impl Syncer {
     pub(super) fn state_path(&self, dev: &str) -> PathBuf {
         self.state_dir.join(format!("{dev}.owned"))
@@ -105,8 +111,19 @@ impl Syncer {
         let Ok(text) = fs::read_to_string(self.ports_path(dev)) else {
             return Vec::new();
         };
+        // The first line says what the numbers mean. Without it this
+        // silently mis-read a file whose stamps meant something else - the
+        // format once recorded when an address went missing, in
+        // milliseconds, and reading those as "last seen, in nanoseconds"
+        // made every carried-over entry look silent since boot. A file
+        // this run does not recognise is no memory, which is the same
+        // thing every build before the file existed did.
+        let mut lines = text.lines();
+        if lines.next() != Some(PORTS_FORMAT) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        for line in text.lines() {
+        for line in lines {
             let mut f = line.split_whitespace();
             let (Some(mac), Some(name), Some(index)) = (f.next(), f.next(), f.next()) else {
                 continue;
@@ -134,7 +151,7 @@ impl Syncer {
     /// for its change comparison anyway, and hands the empty case to the
     /// file's removal instead.
     pub(super) fn write_ports(&self, dev: &str, lines: &[String]) -> bool {
-        let text = lines.join("\n") + "\n";
+        let text = format!("{PORTS_FORMAT}\n{}\n", lines.join("\n"));
         if let Err(e) = self.put_file(&self.ports_path(dev), &text) {
             if self.ports_warned.borrow_mut().insert(dev.to_string()) {
                 eprintln!(

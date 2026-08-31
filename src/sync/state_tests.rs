@@ -2871,10 +2871,12 @@ fn a_damaged_memory_file_is_stepped_over() {
         .filter(|l| l.starts_with(&format_mac(&BEHIND_GUEST)))
         .collect();
     assert_eq!(keep.len(), 1, "the fixture wrote something unexpected");
+    let head = good.lines().next().unwrap().to_string();
     fs::write(
         &path,
         format!(
-            "not-an-address veth0 13 0\n{}\n\n02:00:00:00:00:99 veth0 notanumber 0\n\
+            "{head}\nnot-an-address veth0 13 0\n{}\n\n\
+             02:00:00:00:00:99 veth0 notanumber 0\n\
              {} nic2 3 notaclock\n02:00:00:00:00:98\n",
             keep[0],
             format_mac(&BEHIND_NIC)
@@ -4523,6 +4525,49 @@ fn the_over_capacity_warning_counts_the_card_and_says_it_once() {
     assert!(
         !s.warned_over.contains("nic1"),
         "back under the limit has to re-arm the warning"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A memory file from a build whose numbers meant something else is no
+/// memory at all. Without the format line this silently read the old
+/// missing-since milliseconds as last-seen nanoseconds, and every
+/// carried-over entry looked silent since boot.
+#[test]
+fn a_memory_file_from_another_format_is_ignored() {
+    let dir = scratch("ports-format");
+    let topo = host(mac(1));
+    let (_, mut s, _) = registered(&dir);
+    age_out(&mut s, &topo, BEHIND_GUEST);
+    let path = dir.join(".nic1.owned.ports");
+    let good = fs::read_to_string(&path).unwrap();
+    drop(s);
+
+    // The same lines under a header this build does not know.
+    let body: Vec<&str> = good.lines().skip(1).collect();
+    fs::write(
+        &path,
+        format!("sriov-mac-sync ports 1\n{}\n", body.join("\n")),
+    )
+    .unwrap();
+
+    let mut restarted = ready_syncer(&dir);
+    let mut aged = fdb_without(BEHIND_GUEST);
+    aged.push(card_holds(2, BEHIND_GUEST));
+    let mut sock = kernel(aged);
+    let reports = restarted
+        .reconcile(&mut sock, true, &topo, Dur::ZERO)
+        .unwrap();
+    assert!(
+        sock.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
+        "a file in an unknown format was believed anyway"
+    );
+    assert_eq!(reports[0].quiet, 0);
+    // And the next write leaves it in the format this build does read.
+    assert_eq!(
+        fs::read_to_string(&path).unwrap().lines().next(),
+        good.lines().next(),
+        "the file was not rewritten in this build's own format"
     );
     let _ = fs::remove_dir_all(&dir);
 }

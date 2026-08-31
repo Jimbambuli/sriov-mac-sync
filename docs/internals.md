@@ -43,8 +43,11 @@ counting drift, not the blind tenth it once was. The entry also goes when
 its port goes or the address moves out to the wire.
 
 That memory outlives the process. It is written to `.<dev>.owned.ports`
-beside the note, under the same lock and through the same temp-and-rename,
-one line per address: the port by name *and* index, and the boot-clock
+beside the note, under the same lock and through the same temp-and-rename.
+Its first line names the format, so a file whose numbers meant something
+else is ignored rather than misread - that mistake was made once, when the
+stamps changed from missing-since-milliseconds to last-seen-nanoseconds.
+Then one line per address: the port by name *and* index, and the boot-clock
 reading at which the bridge was last seen holding it. Every pass refreshes
 that stamp for everything it finds learnt, and so does every learn on the
 event path - which is what makes "quiet" a fact rather than a guess: an
