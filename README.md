@@ -55,10 +55,12 @@ curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/s
 dpkg -i sriov-mac-sync_amd64.deb
 
 # OpenWrt 24.10+ (apk) — the flags are the price of a package outside a repository
+# (the stock image has uclient-fetch, not curl: uclient-fetch -O <file> <url>)
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.apk
 apk add --allow-untrusted --force-non-repository ./sriov-mac-sync_x86_64.apk
 
 # OpenWrt 23.05 and older (opkg)
+curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.ipk
 opkg install ./sriov-mac-sync_x86_64.ipk
 
 # anywhere else — x86_64 or aarch64
@@ -156,7 +158,7 @@ hardware are welcome; those four steps are the whole test.
   still hangs in the bridge - ageing is the bridge managing its table, not
   news about the device. The entry goes when its port goes, when the
   address moves out to the wire, or under filter pressure: as the list
-  nears its capacity the longest-missing entries are released first, and
+  nears its capacity the entries silent longest are released first, and
   every fresh learn makes an entry young again. Pressure is measured, not
   assumed - the card's own list is read back each pass, so foreign entries
   count, and a burst on the event path surrenders a keep synchronously

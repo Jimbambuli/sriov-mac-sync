@@ -1,6 +1,6 @@
 use super::tests::*;
 use super::*;
-use crate::sysfs::fixture::mac;
+use crate::topology::fixture::mac;
 
 #[test]
 fn pinned_addresses_are_registered_without_being_learnt() {

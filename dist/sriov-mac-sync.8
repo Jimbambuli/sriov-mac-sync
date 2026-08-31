@@ -26,7 +26,7 @@ bridge has learnt into the uplink's unicast filter, adding addresses as they
 appear and removing them as the bridge ages them out \(em unless the port an
 address was learnt behind still exists in the bridge: such a device is merely
 quiet and stays registered while its port lives, and when the filter nears
-its capacity the longest\-missing entries are released first.
+its capacity the entries silent longest are released first.
 That memory is written down beside the notes, so an update or a restart
 hands the keeps on rather than unregistering every quiet guest; a reboot
 empties
@@ -80,7 +80,7 @@ the mechanism: addresses are registered the moment the kernel reports them.
 .TP
 .BI \-\-max " NUM"
 The filter capacity to respect (default 128): warn above it, and surrender
-kept quiet addresses, longest\-missing first, as the measured list \(em
+kept quiet addresses, longest silent first, as the measured list \(em
 foreign entries included, read back from the card each pass \(em comes
 within a few slots of it. Lowering this releases keeps. The vport list on a ConnectX\-4 Lx
 holds 128; other hardware differs. Where the card reports its capacity
@@ -99,7 +99,7 @@ wire\-side and own\-address rules still override this.
 Explain what is skipped and why. With
 .B \-\-status
 it also lists every wanted address, marking the ones held through a silence
-with how long they have been missing.
+with how long each has been silent.
 .TP
 .BR \-h ", " \-\-help
 Print the usage text.

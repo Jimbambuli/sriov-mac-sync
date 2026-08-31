@@ -1464,6 +1464,13 @@ fn attach_noise_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// One datagram off a raw fd - the FFI call four of these tests make,
+    /// spelled once. What each does with a short or absent answer differs,
+    /// so the count comes back raw and the guard stays at the call site.
+    fn recv_raw(fd: i32, buf: &mut [u8]) -> isize {
+        unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) }
+    }
     use super::*;
 
     /// A netlink socket whose kernel is a thread in this test.
@@ -1929,14 +1936,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             let mut seen = Vec::new();
             for reply in [0i32, -libc::EEXIST] {
-                let n = unsafe {
-                    libc::recv(
-                        kernel.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
                 if n <= 0 {
                     break;
                 }
@@ -2062,14 +2062,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             let mut answered = 0;
             loop {
-                let n = unsafe {
-                    libc::recv(
-                        kernel.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
                 if n < NLMSG_HDR as isize {
                     return answered;
                 }
@@ -2128,14 +2121,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             let mut answered = 0;
             loop {
-                let n = unsafe {
-                    libc::recv(
-                        kernel.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
                 if n < NLMSG_HDR as isize {
                     return answered;
                 }
@@ -2211,14 +2197,7 @@ mod tests {
         let listener = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let n = unsafe {
-                    libc::recv(
-                        kernel.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
                 if n < NLMSG_HDR as isize {
                     return;
                 }

@@ -362,7 +362,7 @@ fn a_pass_without_trouble_reports_no_failures() {
         "an untroubled pass claimed a failure:\n{r}"
     );
 }
-use crate::sysfs::fixture::{mac, Builder};
+use crate::topology::fixture::{mac, Builder};
 
 fn ready_syncer(dir: &std::path::Path) -> Syncer {
     let mut s = Syncer::new(vec![pair()], dir.to_path_buf());
@@ -376,11 +376,7 @@ use std::time::Duration as Dur;
 fn a_full_pass_registers_exactly_what_is_wanted_and_notes_it() {
     let dir = scratch("pass");
     let topo = host(mac(1));
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(fdb());
     let mut s = ready_syncer(&dir);
     let reports = s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
@@ -910,11 +906,7 @@ fn a_renamed_uplink_keeps_its_note() {
     let dir = scratch("rename");
     let topo = host(mac(1));
     let mut s = ready_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(3, 10, BEHIND_NIC)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(3, 10, BEHIND_NIC)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
     assert_eq!(
@@ -1346,11 +1338,7 @@ fn a_detached_device_is_left_alone_rather_than_mistaken_for_the_port() {
         .bridge()
         .lower("bond0")
         .build();
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, WIRE)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, WIRE)]);
     let mut s = ready_syncer(&dir);
     let reports = s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     assert!(
@@ -1496,11 +1484,7 @@ fn a_non_applying_pass_leaves_the_state_directory_untouched() {
         v
     };
     let before = snapshot(&dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(fdb());
     for _ in 0..3 {
         s.reconcile(&mut sock, false, &topo, Dur::ZERO).unwrap();
     }
@@ -1521,12 +1505,12 @@ fn a_non_applying_pass_leaves_the_state_directory_untouched() {
 #[test]
 #[ignore]
 fn scaling_stays_roughly_linear_in_the_forwarding_table() {
-    use crate::sysfs::fixture::Builder;
+    use crate::topology::fixture::Builder;
     use std::time::Instant;
 
     // An SDN-shaped host: uplink + second NIC under the bridge, VLAN
     // interfaces stacked on it, each carrying a vnet bridge with ports.
-    fn build(vnets: u32) -> crate::sysfs::Topology {
+    fn build(vnets: u32) -> crate::topology::Topology {
         let mut b = Builder::new()
             .add("nic1", 2, Some(mac(1)))
             .master("vmbr1")
@@ -1587,11 +1571,7 @@ fn scaling_stays_roughly_linear_in_the_forwarding_table() {
             dir.clone(),
         );
         s.authoritative = true;
-        let mut sock = FakeSock {
-            fdb: entries(n, 8),
-            vf: vec![(2, VF_ADMIN)],
-            ..Default::default()
-        };
+        let mut sock = kernel(entries(n, 8));
         // warm once, then measure the median of five
         let _ = s.reconcile(&mut sock, false, &topo, Dur::ZERO);
         let mut runs: Vec<u128> = (0..5)
@@ -2132,7 +2112,7 @@ fn only_an_interface_with_virtual_functions_makes_their_addresses_stale() {
     // still in the old one, and never a reason to ask. Judging by the new
     // picture alone made every deletion a reason - which on a host with
     // containers is every second link message.
-    let gone = crate::sysfs::Topology::assemble(Vec::new(), crate::hash::map());
+    let gone = crate::topology::Topology::assemble(Vec::new(), crate::hash::map());
     assert!(
         !vf_may_have_changed(now, Some(&gone), &[veth]),
         "what it was is in the picture from before it went"
@@ -2461,7 +2441,7 @@ fn an_unknowable_virtual_function_is_reported_once() {
 /// nic1 (one VF) and a veth guest port side by side in br0 - the small
 /// stage most valve and clock tests play on. Indices: nic1=2, vetha=4,
 /// br0=10.
-fn small_host() -> crate::sysfs::Topology {
+fn small_host() -> crate::topology::Topology {
     Builder::new()
         .add("nic1", 2, Some(mac(1)))
         .master("br0")
@@ -2488,17 +2468,23 @@ fn br0_syncer(dir: &std::path::Path) -> Syncer {
     s
 }
 
+/// A socket answering with this forwarding table and one admin-set VF -
+/// the shape 60-odd tests want and nothing else varies.
+fn kernel(fdb: Vec<crate::netlink::FdbEntry>) -> FakeSock {
+    FakeSock {
+        fdb,
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    }
+}
+
 /// The ritual most quiet tests open with: the host fixture, a ready
 /// syncer over `dir`, and a first pass that registered everything. The
 /// returned sock holds what that pass added.
-fn registered(dir: &std::path::Path) -> (crate::sysfs::Topology, Syncer, FakeSock) {
+fn registered(dir: &std::path::Path) -> (crate::topology::Topology, Syncer, FakeSock) {
     let topo = host(mac(1));
     let mut s = ready_syncer(dir);
-    let mut sock = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(fdb());
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     (topo, s, sock)
 }
@@ -2534,11 +2520,7 @@ fn an_aged_guest_behind_a_living_port_stays_registered() {
 
     let mut aged = fdb_without(BEHIND_GUEST);
     aged.push(card_holds(2, BEHIND_GUEST));
-    let mut sock2 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(aged);
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -2555,14 +2537,10 @@ fn an_aged_guest_behind_a_living_port_stays_registered() {
 
 /// A pass against the aged forwarding table, after the first pass of
 /// `syncer` registered everything - the shape the quiet tests share.
-fn age_out(s: &mut Syncer, topo: &crate::sysfs::Topology, m: Mac) -> Vec<Report> {
+fn age_out(s: &mut Syncer, topo: &crate::topology::Topology, m: Mac) -> Vec<Report> {
     let mut aged = fdb_without(m);
     aged.push(card_holds(2, m));
-    let mut sock = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(aged);
     let reports = s.reconcile(&mut sock, true, topo, Dur::ZERO).unwrap();
     for (_, gone) in sock.removed {
         assert_ne!(gone, m, "removed although its port still lives");
@@ -2609,11 +2587,7 @@ fn a_kept_lan_address_leaves_when_its_nic_does() {
         .bridge()
         .lower("nic1")
         .build();
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, BEHIND_NIC)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, BEHIND_NIC)]);
     s.reconcile(&mut sock2, true, &smaller, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, m)| *m == BEHIND_NIC),
@@ -2646,11 +2620,7 @@ fn a_kept_address_leaves_when_its_port_does() {
         .bridge()
         .lower("vmbr1.44")
         .build();
-    let mut sock2 = FakeSock {
-        fdb: fdb_without(BEHIND_GUEST),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb_without(BEHIND_GUEST));
     let reports = s.reconcile(&mut sock2, true, &vethless, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -2671,11 +2641,7 @@ fn the_wire_wins_over_a_quiet_keep() {
     // the uplink port instead.
     let mut moved = fdb_without(BEHIND_GUEST);
     moved.push(learned(2, 10, BEHIND_GUEST));
-    let mut sock2 = FakeSock {
-        fdb: moved,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(moved);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -2705,11 +2671,7 @@ fn a_reflection_evicts_the_port_memory() {
 
     // A pass whose dump shows neither the wire entry nor the guest, with
     // the old veth still alive: nothing may come back.
-    let mut sock2 = FakeSock {
-        fdb: fdb_without(BEHIND_GUEST),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb_without(BEHIND_GUEST));
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock2.added.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -2735,11 +2697,7 @@ fn a_restart_takes_over_the_quiet_memory() {
     let mut restarted = ready_syncer(&dir);
     let mut aged = fdb_without(BEHIND_GUEST);
     aged.push(card_holds(2, BEHIND_GUEST));
-    let mut sock2 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(aged);
     let reports = restarted
         .reconcile(&mut sock2, true, &topo, Dur::ZERO)
         .unwrap();
@@ -2771,11 +2729,7 @@ fn a_reboot_starts_from_nothing() {
     // behave like every build before it did.
     let _ = fs::remove_file(dir.join(".nic1.owned.ports"));
     let mut restarted = ready_syncer(&dir);
-    let mut sock2 = FakeSock {
-        fdb: fdb_without(BEHIND_GUEST),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb_without(BEHIND_GUEST));
     let reports = restarted
         .reconcile(&mut sock2, true, &topo, Dur::ZERO)
         .unwrap();
@@ -2825,11 +2779,7 @@ fn a_replaced_port_does_not_inherit_the_memory() {
         .master("IOT")
         .build();
     let mut restarted = ready_syncer(&dir);
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, BEHIND_GUEST)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, BEHIND_GUEST)]);
     let reports = restarted
         .reconcile(&mut sock2, true, &replaced, Dur::ZERO)
         .unwrap();
@@ -2859,28 +2809,16 @@ fn the_missing_clock_survives_a_restart() {
     let young: Mac = [0x02, 0xe6, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, old), learned(4, 10, young)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // Both go quiet before the restart, thirty milliseconds apart: after
     // this the only thing that tells them apart is the gap between their
     // clocks, which is exactly what has to survive.
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     std::thread::sleep(Dur::from_millis(30));
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, old), card_holds(2, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, old), card_holds(2, young)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     drop(s);
 
@@ -2889,11 +2827,7 @@ fn the_missing_clock_survives_a_restart() {
     // and fall back to the addresses themselves, which names `young`.
     let mut restarted = br0_syncer(&dir);
     restarted.max_macs = 6;
-    let mut sock4 = FakeSock {
-        fdb: vec![card_holds(2, old), card_holds(2, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock4 = kernel(vec![card_holds(2, old), card_holds(2, young)]);
     restarted
         .reconcile(&mut sock4, true, &topo, Dur::ZERO)
         .unwrap();
@@ -2922,11 +2856,7 @@ fn a_damaged_memory_file_is_stepped_over() {
         .collect();
     aged.push(card_holds(2, BEHIND_GUEST));
     aged.push(card_holds(2, BEHIND_NIC));
-    let mut quiet = FakeSock {
-        fdb: aged.clone(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut quiet = kernel(aged.clone());
     s.reconcile(&mut quiet, true, &topo, Dur::ZERO).unwrap();
     assert!(quiet.removed.is_empty(), "both should be kept, not removed");
     drop(s);
@@ -2953,11 +2883,7 @@ fn a_damaged_memory_file_is_stepped_over() {
     .unwrap();
 
     let mut restarted = ready_syncer(&dir);
-    let mut sock2 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(aged);
     let reports = restarted
         .reconcile(&mut sock2, true, &topo, Dur::ZERO)
         .unwrap();
@@ -2993,11 +2919,7 @@ fn a_kept_absent_address_triggers_the_grow_refresh() {
     // kept state buys its own fresh question, and the answer is clean.
     let mut aged: Vec<crate::netlink::FdbEntry> = fdb_without(BEHIND_GUEST);
     aged.extend(holds.iter().cloned());
-    let mut sock2 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(aged);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock2.vf_asked >= 1,
@@ -3092,11 +3014,7 @@ fn exclusions_and_extras_outrank_the_keep() {
 
     // Excluded after the fact: the keep must not override the operator.
     s.exclude.insert(BEHIND_GUEST);
-    let mut sock2 = FakeSock {
-        fdb: fdb_without(BEHIND_GUEST),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb_without(BEHIND_GUEST));
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST));
     assert_eq!(reports[0].quiet, 0);
@@ -3104,11 +3022,7 @@ fn exclusions_and_extras_outrank_the_keep() {
     // Pinned instead: wanted through EXTRA, not counted as quiet.
     s.exclude.remove(&BEHIND_GUEST);
     s.extra.insert(BEHIND_NIC);
-    let mut sock3 = FakeSock {
-        fdb: fdb_without(BEHIND_NIC),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(fdb_without(BEHIND_NIC));
     let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock3.removed.iter().any(|(_, m)| *m == BEHIND_NIC),
@@ -3131,11 +3045,7 @@ fn an_unreadable_note_does_not_erase_the_port_memory() {
 
     let note = dir.join("nic1.owned");
     fs::set_permissions(&note, fs::Permissions::from_mode(0o000)).unwrap();
-    let mut sock2 = FakeSock {
-        fdb: fdb_without(BEHIND_GUEST),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb_without(BEHIND_GUEST));
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.is_empty(),
@@ -3145,11 +3055,7 @@ fn an_unreadable_note_does_not_erase_the_port_memory() {
     fs::set_permissions(&note, fs::Permissions::from_mode(0o600)).unwrap();
     let mut aged = fdb_without(BEHIND_GUEST);
     aged.push(card_holds(2, BEHIND_GUEST));
-    let mut sock3 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(aged);
     let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -3170,21 +3076,21 @@ fn the_pressure_valve_sheds_keeps_first() {
     let m3: Mac = [0x02, 0xdd, 0, 0, 0, 3];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, m1), learned(4, 10, m2), learned(4, 10, m3)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![
+        learned(4, 10, m1),
+        learned(4, 10, m2),
+        learned(4, 10, m3),
+    ]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // All three age out; with the bridge's own address that is four
     // occupied slots against allowed = max - headroom = 3: one must yield.
     s.max_macs = 7;
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, m1), card_holds(2, m2), card_holds(2, m3)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![
+        card_holds(2, m1),
+        card_holds(2, m2),
+        card_holds(2, m3),
+    ]);
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert_eq!(
         reports[0].quiet, 2,
@@ -3207,32 +3113,20 @@ fn the_pressure_valve_sheds_the_longest_missing_first() {
     let young: Mac = [0x02, 0xde, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, old), learned(4, 10, young)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // `old` ages out first and its clock starts; `young` is still learnt.
     // `young` sorts before `old` by address, so a valve that ignored the
     // clock would shed `young` - only the clock names `old`.
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     std::thread::sleep(Dur::from_millis(30));
 
     // Now both are quiet, and the limit leaves room for only some of the
     // list: the longest-missing - `old` - is the one surrendered.
     s.max_macs = 6;
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, old), card_holds(2, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, old), card_holds(2, young)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock3.removed.iter().any(|(_, m)| *m == old),
@@ -3297,26 +3191,14 @@ fn the_memory_follows_the_latest_learn() {
     let mut s = br0_syncer(&dir);
 
     // Learnt behind vetha first, then behind vethb.
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let mut sock2 = FakeSock {
-        fdb: vec![learned(5, 10, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![learned(5, 10, m)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // vetha dies, the address ages - vethb is what keeps it.
     let gone_a = build(false);
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, m)]);
     let reports = s.reconcile(&mut sock3, true, &gone_a, Dur::ZERO).unwrap();
     assert!(
         !sock3.removed.iter().any(|(_, mm)| *mm == m),
@@ -3381,11 +3263,7 @@ fn a_note_turning_readable_mid_pass_keeps_the_memory() {
     aged.push(card_holds(2, BEHIND_GUEST));
     aged.push(learned(3, 10, newmac));
     let mut sock2 = FlipSock {
-        inner: FakeSock {
-            fdb: aged.clone(),
-            vf: vec![(2, VF_ADMIN)],
-            ..Default::default()
-        },
+        inner: kernel(aged.clone()),
         heal: Some(note.clone()),
     };
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
@@ -3400,11 +3278,7 @@ fn a_note_turning_readable_mid_pass_keeps_the_memory() {
     aged3.push(card_holds(2, BEHIND_GUEST));
     aged3.push(learned(3, 10, newmac));
     aged3.push(card_holds(2, newmac));
-    let mut sock3 = FakeSock {
-        fdb: aged3,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(aged3);
     let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -3447,11 +3321,7 @@ fn a_failed_reflection_removal_does_not_become_a_keep() {
     // the address. The removal must now happen, not a keep.
     let mut flushed = fdb_without(BEHIND_GUEST);
     flushed.push(card_holds(2, BEHIND_GUEST));
-    let mut sock3 = FakeSock {
-        fdb: flushed,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(flushed);
     let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock3.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -3481,11 +3351,7 @@ fn a_port_moved_to_another_bridge_ends_the_keep() {
         .lower("vetha")
         .build();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &before, Dur::ZERO).unwrap();
     assert!(s.load_owned("nic1").contains(&m));
 
@@ -3503,11 +3369,7 @@ fn a_port_moved_to_another_bridge_ends_the_keep() {
         .bridge()
         .lower("vetha")
         .build();
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, m)]);
     let reports = s.reconcile(&mut sock2, true, &after, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, r)| *r == m),
@@ -3537,11 +3399,7 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
         .lower("nic2")
         .build();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(5, 10, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(5, 10, m)]);
     s.reconcile(&mut sock, true, &before, Dur::ZERO).unwrap();
     assert!(s.load_owned("nic1").contains(&m));
 
@@ -3561,11 +3419,7 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
         .bridge()
         .lower("bond0")
         .build();
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, m)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, m)]);
     let reports = s.reconcile(&mut sock2, true, &after, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, r)| *r == m),
@@ -3585,21 +3439,13 @@ fn the_pressure_valve_opens_exactly_at_its_margin() {
     let mut s = br0_syncer(&dir);
     // Eight learns plus the bridge's own address: want is exactly 9.
     let learns: Vec<Mac> = (1..=8u8).map(|i| [0x02, 0xe0, 0, 0, 0, i]).collect();
-    let mut sock = FakeSock {
-        fdb: learns.iter().map(|m| learned(4, 10, *m)).collect(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(learns.iter().map(|m| learned(4, 10, *m)).collect());
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // All eight age: nine occupied slots. At max 13 they sit exactly on
     // the margin (9 + 4 == 13) and nothing may yield yet.
     s.max_macs = 13;
-    let mut sock2 = FakeSock {
-        fdb: learns.iter().map(|m| card_holds(2, *m)).collect(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(learns.iter().map(|m| card_holds(2, *m)).collect());
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.is_empty(),
@@ -3610,11 +3456,7 @@ fn the_pressure_valve_opens_exactly_at_its_margin() {
 
     // One slot tighter, and exactly one keep has to go.
     s.max_macs = 12;
-    let mut sock3 = FakeSock {
-        fdb: learns.iter().map(|m| card_holds(2, *m)).collect(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(learns.iter().map(|m| card_holds(2, *m)).collect());
     let reports = s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert_eq!(
         sock3.removed.len(),
@@ -3638,39 +3480,23 @@ fn the_missing_clock_is_not_wound_up_by_later_passes() {
     let young: Mac = [0x02, 0xe1, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, old), learned(4, 10, young)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // Pass 2: `old` ages, `young` still speaks.
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, old), learned(4, 10, young)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, old), learned(4, 10, young)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     std::thread::sleep(Dur::from_millis(20));
 
     // Pass 3: both quiet now - `old`'s clock must keep its earlier start.
     let both = vec![card_holds(2, old), card_holds(2, young)];
-    let mut sock3 = FakeSock {
-        fdb: both.clone(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(both.clone());
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     std::thread::sleep(Dur::from_millis(20));
 
     // Pass 4, under pressure: the one shed has to be `old`.
     s.max_macs = 6;
-    let mut sock4 = FakeSock {
-        fdb: both,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock4 = kernel(both);
     s.reconcile(&mut sock4, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock4.removed.iter().any(|(_, m)| *m == old),
@@ -3722,11 +3548,7 @@ fn a_rename_carries_the_quiet_memory_along() {
     let mut aged = fdb_without(BEHIND_GUEST);
     aged.retain(|e| !e.is_self());
     aged.push(card_holds(2, BEHIND_GUEST));
-    let mut sock2 = FakeSock {
-        fdb: aged,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(aged);
     let reports = s.reconcile(&mut sock2, true, &renamed, Dur::ZERO).unwrap();
     assert!(
         !sock2.removed.iter().any(|(_, m)| *m == BEHIND_GUEST),
@@ -3853,11 +3675,7 @@ fn a_bound_sister_vf_is_excluded_by_its_netdev() {
     // The bridge learns the VF's own address behind a guest port - the
     // reflection case the exclusion set exists to refuse. The driver's
     // answer does NOT name it: no admin MAC was ever set.
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, vf_mac)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, vf_mac)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     assert!(
         !sock.added.iter().any(|(_, m)| *m == vf_mac),
@@ -3913,11 +3731,7 @@ fn an_empty_memory_leaves_no_file() {
         .filter(|e| !e.is_self())
         .map(|e| learned(2, 10, e.mac))
         .collect();
-    let mut sock2 = FakeSock {
-        fdb: wire,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(wire);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         s.load_owned("nic1").is_empty(),
@@ -3938,19 +3752,11 @@ fn a_future_stamp_is_clamped_not_believed() {
     let bogus: Mac = [0x02, 0xe7, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, honest), learned(4, 10, bogus)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, honest), learned(4, 10, bogus)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     // `honest` goes quiet and earns a real clock; then the file is doctored
     // so `bogus` carries a stamp from the far future.
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, honest), learned(4, 10, bogus)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, honest), learned(4, 10, bogus)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     drop(s);
     std::thread::sleep(Dur::from_millis(20));
@@ -3968,11 +3774,7 @@ fn a_future_stamp_is_clamped_not_believed() {
     // stamp that, taken at face value, dwarfs every honest one.
     let mut restarted = br0_syncer(&dir);
     restarted.max_macs = 6;
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, honest), card_holds(2, bogus)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, honest), card_holds(2, bogus)]);
     restarted
         .reconcile(&mut sock3, true, &topo, Dur::ZERO)
         .unwrap();
@@ -3998,11 +3800,7 @@ fn an_idle_pass_leaves_the_memory_file_untouched() {
     // Backdate, then run an unchanged pass: an untouched file keeps the
     // old timestamp, a rewritten one comes back young.
     let old = filetime_backdate(&path);
-    let mut sock2 = FakeSock {
-        fdb: fdb(),
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb());
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     let meta = fs::metadata(&path).unwrap();
     use std::os::unix::fs::MetadataExt;
@@ -4044,11 +3842,7 @@ fn the_pressure_valve_counts_foreign_entries() {
     let m1: Mac = [0x02, 0xe8, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, m1)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, m1)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // m1 ages; two slots are wanted (bridge + keep). Alone that fits a
@@ -4060,11 +3854,7 @@ fn the_pressure_valve_counts_foreign_entries() {
         .collect();
     let mut fdb2 = vec![card_holds(2, m1)];
     fdb2.extend(foreign.clone());
-    let mut sock2 = FakeSock {
-        fdb: fdb2,
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(fdb2);
     let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
         sock2.removed.iter().any(|(_, m)| *m == m1),
@@ -4092,21 +3882,13 @@ fn a_burst_over_capacity_sheds_a_keep_on_the_fast_path() {
     let newcomer: Mac = [0x02, 0xe9, 0, 0, 0, 2];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, old)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, old)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
 
     // `old` goes quiet; occupancy is 2 (bridge + keep) with max 6, i.e.
     // exactly at allowed = max - headroom.
     s.max_macs = 6;
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, old)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, old)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(s.load_owned("nic1").contains(&old));
 
@@ -4149,18 +3931,10 @@ fn successive_batches_count_against_each_other() {
     let quiet: Mac = [0x02, 0xea, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     // The guest goes quiet: two slots held (bridge + keep).
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, quiet)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // allowed = 8 - 4 = 4, occupancy 2. Two newcomers fit; the third must
@@ -4195,18 +3969,10 @@ fn a_relearn_buys_no_slot_and_sheds_nothing() {
     let live: Mac = [0x02, 0xec, 0, 0, 0, 2];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, quiet), learned(4, 10, live)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, quiet), learned(4, 10, live)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     // `quiet` ages; three slots held (bridge, keep, live).
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, quiet), learned(4, 10, live)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, quiet), learned(4, 10, live)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // Sitting exactly on the margin: allowed = 7 - 4 = 3, occupancy 3.
@@ -4311,25 +4077,13 @@ fn a_fast_path_learn_makes_an_entry_young_again() {
     let b: Mac = [0x02, 0xee, 0, 0, 0, 2];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, a), learned(4, 10, b)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, a), learned(4, 10, b)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     // `a` goes quiet first, then `b`: a is the older keep.
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, a), learned(4, 10, b)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, a), learned(4, 10, b)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     std::thread::sleep(Dur::from_millis(20));
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, a), card_holds(2, b)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, a), card_holds(2, b)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
 
     // `a` speaks again - a re-learn, no new slot - and must now be the
@@ -4378,17 +4132,9 @@ fn a_refused_shed_keeps_its_note_line() {
     for (errno, still_noted) in [(libc::EBUSY, true), (libc::ENOENT, false)] {
         let dir = dir.join(format!("e{errno}"));
         let mut s = br0_syncer(&dir);
-        let mut sock = FakeSock {
-            fdb: vec![learned(4, 10, quiet)],
-            vf: vec![(2, VF_ADMIN)],
-            ..Default::default()
-        };
+        let mut sock = kernel(vec![learned(4, 10, quiet)]);
         s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-        let mut sock2 = FakeSock {
-            fdb: vec![card_holds(2, quiet)],
-            vf: vec![(2, VF_ADMIN)],
-            ..Default::default()
-        };
+        let mut sock2 = kernel(vec![card_holds(2, quiet)]);
         s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
         s.max_macs = 6;
@@ -4429,17 +4175,9 @@ fn an_unreadable_note_stops_the_shedder() {
     let quiet: Mac = [0x02, 0xf0, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, quiet)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // Somebody replaced the note with one this daemon cannot read - a new
@@ -4570,17 +4308,9 @@ fn the_capacity_arithmetic_survives_a_rename() {
     let quiet: Mac = [0x02, 0xf1, 0, 0, 0, 1];
     let topo = small_host();
     let mut s = br0_syncer(&dir);
-    let mut sock = FakeSock {
-        fdb: vec![learned(4, 10, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock = kernel(vec![learned(4, 10, quiet)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let mut sock2 = FakeSock {
-        fdb: vec![card_holds(2, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock2 = kernel(vec![card_holds(2, quiet)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
     // Same interface, same index, new name.
@@ -4599,11 +4329,7 @@ fn the_capacity_arithmetic_survives_a_rename() {
         dev: "nicX".into(),
         bridge: "br0".into(),
     }];
-    let mut sock3 = FakeSock {
-        fdb: vec![card_holds(2, quiet)],
-        vf: vec![(2, VF_ADMIN)],
-        ..Default::default()
-    };
+    let mut sock3 = kernel(vec![card_holds(2, quiet)]);
     s.reconcile(&mut sock3, true, &renamed, Dur::ZERO).unwrap();
 
     // Under the new name, one newcomer past the margin: the keep pays.
@@ -4703,6 +4429,100 @@ fn a_refused_stale_removal_does_not_return_through_the_merge() {
     assert!(
         !s.load_owned("nic1").contains(&BEHIND_GUEST),
         "and the note lets go once the card did"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// When the room needed is more than the quiet can give, the shedder
+/// stops rather than reaching into the living: a guest the bridge still
+/// knows is one somebody is talking to right now, and taking its entry
+/// out to make room for another is the outage this daemon exists to
+/// prevent. The ordering alone would not stop it - it would simply carry
+/// on into the next-oldest, which is a speaking guest.
+#[test]
+fn the_shedder_stops_rather_than_take_a_living_guest() {
+    let dir = scratch("shed-stops");
+    let quiet: Mac = [0x02, 0xf2, 0, 0, 0, 1];
+    let live: Mac = [0x02, 0xf2, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, quiet), learned(4, 10, live)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    // `quiet` falls silent; `live` keeps talking. Three slots held.
+    let mut sock2 = kernel(vec![card_holds(2, quiet), learned(4, 10, live)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+
+    // Three slots held, allowed = 7 - 4 = 3, two newcomers: two slots are
+    // needed and only one quiet entry can pay. The shedder must stop
+    // there rather than carry on into `live`, which the ordering alone
+    // would happily do.
+    s.max_macs = 7;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let a: Mac = [0x02, 0xf2, 0, 0, 0, 8];
+    let b: Mac = [0x02, 0xf2, 0, 0, 0, 9];
+    let mut sock3 = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut sock3,
+        &topo,
+        &[
+            (RTM_NEWNEIGH, learned(4, 10, a)),
+            (RTM_NEWNEIGH, learned(4, 10, b)),
+        ],
+    )
+    .unwrap();
+    assert!(
+        sock3.removed.iter().any(|(_, m)| *m == quiet),
+        "the one quiet entry should have been surrendered"
+    );
+    assert!(
+        !sock3.removed.iter().any(|(_, m)| *m == live),
+        "a guest the bridge still knows was surrendered for room"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The over-capacity warning is said once per stay above the limit and
+/// re-armed when it clears - and it counts what the CARD holds, foreign
+/// entries included, not merely what the daemon wants. Every part of that
+/// could be deleted without a test noticing.
+#[test]
+fn the_over_capacity_warning_counts_the_card_and_says_it_once() {
+    let dir = scratch("over-capacity-warning");
+    let mine: Mac = [0x02, 0xf3, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    // Four foreign entries in the card plus our two: six against a limit
+    // of five. Wanting two alone would stay under it.
+    s.max_macs = 5;
+    let foreign: Vec<crate::netlink::FdbEntry> = (1..=4u8)
+        .map(|i| card_holds(2, [0xaa, 0xf3, 0, 0, 0, i]))
+        .collect();
+    let mut fdb1 = vec![learned(4, 10, mine)];
+    fdb1.extend(foreign.clone());
+    let mut sock = kernel(fdb1);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        s.warned_over.contains("nic1"),
+        "the card is over its limit and nothing said so"
+    );
+
+    // Said once: a second identical pass must not re-arm it.
+    let mut fdb2 = vec![learned(4, 10, mine)];
+    fdb2.extend(foreign);
+    let mut sock2 = kernel(fdb2);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(s.warned_over.contains("nic1"), "the mark must stand");
+
+    // The foreign entries go: back under the limit, and the warning is
+    // armed again for the next time.
+    let mut sock3 = kernel(vec![learned(4, 10, mine)]);
+    s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !s.warned_over.contains("nic1"),
+        "back under the limit has to re-arm the warning"
     );
     let _ = fs::remove_dir_all(&dir);
 }

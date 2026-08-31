@@ -1,4 +1,10 @@
-//! The interface topology, read out of `/sys/class/net`.
+//! The interface topology: which interface leads where.
+//!
+//! Built from one rtnetlink link dump plus a few `/sys` reads for what the
+//! dump deliberately leaves out. The `/sys`-only reader further down is
+//! test scaffolding - an independent second opinion the suite holds this
+//! against - not the production path, which is why the file is named for
+//! what it produces rather than where it once read it.
 //!
 //! Everything here is about answering two structural questions without ever
 //! looking at an interface's name: which way is the wire, and which way is the

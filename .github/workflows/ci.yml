@@ -161,6 +161,15 @@ jobs:
             test "$(ar p "$f" debian-binary)" = "2.0"
             ar p "$f" data.tar.gz | tar tzf - | grep -q "./etc/init.d/sriov-mac-sync"
             ar p "$f" control.tar.gz | tar xzOf - ./control | grep -q "^Package: sriov-mac-sync$"
+            # procd's `start` compares the instance definition, not the
+            # binary, so without this restart an upgrade leaves the OLD
+            # daemon running until reboot. Nothing but this asserts it.
+            ar p "$f" control.tar.gz | tar xzOf - ./postinst | grep -q PKG_UPGRADE \
+              || (echo "$f: postinst does not restart on upgrade" && exit 1)
+            # And the removal path must refuse to flush past a daemon that
+            # did not stop - a live one puts the entries straight back.
+            ar p "$f" control.tar.gz | tar xzOf - ./prerm | grep -q "not flushing" \
+              || (echo "$f: prerm flushes without checking the daemon is down" && exit 1)
           done
       - name: The .apk is one OpenWrt would take
         run: |
@@ -175,13 +184,31 @@ jobs:
           # to be read from the metadata - extracting as a normal user cannot
           # preserve it, which is why checking the extracted tree proves
           # nothing.
+          # Captured, not piped: a pipeline whose first grep matches nothing
+          # returns 1 and the loop happily calls that "all root" - a dump
+          # that failed outright then reads as a pass. The assignment lets
+          # errexit kill the step instead, and the count proves the dump
+          # said anything at all.
           for f in dist/out/*.apk; do
-            if $APK adbdump "$f" | grep -E "^ +(user|group): " | grep -qv ": root$"; then
+            dump=$($APK adbdump "$f")
+            owners=$(printf '%s\n' "$dump" | grep -cE "^ +(user|group): " || true)
+            if [ "$owners" -eq 0 ]; then
+              echo "$f: adbdump named no owners at all"
+              exit 1
+            fi
+            if printf '%s\n' "$dump" | grep -E "^ +(user|group): " | grep -qv ": root$"; then
               echo "$f: something in there is not owned by root"
               exit 1
             fi
+            # The upgrade mechanism each package carries is the thing that
+            # keeps the quiet-keep memory alive across an update; nothing
+            # else asserts it exists.
+            printf '%s\n' "$dump" | grep -q "post-upgrade" || {
+              echo "$f: no post-upgrade script - an upgrade would leave the old daemon"
+              exit 1
+            }
           done
-          echo "every file in every .apk is owned by root"
+          echo "every file in every .apk is owned by root, and each carries post-upgrade"
       - uses: actions/upload-artifact@v5
         with:
           name: packages

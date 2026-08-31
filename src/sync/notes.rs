@@ -51,7 +51,7 @@ impl Syncer {
         self.state_dir.join(format!(".{dev}.owned.ports"))
     }
 
-    /// Milliseconds since this boot, the clock the quiet memory is stamped
+    /// Nanoseconds since this boot, the clock the quiet memory is stamped
     /// in.
     ///
     /// `Instant` cannot be written down and read back, and a wall clock can
@@ -61,11 +61,14 @@ impl Syncer {
     /// starts empty after a reboot, so a stamp and the clock that reads it
     /// always come from the same boot.
     ///
-    /// Milliseconds rather than seconds because the valve orders by this,
-    /// and two addresses that went quiet in the same second are still one
-    /// after the other - at whole seconds the order fell back to the
-    /// addresses themselves.
-    pub(super) fn boot_millis() -> u64 {
+    /// Nanoseconds rather than something coarser because two readings
+    /// have to be told apart whenever they are two: the valve orders by
+    /// this, and - since a pass now stamps what it saw and judges quiet
+    /// by "older than this pass" - two passes falling into one tick would
+    /// make everything look loud. At whole seconds the order fell back to
+    /// the addresses themselves; at milliseconds two passes of a busy
+    /// daemon can still share a tick.
+    pub(super) fn boot_nanos() -> u64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -75,8 +78,8 @@ impl Syncer {
         // a zero answer would only make everything look equally young.
         unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
         (ts.tv_sec.max(0) as u64)
-            .saturating_mul(1000)
-            .saturating_add(ts.tv_nsec.max(0) as u64 / 1_000_000)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec.max(0) as u64)
     }
 
     /// The quiet memory as it was last written: which bridge port each owned
@@ -98,7 +101,7 @@ impl Syncer {
     /// Best-effort in both directions. This file is evidence, never
     /// ownership: losing it costs the keeps and nothing else, which is
     /// exactly what every build before it did.
-    pub(super) fn read_ports(&self, dev: &str) -> Vec<(Mac, String, u32, Option<u64>)> {
+    pub(super) fn read_ports(&self, dev: &str) -> Vec<(Mac, String, u32, u64)> {
         let Ok(text) = fs::read_to_string(self.ports_path(dev)) else {
             return Vec::new();
         };
@@ -112,16 +115,13 @@ impl Syncer {
             else {
                 continue;
             };
-            // A missing clock is written as a dash: the address was in the
-            // table when this was written, so it has not started ageing.
-            let since = match f.next() {
-                Some("-") | None => None,
-                Some(v) => match v.parse::<u64>() {
-                    Ok(v) => Some(v),
-                    Err(_) => continue,
-                },
+            // Every line carries when the bridge was last seen holding
+            // the address; a line without a readable one says nothing
+            // this can use.
+            let Some(Ok(seen)) = f.next().map(|v| v.parse::<u64>()) else {
+                continue;
             };
-            out.push((mac, name.to_string(), index, since));
+            out.push((mac, name.to_string(), index, seen));
         }
         out
     }
@@ -528,9 +528,9 @@ impl Syncer {
 
     /// Write the note as the difference this caller made, not as the set it
     /// started from: whatever else has been added meanwhile stays.
-    pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) -> bool {
+    pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) {
         if self.dry_run {
-            return true;
+            return;
         }
         self.locked(dev, || {
             let current = self.read_owned(dev);
@@ -545,7 +545,7 @@ impl Syncer {
                     merged.remove(mac);
                 }
             }
-            self.write_owned(dev, &merged)
+            self.write_owned(dev, &merged);
         })
     }
 
@@ -621,9 +621,9 @@ impl Syncer {
     /// had no business changing is a trace where the point was to leave
     /// none. The lines that stay keep their bytes and their order; only the
     /// one line goes. Under the caller's lock.
-    pub(super) fn drop_line_locked(&self, dev: &str, mac: &Mac) -> bool {
+    pub(super) fn drop_line_locked(&self, dev: &str, mac: &Mac) {
         let Ok(text) = fs::read_to_string(self.state_path(dev)) else {
-            return false;
+            return;
         };
         let wanted = format_mac(mac);
         let kept: Vec<&str> = text
@@ -634,18 +634,14 @@ impl Syncer {
             // The note existed for this address alone - it came into being
             // with the probe and goes with it, index record and all.
             self.remove_note(dev);
-            return true;
+            return;
         }
         let text = kept.join("\n") + "\n";
         // Either way the remembered copy is about a file that changed, or
         // that is no longer known to hold what it claims.
         self.notes.borrow_mut().remove(dev);
-        match self.put_file(&self.state_path(dev), &text) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("warning: cannot write the ownership note for {dev}: {e}");
-                false
-            }
+        if let Err(e) = self.put_file(&self.state_path(dev), &text) {
+            eprintln!("warning: cannot write the ownership note for {dev}: {e}");
         }
     }
 

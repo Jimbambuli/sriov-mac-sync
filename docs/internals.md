@@ -32,7 +32,7 @@ still exists in the bridge is kept - for a guest the kernel deletes the veth
 or tap with its endpoint, so the port existing is the guest existing, and a
 device behind a physical port in the bridge is blackholed by ageing all the
 same. What bounds the keep is capacity, not time: nearing the filter's limit,
-the longest-missing entries are released first, and every fresh learn makes
+the entries silent longest are released first, and every fresh learn makes
 an entry young again. The pressure is measured against the card's own
 unicast list, read back each pass - foreign entries occupy real slots and
 count - and the event path carries that count between passes, surrendering
@@ -45,7 +45,14 @@ its port goes or the address moves out to the wire.
 That memory outlives the process. It is written to `.<dev>.owned.ports`
 beside the note, under the same lock and through the same temp-and-rename,
 one line per address: the port by name *and* index, and the boot-clock
-reading at which the address went missing. A restart is mostly an update,
+reading at which the bridge was last seen holding it. Every pass refreshes
+that stamp for everything it finds learnt, and so does every learn on the
+event path - which is what makes "quiet" a fact rather than a guess: an
+address whose stamp predates the last pass is one the last pass did not
+see. The same number orders the pressure valve's evictions, and it records
+when the guest last *spoke* rather than when the daemon noticed the
+silence, so two addresses that fall out between the same two passes are
+told apart by their traffic instead of by their names. A restart is mostly an update,
 and an update that forgot its keeps would unregister every quiet guest on
 its first pass - the outage the keep exists to prevent, delivered by our
 own package. A line is believed only where it still describes this kernel,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::netlink::FdbEntry;
-use crate::sysfs::fixture::{mac, Builder};
+use crate::topology::fixture::{mac, Builder};
 
 pub(crate) const WIRE: Mac = [0xaa, 0, 0, 0, 0, 1]; // a peer out on the switch
 pub(crate) const BEHIND_NIC: Mac = [0xaa, 0, 0, 0, 0, 2]; // on the bridge's other NIC
@@ -116,7 +116,7 @@ pub(crate) fn learned(ifindex: u32, master: u32, mac: Mac) -> FdbEntry {
 
 /// nic1 and nic2 in vmbr1, a vnet bridge IOT stacked on vmbr1.44 with a
 /// container on it, and an unrelated vmbr0 carrying a VM tap.
-pub(crate) fn host(bridge_mac: [u8; 6]) -> crate::sysfs::Topology {
+pub(crate) fn host(bridge_mac: [u8; 6]) -> crate::topology::Topology {
     Builder::new()
         .add("nic1", 2, Some(mac(1)))
         .master("vmbr1")
@@ -171,7 +171,7 @@ pub(crate) fn fdb() -> Vec<FdbEntry> {
 /// hold indices already, having just looked the pair up.
 pub(crate) fn desired_named(
     s: &Syncer,
-    topo: &crate::sysfs::Topology,
+    topo: &crate::topology::Topology,
     pair: &Pair,
     port: &str,
     fdb: &[FdbEntry],
