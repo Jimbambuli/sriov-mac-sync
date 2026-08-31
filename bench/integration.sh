@@ -239,7 +239,13 @@ check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 # -v on a single pass lists the addresses themselves, under a heading that
 # names the uplink - the report line above it appears only when something
 # changed, so on a quiet host it is not there to name anything.
-check "the addresses are listed" "grep -q '^    $M2$' /tmp/sms-it-s3.log"
+# Anchored at the front and on a word boundary, not on the end of the line:
+# the row carries the port the address was learnt behind where one is known,
+# and M2 happens to have none here only because this dry run is a fresh
+# process whose memory file does not name it yet. Tied to the end of the
+# line, the check would pass for that accident and fail the day it stops
+# being one.
+check "the addresses are listed" "grep -qE '^    $M2( |\$)' /tmp/sms-it-s3.log"
 check "the list is headed" "grep -q 'veth-up: .* address(es) wanted' /tmp/sms-it-s3.log"
 
 say "S4: the daemon's fast path registers within seconds"
