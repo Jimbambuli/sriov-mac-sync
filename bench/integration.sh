@@ -134,7 +134,11 @@ BIN=$(readlink -f "$BIN")
 
 SNAP=$(mktemp)
 trap cleanup EXIT
-ip -br link >"$SNAP"
+# Interface NAMES, not `ip -br link` in full: the state column of a host
+# this suite never touches can change under it - a runner brings a service
+# up mid-run - and that is not this suite having leaked anything. What it
+# could leak is an interface, and an interface has a name.
+ip -br link | awk '{print $1}' | sort >"$SNAP"
 ip netns del sms-it 2>/dev/null
 ip netns add sms-it
 # No IPv6 anywhere in here, set before a single interface exists so that
@@ -384,7 +388,9 @@ check_soon "the pass ran" "grep -q 'registered' /tmp/sms-it-s6g2.log"
 check "no takeover was claimed" "! grep -q 'took over' /tmp/sms-it-s6g2.log"
 check_soon "the unrecognised memory kept nothing" "! has_self $MG"
 stop_daemon
-restore_guest_port
+# No restore_guest_port here: this scenario never took the port away, and
+# asking for it back printed "RTNETLINK answers: File exists" into a log
+# whose whole job is to be quiet.
 
 say "S7: --status reads without writing"
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)
@@ -410,7 +416,8 @@ check "M1 self entry gone" "! has_self $M1"
 check "notes gone" "[ -z \"\$(ls -A $STATE 2>/dev/null | grep -v '.lock\$')\" ]"
 
 say "S9: the host outside the namespace is untouched"
-DIFF=$(diff <(ip -br link) "$SNAP")
+DIFF=$(diff "$SNAP" <(ip -br link | awk '{print $1}' | sort))
+[ -n "$DIFF" ] && printf '%s\n' "$DIFF" >&2
 check "interface snapshot identical" "[ -z \"$DIFF\" ]"
 
 echo
