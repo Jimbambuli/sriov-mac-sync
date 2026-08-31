@@ -986,6 +986,40 @@ impl Syncer {
         }
     }
 
+    /// Record what was just observed about an owned address: where the
+    /// bridge holds it, and when it was last heard from.
+    ///
+    /// The one place a stamp is written, and it only ever moves forward.
+    /// Every reader treats the number as "the most recent moment there is
+    /// evidence for", so an older observation is not evidence against a
+    /// newer one - it is simply nothing new. That has to hold whatever
+    /// the source: the pass, a learn on the event path, or the bridge's
+    /// own deletion dating a silence. It cannot be argued per site,
+    /// because the sources do not share a clock reading - a pass stamp is
+    /// nudged past its predecessor and can sit a millisecond ahead of the
+    /// clock a learn moments later reads, and a deletion's date is
+    /// deliberately older than now. A stamp that went backwards would
+    /// make a live guest the pressure valve's first victim.
+    ///
+    /// `port` is what the observation knows: the pass and a learn name
+    /// one, a deletion refines only the moment. An address nothing knows
+    /// a port for is not recorded at all - the keep rests on the port.
+    fn note_seen(ports: &mut Map<Mac, (u32, u64)>, mac: Mac, port: Option<u32>, at: u64) {
+        match ports.get_mut(&mac) {
+            Some(slot) => {
+                if let Some(p) = port {
+                    slot.0 = p;
+                }
+                slot.1 = slot.1.max(at);
+            }
+            None => {
+                if let Some(p) = port {
+                    ports.insert(mac, (p, at));
+                }
+            }
+        }
+    }
+
     /// Put a date on a silence the bridge has just announced.
     ///
     /// A bridge forgets an address exactly its ageing time after the last
@@ -1025,11 +1059,7 @@ impl Syncer {
             };
             let spoke = now.saturating_sub(ageing);
             for ports in self.carried_ports.values_mut() {
-                if let Some(slot) = ports.get_mut(&entry.mac) {
-                    if spoke > slot.1 {
-                        slot.1 = spoke;
-                    }
-                }
+                Self::note_seen(ports, entry.mac, None, spoke);
             }
         }
     }
@@ -1915,7 +1945,7 @@ impl Syncer {
                 // quiet. Nothing has to be decided here; the two numbers
                 // say it.
                 for (m, p) in learnt_at {
-                    ports.insert(m, (p, pass_at));
+                    Self::note_seen(ports, m, Some(p), pass_at);
                 }
                 ports.retain(|m, _| owned.contains(m));
                 if apply {
@@ -2376,9 +2406,7 @@ impl Syncer {
             let now = Self::boot_millis();
             if let Some(ports) = self.carried_ports.get_mut(&dev) {
                 for mac in &macs {
-                    if let Some(slot) = ports.get_mut(mac) {
-                        slot.1 = now;
-                    }
+                    Self::note_seen(ports, *mac, None, now);
                 }
             }
             let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);

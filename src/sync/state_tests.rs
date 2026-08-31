@@ -4751,3 +4751,51 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
         "the silence should be about the bridge's 200 ms ageing time, was {silent} ms"
     );
 }
+
+/// Stamps only ever move forward, whoever writes them. The sources do
+/// not share a clock reading: a pass stamp is nudged past its
+/// predecessor and can sit a millisecond ahead of the clock a learn
+/// moments later reads, and a deletion's date is deliberately older than
+/// now. Written without that rule, a learn - the very evidence that a
+/// guest is alive - could set its stamp back and make it the pressure
+/// valve's first victim.
+#[test]
+fn a_stamp_never_moves_backwards_whoever_writes_it() {
+    let dir = scratch("stamp-monotone");
+    let m: Mac = [0x02, 0xf7, 0, 0, 0, 1];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // Two passes back to back land in one millisecond, so the second
+    // one's stamp is nudged past the clock the next learn will read.
+    let mut sock2 = kernel(vec![learned(4, 10, m)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    let after_pass = s.carried_ports["nic1"][&m].1;
+
+    // A learn now: evidence the guest is alive, and it must not read as
+    // older than what the pass already recorded.
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut ev = FakeSock::default();
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert!(
+        s.carried_ports["nic1"][&m].1 >= after_pass,
+        "a learn set the stamp back: {} then {}",
+        after_pass,
+        s.carried_ports["nic1"][&m].1
+    );
+
+    // And a deletion, which dates deliberately into the past, cannot
+    // either.
+    let before_del = s.carried_ports["nic1"][&m].1;
+    let mut ev2 = FakeSock::default();
+    s.fast_apply(&mut ev2, &topo, &[(RTM_DELNEIGH, learned(4, 10, m))])
+        .unwrap();
+    assert!(
+        s.carried_ports["nic1"][&m].1 >= before_del,
+        "a deletion set the stamp back"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

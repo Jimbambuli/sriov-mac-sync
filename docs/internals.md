@@ -72,7 +72,16 @@ VLAN and ages them apart, so a deletion may well concern an address that
 spoke in another VLAN a moment ago, and our own observation is then the
 better one. So the event can say "it went on speaking after you last
 looked" and never the reverse - which is also why a deletion is still no
-reason to unregister anything, only to look. A restart is mostly an update,
+reason to unregister anything, only to look.
+
+Forward-only is the rule for every stamp, not just that one, and it is
+kept in one function rather than argued at three call sites. The sources
+do not share a clock reading: a pass stamp is nudged past its
+predecessor and can sit a millisecond ahead of the clock a learn moments
+later reads, and a deletion's date is deliberately older than now. The
+number means "the most recent moment there is evidence for", so an older
+observation is not evidence against a newer one - it is simply nothing
+new. A restart is mostly an update,
 and an update that forgot its keeps would unregister every quiet guest on
 its first pass - the outage the keep exists to prevent, delivered by our
 own package. A line is believed only where it still describes this kernel,
