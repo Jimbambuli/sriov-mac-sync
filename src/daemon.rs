@@ -583,7 +583,11 @@ fn run_pass<W: World>(
             // wins; the gate is the same one.
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
                 let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-                let answers = world.filter_capacities(&devs);
+                let answers =
+                    world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
+                for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
+                    syncer.max_macs_je_karte.insert(karte, wert);
+                }
                 if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
                     // One number, one home: the warning threshold and the
                     // quiet-keep's pressure valve read the same field. The
@@ -610,7 +614,7 @@ fn run_pass<W: World>(
         // them even before its interface exists.
         let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
         {
-            let answers = world.filter_capacities(&devs);
+            let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
             // Settled when every written-down device was there to be asked
             // and gave an answer - and "the card says nothing" is an
             // answer. On ixgbe, i40e and mlx4 it is the only one there will
@@ -631,6 +635,9 @@ fn run_pass<W: World>(
                 .is_some_and(|t| devs.iter().all(|d| t.index_of(d).is_some()));
             if all_present && answers.iter().all(|(_, a)| a.is_ok()) {
                 state.capacity_pending = false;
+            }
+            for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
+                syncer.max_macs_je_karte.insert(karte, wert);
             }
             if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
                 syncer.max_macs = v;
@@ -800,6 +807,64 @@ pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAn
 ///
 /// `None` means the assumed threshold stands. The `--max`/`MAX_MACS` gate
 /// lives at the call sites: an operator's instruction is never moved.
+/// Die Namen der Interfaces, die die Filter der Uplinks wirklich halten.
+/// Fuer alles Ungestapelte ist das der Uplink selbst; ein VLAN-Interface
+/// reicht an das Interface darunter weiter, und nur dieses hat eine
+/// Kapazitaet, nach der devlink ueberhaupt gefragt werden kann.
+pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<String> {
+    let Some(topo) = topo else {
+        return devs.to_vec();
+    };
+    let mut aus: Vec<String> = Vec::new();
+    for d in devs {
+        let name = topo
+            .index_of(d)
+            .map(|i| topo.filter_carrier(i))
+            .and_then(|c| topo.name_of(c))
+            .unwrap_or(d)
+            .to_string();
+        if !aus.contains(&name) {
+            aus.push(name);
+        }
+    }
+    aus
+}
+
+/// Was die Karten gemeldet haben, brauchbar gemacht: je Karte ein Wert,
+/// und dazu das Minimum als Vorgabe fuer alles, was nichts gemeldet hat.
+/// Beides wird gebraucht - die Einzelwerte, damit eine grosse Karte nicht
+/// nach dem Mass der kleinsten arbeitet, das Minimum als sichere Annahme.
+pub(crate) fn reported_capacities(
+    answers: Vec<(String, CapacityAnswer)>,
+    verbose: bool,
+    assumed: usize,
+) -> Vec<(String, usize)> {
+    let mut usable: Vec<(String, usize)> = Vec::new();
+    for (dev, answer) in answers {
+        match answer {
+            Ok(Some(v)) => match clamp_max_macs(v as usize) {
+                Ok(v) => usable.push((dev, v)),
+                Err(_) => {
+                    if verbose {
+                        note!("{dev}: reported capacity {v} is unusable, ignored");
+                    }
+                }
+            },
+            Ok(None) => {
+                if verbose {
+                    note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    note!("{dev}: could not ask for the filter capacity: {e}");
+                }
+            }
+        }
+    }
+    usable
+}
+
 pub(crate) fn adopt_reported_capacity(
     answers: Vec<(String, CapacityAnswer)>,
     verbose: bool,

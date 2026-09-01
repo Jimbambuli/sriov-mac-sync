@@ -272,6 +272,23 @@ Ask a running installation what it thinks the world looks like:
 sriov\-mac\-sync \-\-status
 .EE
 .RE
+.SH SEVERAL UPLINKS ON ONE CARD
+A virtual function can reach more than one bridge through VLAN interfaces:
+.I nic1.100
+in one bridge,
+.I nic1.200
+in another. Both are uplinks in their own right and are detected as such;
+each keeps its own ownership note.
+.PP
+They do share one thing: the unicast filter. A VLAN interface has none of
+its own \(em the kernel keeps its entries on the interface below it \(em so
+two such uplinks are two pairs but one list of slots. This is accounted for:
+how full a card is, is read from the interface that holds the filter, and the
+capacity is asked of that one too. Each uplink therefore sees its sister's
+entries as foreign, counts them against the limit, and never touches them.
+.PP
+A bond is different: every member has a filter of its own and the kernel
+spreads the entries over them, so a bond carries its own.
 .SH LIMITS
 The unicast list is finite; beyond it the driver
 drops addresses silently. Hardware that can represent virtual functions as real

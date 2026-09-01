@@ -526,6 +526,41 @@ impl Topology {
         self.flood(roots, |l| &l.lowers)
     }
 
+    /// The interface whose unicast filter an uplink really writes into.
+    ///
+    /// A VLAN interface has no filter of its own: the kernel passes a
+    /// `self` entry down to the interface it is stacked on, and that one
+    /// holds the entry. Several uplinks can therefore end up sharing one
+    /// filter - three VLANs of one virtual function are three uplinks but
+    /// one list of, say, 128 slots. Whoever counts how full the card is
+    /// has to ask this interface, not the uplink.
+    ///
+    /// Only the stacking relation is followed, never a master: a bond's
+    /// members each have their own filter, and the kernel spreads entries
+    /// over them, so a bond carries its own.
+    pub fn filter_carrier(&self, dev: u32) -> u32 {
+        let mut seen = crate::hash::set();
+        let mut cur = dev;
+        while seen.insert(cur) {
+            // `lowers` holds two different relations - the ports of a master
+            // and the parent of a stacked interface - and only the second one
+            // shares a filter. They are told apart by looking back: a port
+            // names its master, a parent does not name what sits on it. Get
+            // this wrong and a bond looks like it were stacked on its first
+            // member.
+            let Some(l) = self.at(cur) else { break };
+            let stacked = l
+                .lowers
+                .iter()
+                .find(|&&u| self.at(u).and_then(|p| p.master) != Some(cur));
+            match (l.lowers.len(), stacked) {
+                (1, Some(&parent)) => cur = parent,
+                _ => break,
+            }
+        }
+        cur
+    }
+
     /// Follow the master chain upwards - through bonds, teams, whatever -
     /// until a bridge is reached. Returns the bridge and the interface that is
     /// actually enslaved to it, which is what the bridge's tables refer to.
@@ -584,8 +619,22 @@ impl Topology {
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         for link in sorted {
             let name = &link.name;
-            let has_vfs = link.numvfs > 0;
-            if !has_vfs && link.physfn.is_none() {
+            // A card of its own, or something stacked on one. The second
+            // case is a VLAN interface of a virtual function: it is what
+            // sits in the bridge, and the entries it takes land in the
+            // filter of the function below it. Without this, such a host
+            // has to be configured by hand - and loses the orphan sweep
+            // with it, because only autodetection may conclude a device is
+            // gone.
+            let traeger = self.filter_carrier(link.index);
+            let karte = if traeger == link.index {
+                Some(link)
+            } else {
+                self.at(traeger)
+            };
+            let Some(karte) = karte else { continue };
+            let has_vfs = karte.numvfs > 0;
+            if !has_vfs && karte.physfn.is_none() {
                 continue;
             }
             match self.bridge_above(link.index) {
@@ -596,7 +645,7 @@ impl Topology {
                     // vports of one eSwitch. The same goes for a sister VF
                     // that was taken for this bridge a moment ago - the rule
                     // is about the eSwitch, not about who is a PF.
-                    if let Some(pf) = link.physfn {
+                    if let Some(pf) = karte.physfn {
                         let pf_name = self.name_of(pf).unwrap_or_default();
                         // Every netdev of this function, not just the first:
                         // a card whose ports share one PCI function shows one
@@ -1032,6 +1081,89 @@ mod tests {
                 .any(|s| s.contains("pf3v0") && s.contains("already carries")),
             "the VF must be declined: a netdev of its own function - the \
              fourth, not the first - already carries that bridge"
+        );
+    }
+
+    /// Which interface really holds a filter. A VLAN interface has none of
+    /// its own - the kernel keeps its entries on the interface below - while
+    /// a bond has one per member and carries its own. Both relations arrive
+    /// as `lowers`, so telling them apart is the whole point.
+    #[test]
+    fn a_vlan_shares_the_filter_below_it_but_a_bond_does_not() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(1)
+            .add("nic1.100", 20, Some(mac(1)))
+            .master("br100")
+            .lower("nic1")
+            .add("nic1.200", 21, Some(mac(1)))
+            .master("br200")
+            .lower("nic1")
+            .add("br100", 30, Some(mac(1)))
+            .bridge()
+            .lower("nic1.100")
+            .add("br200", 31, Some(mac(1)))
+            .bridge()
+            .lower("nic1.200")
+            .add("nic2", 3, Some(mac(2)))
+            .master("bond0")
+            .add("bond0", 4, Some(mac(2)))
+            .lower("nic2")
+            .build();
+        let idx = |n: &str| t.index_of(n).unwrap();
+        assert_eq!(
+            t.filter_carrier(idx("nic1.100")),
+            idx("nic1"),
+            "a VLAN interface writes into the filter of the interface below"
+        );
+        assert_eq!(
+            t.filter_carrier(idx("nic1.200")),
+            idx("nic1"),
+            "both VLANs of one function share one filter"
+        );
+        assert_eq!(
+            t.filter_carrier(idx("nic1")),
+            idx("nic1"),
+            "an unstacked interface carries its own"
+        );
+        assert_eq!(
+            t.filter_carrier(idx("bond0")),
+            idx("bond0"),
+            "a bond is not stacked on its member: each member has a filter, \
+             and the kernel spreads the entries over them"
+        );
+    }
+
+    /// A virtual function that reaches its bridge through a VLAN interface.
+    /// The VLAN interface is what sits in the bridge, so that is the uplink;
+    /// without this the host has to be configured by hand and loses the
+    /// orphan sweep with it.
+    #[test]
+    fn autodetect_finds_an_uplink_that_hangs_in_through_a_vlan() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .add("nic1.100", 20, Some(mac(1)))
+            .master("br100")
+            .lower("nic1")
+            .add("nic1.200", 21, Some(mac(1)))
+            .master("br200")
+            .lower("nic1")
+            .add("br100", 30, Some(mac(1)))
+            .bridge()
+            .lower("nic1.100")
+            .add("br200", 31, Some(mac(1)))
+            .bridge()
+            .lower("nic1.200")
+            .build();
+        let (pairs, _) = t.autodetect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("nic1.100".to_string(), "br100".to_string()),
+                ("nic1.200".to_string(), "br200".to_string())
+            ],
+            "both VLAN interfaces are uplinks in their own right"
         );
     }
 

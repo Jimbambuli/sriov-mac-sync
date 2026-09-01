@@ -3467,6 +3467,73 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
 
 /// The valve opens exactly when the measured occupancy no longer fits
 /// above the headroom, and not one slot earlier: off by one in either
+/// A host whose virtual function reaches two bridges through two VLAN
+/// interfaces. Both uplinks write into ONE filter - the one of nic1 below
+/// them - so whoever counts how full the card is has to ask nic1.
+fn vlan_host() -> crate::topology::Topology {
+    Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .vfs(1)
+        .add("nic1.100", 20, Some(mac(1)))
+        .master("br100")
+        .lower("nic1")
+        .add("nic1.200", 21, Some(mac(1)))
+        .master("br200")
+        .lower("nic1")
+        .add("vetha", 4, Some(mac(4)))
+        .master("br100")
+        .add("br100", 10, Some(mac(3)))
+        .bridge()
+        .lower("nic1.100")
+        .lower("vetha")
+        .add("br200", 11, Some(mac(5)))
+        .bridge()
+        .lower("nic1.200")
+        .build()
+}
+
+/// Two uplinks on one card share its filter, and the pressure valve has to
+/// see that. The entries of the sister uplink sit on nic1, not on the VLAN
+/// interface this pair works through - a pass that counted only its own
+/// share would believe it had room while the card was already full, and the
+/// eSwitch would then drop entries of its own choosing.
+#[test]
+fn a_shared_filter_is_counted_whole() {
+    let dir = scratch("shared-filter");
+    let topo = vlan_host();
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1.100".into(),
+            bridge: "br100".into(),
+        }],
+        dir.to_path_buf(),
+    );
+    s.authoritative = true;
+    // Four guests behind br100, all of them ours.
+    let learns: Vec<Mac> = (1..=4u8).map(|i| [0x02, 0xe0, 0, 0, 0, i]).collect();
+    let mut sock = kernel(learns.iter().map(|m| learned(4, 10, *m)).collect());
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // They go quiet, so they are keeps and the valve may shed them. Six
+    // entries of the SISTER uplink sit in the same filter - on nic1, where
+    // the kernel keeps them. With eleven slots the pass is over its margin
+    // only if those six are counted.
+    let mut halten: Vec<crate::netlink::FdbEntry> =
+        learns.iter().map(|m| card_holds(2, *m)).collect();
+    halten.extend((1..=6u8).map(|i| card_holds(2, [0x02, 0xff, 0, 0, 0, i])));
+    s.max_macs = 11;
+    let mut sock2 = kernel(halten);
+    let reports = s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    assert!(
+        !sock2.removed.is_empty(),
+        "the sister's entries fill the same card and have to be counted \
+         (quiet={}, removed={})",
+        reports[0].quiet,
+        sock2.removed.len()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// direction means a needless shed or a silent overflow on the next learn.
 #[test]
 fn the_pressure_valve_opens_exactly_at_its_margin() {

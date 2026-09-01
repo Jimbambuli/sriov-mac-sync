@@ -148,6 +148,19 @@ only autodetection sees every uplink; naming pairs by hand says nothing about
 the pairs it omits. Notes are written 0600 in a 0700 directory — a note another
 user can write is a note that decides what a root daemon takes out of a card.
 
+**An uplink and the card it writes into are not always the same interface.**
+A VLAN interface has no unicast filter of its own; a `self` entry given to it
+is kept by the interface it is stacked on. Several uplinks can therefore
+share one filter — three VLANs of one virtual function are three uplinks but
+one list of, say, 128 slots. Everything that measures the card asks the
+interface that actually holds the filter: the read-back that counts how full
+it is, and the devlink question about its capacity. Each uplink then sees its
+sisters' entries as foreign, counts them against the limit and leaves them
+alone, which is exactly what invariant 3 already says. The relation is told
+apart from mastering by looking back: a port names its master, a parent does
+not name what sits on it — otherwise a bond would look like it were stacked
+on its first member, and each of those members has a filter of its own.
+
 **Ownership lives in files because the card cannot carry it.** A unicast
 list entry has no owner field — read back, our entry and one somebody else
 put there are the same bytes. So the question "did we add this?" can only be

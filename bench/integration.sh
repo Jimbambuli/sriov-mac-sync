@@ -470,6 +470,45 @@ check "exit 0" "[ $RC -eq 0 ]"
 check "M1 self entry gone" "! has_self $M1"
 check "notes gone" "[ -z \"\$(ls -A $STATE 2>/dev/null | grep -v '.lock\$')\" ]"
 
+say "S10: two uplinks on one card share its filter"
+# A VLAN interface has no filter of its own - the kernel keeps the entries
+# on the interface below it. Two such uplinks are two pairs but ONE list of
+# slots, and a pass that counted only its own share would let the card
+# overflow while both believed they had room.
+$NS ip link add vshare type dummy
+$NS ip link add link vshare name vshare.11 type vlan id 11
+$NS ip link add link vshare name vshare.12 type vlan id 12
+$NS ip link add vbr1 type bridge
+$NS ip link add vbr2 type bridge
+$NS ip link set vshare.11 master vbr1
+$NS ip link set vshare.12 master vbr2
+$NS ip link add vg1 type veth peer name vg1p
+$NS ip link add vg2 type veth peer name vg2p
+$NS ip link set vg1 master vbr1
+$NS ip link set vg2 master vbr2
+for i in vshare vshare.11 vshare.12 vbr1 vbr2 vg1 vg1p vg2 vg2p; do $NS ip link set $i up; done
+$NS bridge fdb add 02:00:00:00:11:11 dev vg1 master dynamic
+$NS bridge fdb add 02:00:00:00:12:12 dev vg2 master dynamic
+$NS "$BIN" --once --pair vshare.11:vbr1 --pair vshare.12:vbr2 >/tmp/sms-it-s10.log 2>&1
+check "both uplinks worked" "[ \$(grep -c 'registered' /tmp/sms-it-s10.log) -eq 2 ]"
+check "the guest behind vbr1 reached the card" \
+  "$NS bridge fdb show dev vshare self | grep -q 02:00:00:00:11:11"
+check "the guest behind vbr2 reached the same card" \
+  "$NS bridge fdb show dev vshare self | grep -q 02:00:00:00:12:12"
+# Each uplink keeps its own note; sharing a filter is not sharing a record.
+check "two separate notes" "[ -f $STATE/vshare.11.owned ] && [ -f $STATE/vshare.12.owned ]"
+check "the notes do not overlap" \
+  "! grep -q 02:00:00:00:12:12 $STATE/vshare.11.owned"
+# The count has to be of the whole shared list. Each uplink holds two
+# entries, so a pass that saw only its own share would say 2; the number in
+# the warning is what tells the two apart.
+$NS "$BIN" --once --max 3 --pair vshare.11:vbr1 --pair vshare.12:vbr2 \
+  >/tmp/sms-it-s10b.log 2>&1
+check "the whole shared list is counted, not just this uplink's share" \
+  "grep -q '4 unicast entries against the 3' /tmp/sms-it-s10b.log"
+$NS "$BIN" --flush >/dev/null 2>&1
+for i in vg1 vg2 vbr1 vbr2 vshare.11 vshare.12 vshare; do $NS ip link del $i 2>/dev/null; done
+
 say "S9: the host outside the namespace is untouched"
 DIFF=$(diff "$SNAP" <(ip -br link | awk '{print $1}' | sort))
 [ -n "$DIFF" ] && printf '%s\n' "$DIFF" >&2

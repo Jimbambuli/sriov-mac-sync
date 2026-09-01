@@ -380,7 +380,19 @@ pub struct Syncer {
     /// The filter capacity the quiet-keep must respect. Kept addresses cost
     /// filter slots, and past its capacity the card drops entries silently -
     /// so keeps are the first surrendered as the list nears this limit.
+    /// The value for anything the card did not report a number for.
     pub max_macs: usize,
+    /// Which interface holds the filter an uplink writes into, filled by
+    /// each pass from the picture it read. The event path has no topology
+    /// of its own and needs the answer just as much - a burst on a VLAN
+    /// uplink measures against the card below it, like everything else.
+    karte_von: Map<String, String>,
+    /// What single cards reported, by the name of the interface that holds
+    /// the filter. Two cards in one host can be differently sized, and a
+    /// host that took the smaller number for both would shed keeps on the
+    /// larger one for nothing. Empty until devlink answers, which on ixgbe,
+    /// i40e and mlx4 is never - hence the fallback above.
+    pub max_macs_je_karte: Map<String, usize>,
     /// Which addresses each uplink was last said to be keeping, so the
     /// quiet-keep is announced once per entry into that state rather than
     /// once per pass forever.
@@ -570,6 +582,8 @@ impl Syncer {
             ports_loaded: crate::hash::set(),
             ports_written: crate::hash::map(),
             max_macs: DEFAULT_MAX_MACS,
+            karte_von: crate::hash::map(),
+            max_macs_je_karte: crate::hash::map(),
             noted_quiet: crate::hash::map(),
             last_pass_at: 0,
             warned_over: crate::hash::set(),
@@ -1483,6 +1497,17 @@ impl Syncer {
     /// missed every foreign entry taking a real slot and listed the state
     /// directory and read every note to find out, on a path that an
     /// ageing table walks hundreds of times.
+    /// The capacity of the card this uplink writes into. What that card
+    /// itself reported, or the assumed number where it reported nothing -
+    /// which on ixgbe, i40e and mlx4 is every card there is.
+    pub fn limit_of(&self, dev: &str) -> usize {
+        let karte = self.karte_von.get(dev).map(String::as_str).unwrap_or(dev);
+        self.max_macs_je_karte
+            .get(karte)
+            .copied()
+            .unwrap_or(self.max_macs)
+    }
+
     pub fn fullest_filter(&self) -> usize {
         self.carried
             .values()
@@ -1625,7 +1650,7 @@ impl Syncer {
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
              address(es) [pressure]",
-            self.max_macs,
+            self.limit_of(dev),
             dropped.len()
         );
         freed
@@ -2119,12 +2144,37 @@ impl Syncer {
             // slots HERE too, instead of eating an invisible margin. What
             // the pass will leave behind is `want` plus the present entries
             // that are neither wanted nor ours to remove.
-            let foreign_extra = present
+            //
+            // Asked of the interface that really holds the filter, not of
+            // the uplink: a VLAN interface has no list of its own, the
+            // kernel keeps the entries on the interface below. Three VLANs
+            // of one function are three uplinks but ONE list of slots, and
+            // an uplink that counted only its own share would let the card
+            // overflow with every pair believing it had room. Where nothing
+            // is stacked, this is the uplink itself and nothing changes.
+            let carrier = topo.filter_carrier(dev_index);
+            let on_card: Set<Mac> = if carrier == dev_index {
+                present.clone()
+            } else {
+                fdb.iter()
+                    .filter(|e| e.is_self() && e.ifindex == carrier && e.is_unicast())
+                    .map(|e| e.mac)
+                    .collect()
+            };
+            let foreign_extra = on_card
                 .iter()
                 .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
                 .count();
             let mut occupied = want.len() + foreign_extra;
-            if !kept.is_empty() && occupied + CAPACITY_HEADROOM > self.max_macs {
+            if let Some(n) = topo.name_of(carrier) {
+                if n != pair.dev {
+                    self.karte_von.insert(pair.dev.clone(), n.to_string());
+                } else {
+                    self.karte_von.remove(&pair.dev);
+                }
+            }
+            let limit = self.limit_of(&pair.dev);
+            if !kept.is_empty() && occupied + CAPACITY_HEADROOM > limit {
                 // Ordered by the RAW stamp, the way shed_keeps orders - one
                 // spelling for both valves. Not by `silence_of`: that view
                 // clamps a stamp ahead of the pass mark down to "just now"
@@ -2143,7 +2193,7 @@ impl Syncer {
                 order.sort_unstable();
                 let mut shed = 0usize;
                 for (_, m) in order {
-                    if occupied + CAPACITY_HEADROOM <= self.max_macs {
+                    if occupied + CAPACITY_HEADROOM <= limit {
                         break;
                     }
                     // A shed keep leaves `want`; the stale loop below takes
@@ -2159,7 +2209,7 @@ impl Syncer {
                         "{}: filter nearing its {} limit, released {shed} quiet \
                          address(es) [pressure]",
                         pair.dev,
-                        self.max_macs
+                        limit
                     );
                 }
             }
@@ -2351,13 +2401,13 @@ impl Syncer {
             // a --status predicting the same number is not the daemon's
             // journal line.
             if apply {
-                if occupied > self.max_macs {
+                if occupied > limit {
                     if self.warned_over.insert(pair.dev.clone()) {
                         eprintln!(
                             "warning: {}: {} unicast entries against the {} the \
                              vport list holds - some will be dropped silently, \
                              and not by choice",
-                            pair.dev, occupied, self.max_macs
+                            pair.dev, occupied, limit
                         );
                     }
                 } else {
@@ -2367,7 +2417,7 @@ impl Syncer {
                 // under the headroom the batch measures against, or the
                 // pass would clear it while the batch is still in the band
                 // that set it.
-                if occupied + CAPACITY_HEADROOM <= self.max_macs {
+                if occupied + CAPACITY_HEADROOM <= limit {
                     self.warned_tight.remove(&pair.dev);
                 }
             }
@@ -2849,7 +2899,7 @@ impl Syncer {
                     Self::note_seen(ports, *mac, learnt_on.get(mac).copied(), now);
                 }
             }
-            let allowed = self.max_macs.saturating_sub(CAPACITY_HEADROOM);
+            let allowed = self.limit_of(&dev).saturating_sub(CAPACITY_HEADROOM);
             let est = self.carried.get(&dev).map_or(0, |c| c.present.len());
             // Only what would take a NEW slot. An address the card already
             // holds costs nothing to re-register - counting it would shed
@@ -2871,7 +2921,9 @@ impl Syncer {
                          quiet ones left to release - the list is within {} \
                          of the {} the card holds, and past that it drops \
                          silently",
-                        fresh_slots, CAPACITY_HEADROOM, self.max_macs
+                        fresh_slots,
+                        CAPACITY_HEADROOM,
+                        self.limit_of(&dev)
                     );
                 }
             }
