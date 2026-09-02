@@ -1,16 +1,13 @@
 //! The interface topology: which interface leads where.
 //!
 //! Built from one rtnetlink link dump plus a few `/sys` reads for what the
-//! dump deliberately leaves out. The `/sys`-only reader further down is
-//! test scaffolding - an independent second opinion the suite holds this
-//! against - not the production path, which is why the file is named for
-//! what it produces rather than where it once read it.
+//! dump leaves out; the `/sys`-only reader further down is test scaffolding,
+//! an independent second opinion.
 //!
-//! Everything here is about answering two structural questions without ever
-//! looking at an interface's name: which way is the wire, and which way is the
-//! rest of the host. Naming conventions differ between distributions and
-//! guessing from them is how a tool like this breaks on somebody else's
-//! machine.
+//! Two structural questions are answered without ever looking at a name -
+//! which way is the wire, which way the rest of the host - because naming
+//! conventions differ between distributions, and guessing from them is how a
+//! tool like this breaks on somebody else's machine.
 
 use crate::hash::{Map, Set};
 use std::fs;
@@ -22,19 +19,16 @@ use crate::netlink::parse_mac;
 const NET: &str = "/sys/class/net";
 
 /// Interfaces that carry a `lower_<parent>` link in sysfs because they are
-/// stacked on that parent. A veth also reports a peer over netlink, and a
-/// tunnel reports its underlay - neither is stacking, and treating them as
-/// such would send the uplink search off in the wrong direction.
+/// stacked on that parent. A veth's peer and a tunnel's underlay are not
+/// stacking, and treating them so sends the uplink search the wrong way.
 const STACKED_ON_PARENT: &[&str] = &[
     "vlan", "macvlan", "macvtap", "ipvlan", "ipvtap", "macsec", "vxlan",
 ];
 
-/// One interface, with its relations held as interface indices rather than
-/// names. The kernel identifies interfaces by index in every message the
-/// daemon reads, the walks below follow these relations constantly, and a
-/// name is a heap allocation that has to be hashed character by character
-/// every time it is looked up. The name is kept for one purpose: saying
-/// which interface is meant in a message a person will read.
+/// One interface, its relations held as indices rather than names: the kernel
+/// identifies interfaces by index in every message, the walks follow these
+/// relations constantly, and a name is a heap allocation hashed character by
+/// character. The name is kept for messages a person reads.
 #[derive(Debug, Clone, Default)]
 pub struct Link {
     pub name: String,
@@ -51,10 +45,9 @@ pub struct Link {
     /// is unknown - naming the wrong carrier is worse than naming none.
     pub filter_below: Option<u32>,
     pub is_bridge: bool,
-    /// How long this bridge takes to forget a silent address, in
-    /// milliseconds - and so how long ago an address it has just aged out
-    /// last spoke. Only bridges have one; from the same dump everything
-    /// else here comes from.
+    /// How long this bridge takes to forget a silent address, in milliseconds
+    /// - so how long ago an address it just aged out last spoke. Only bridges
+    ///   have one.
     pub ageing_ms: Option<u64>,
     pub numvfs: u32,
     pub driver: Option<String>,
@@ -63,30 +56,26 @@ pub struct Link {
     /// and this is the lowest-numbered of them - readdir order is not
     /// promised, and this is a key elsewhere; `pf_netdevs` holds them all.
     pub physfn: Option<u32>,
-    /// every PF netdev of this virtual function's PCI function - more than one
-    /// when a multiport card shares a single function across its ports, where
-    /// each port's netdev reports only its own port's VF addresses. The
-    /// exclusion set must take them all in, or a sibling VF on the other port
-    /// goes unexcluded and its address is registered past the guest holding it.
+    /// every PF netdev of this VF's PCI function - several on a multiport
+    /// card sharing one function, where each port's netdev reports only its
+    /// own VF addresses. The exclusion set must take them all, or a sibling
+    /// VF on the other port is registered past its guest.
     pub pf_netdevs: Vec<u32>,
     /// netdevs of this interface's VFs, as far as they are bound on the host
     pub vf_netdevs: Vec<u32>,
     /// what has this interface as a lower - the inverse of `lowers`, worked
-    /// out once when the topology is built. Without it, "which interfaces sit
-    /// on top of this bridge" is answered by asking every interface on the
-    /// host whether it leads to the bridge, which walks the same edges once
-    /// per interface instead of once.
+    /// out once when the topology is built, so "which interfaces sit on top
+    /// of this bridge" is one walk instead of one per interface.
     pub uppers: Vec<u32>,
     /// what is enslaved to this interface - the inverse of `master`
     pub slaves: Vec<u32>,
 }
 
 /// What a learn means to one bridge, worked out once per bridge: the
-/// interfaces stacked above it (uplink-ward: a learn there faces the
-/// host, never a guest) and the bridges stacked on it (whose learns are
-/// guests the lower bridge never sees). One spelling for the pass, the
-/// event path and the quiet-keep, which each used to walk this on their
-/// own - and one of them had drifted.
+/// interfaces stacked above it (uplink-ward: a learn there faces the host)
+/// and the bridges stacked on it (whose learns are guests). One spelling for
+/// the pass, the event path and the quiet-keep - of three hand-walks one had
+/// drifted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reach {
     pub bridge: u32,
@@ -177,19 +166,15 @@ fn link_target_name(path: impl AsRef<Path>) -> Option<String> {
 impl Topology {
     /// The same picture, walked out of `/sys/class/net`.
     ///
-    /// Not used in anger any more - `from_links` reads the kernel directly,
-    /// which on a host with hundreds of interfaces is the difference between
-    /// 11.5 ms and one request. It is kept because it is an independent
-    /// second opinion, and a test holds the two to each other on whatever
-    /// host it runs on: two ways of describing the same thing drift apart
-    /// silently otherwise.
+    /// Not the production path (`from_links` reads the kernel: 11.5 ms
+    /// against one request on a host with hundreds of interfaces), kept as an
+    /// independent second opinion a test holds the dump against on whatever
+    /// host it runs on.
     #[cfg(test)]
     pub fn load() -> std::io::Result<Self> {
-        // Relations come out of /sys as names - a symlink's target, a
-        // lower_* entry - and are turned into indices once every interface
-        // has been seen. Anything naming an interface that is not there any
-        // more is dropped: it went while this was being read, and the next
-        // reading is the one that will have it right.
+        // Relations come out of /sys as names and are turned into indices
+        // once every interface has been seen. Anything naming an interface no
+        // longer there is dropped: it went while this was being read.
         let mut named: Vec<(Link, Names)> = Vec::new();
         for entry in fs::read_dir(NET)? {
             let entry = entry?;
@@ -200,12 +185,11 @@ impl Topology {
                 Some(i) => i,
                 None => continue,
             };
-            // Whether there is a PCI device behind this interface decides four
-            // of the reads below. Veth, VLAN and bridge interfaces have none -
-            // on a host carrying containers they are the large majority - and
-            // asking each of them for a driver, a VF count, a physical function
-            // and a VF list is four failed lookups apiece. One look answers all
-            // four.
+            // Whether a PCI device is behind this interface decides four of
+            // the reads below. Veth, VLAN and bridge interfaces have none -
+            // on a container host the large majority - and asking each for
+            // driver, VF count, physical function and VF list is four failed
+            // lookups apiece.
             let dev = base.join("device");
             let has_dev = dev.is_dir();
 
@@ -306,16 +290,13 @@ impl Topology {
         Ok(Topology::assemble(links, by_name))
     }
 
-    /// The same picture, from one netlink dump instead of a walk over
-    /// `/sys/class/net`.
+    /// The same picture from one netlink dump instead of a walk over
+    /// `/sys/class/net`, which is six or more file operations per interface -
+    /// measured at 11.5 ms of an 11.7 ms load for 406 interfaces.
     ///
-    /// The walk is six or more file operations per interface, and on a host
-    /// with hundreds of them that is the whole cost of having a topology at
-    /// all - measured at 11.5 ms of a 11.7 ms load for 406 interfaces. The
-    /// dump is one request. What it does not carry is the SR-IOV relations:
-    /// the physical function behind a VF, and the netdevs of a PF's VFs.
-    /// Those come from /sys, for the interfaces that have a bus device behind
-    /// them and no others - two or three on a normal host.
+    /// What the dump does not carry is the SR-IOV relations (the PF behind a
+    /// VF, a PF's VF netdevs); those come from /sys for the two or three
+    /// interfaces with a bus device behind them.
     pub fn from_links(links: Vec<crate::netlink::LinkInfo>) -> Self {
         // Whether the kernel names bus devices for us at all. It has done
         // since 5.13; where it does not, the presence of the directory has to
@@ -324,15 +305,12 @@ impl Topology {
 
         // ... but only where an interface could have one. The kernel gives a
         // kind to interfaces it creates itself - bridge, vlan, veth, bond,
-        // tun - and a driver bound to a bus device does not. So an interface
-        // with a kind has no device directory to find, and asking is one
-        // statx that always fails. On a host full of containers that is
-        // nearly every interface: 409 of them here, 3.2 ms of a 23 ms pass.
-        // The dump cannot say which interfaces have virtual functions - that
-        // count is only sent when the request asks for the functions
-        // themselves, which is the expensive thing this avoids - so the kind
-        // is the whole of the test. An interface handing out virtual
-        // functions is a driver bound to a bus device and has no kind.
+        // tun - and a driver bound to a bus device does not, so an interface
+        // with a kind has no device directory and asking is one statx that
+        // always fails: 409 of them on a container host, 3.2 ms of a 23 ms
+        // pass. The dump cannot say which interfaces have VFs (that count
+        // comes only with the expensive flag), so the kind is the whole test:
+        // an interface handing out VFs is a bus driver and has no kind.
         let could_have_device = |l: &crate::netlink::LinkInfo| l.kind.is_none();
 
         let mut by_name: Map<String, u32> =
@@ -347,32 +325,30 @@ impl Topology {
             } else {
                 could_have_device(&l) && Path::new(NET).join(&l.name).join("device").is_dir()
             };
-            // Built only for interfaces with a device behind them: on the
-            // 406-interface measuring host this was ~400 allocations per
-            // reading spent on veths that never touch it, and the reading
-            // sits on the batch path. The empty PathBuf does not allocate.
+            // Built only for interfaces with a device behind them: ~400
+            // allocations per reading spent on veths otherwise, on the batch
+            // path. The empty PathBuf does not allocate.
             let base = if probed {
                 Path::new(NET).join(&l.name)
             } else {
                 PathBuf::new()
             };
             // The dump and the reads below are two moments, and a rename in
-            // between - udev renames NICs at boot, which is when this daemon
-            // starts - makes <name> another interface's directory. Its VF
-            // count, driver and functions would then become THIS uplink's
-            // exclusions, which is the wrong set in the dangerous direction.
-            // One file says whether the directory still answers for this
-            // interface; on any disagreement the device-backed extras are
-            // skipped for this pass, and the next pass reads afresh.
+            // between (udev renames NICs at boot, when this daemon starts)
+            // makes <name> another interface's directory - its VF count,
+            // driver and functions would become THIS uplink's exclusions,
+            // wrong in the dangerous direction. One file says whether the
+            // directory still answers for this interface; on disagreement the
+            // device-backed extras are skipped for this pass.
             let has_device = probed
                 && read_trim(base.join("ifindex")).and_then(|s| s.parse::<u32>().ok())
                     == Some(l.index);
 
             // sysfs carries a lower_<name> link for what an interface is
-            // built on. Two relations produce those: a port's master, seen
-            // from the master's side, and the parent a stacked interface sits
-            // on. A veth's peer and a tunnel's underlay are neither, which is
-            // why the kind has to be consulted before believing IFLA_LINK.
+            // built on: a port's master seen from the master's side, and the
+            // parent a stacked interface sits on. A veth's peer and a
+            // tunnel's underlay are neither, which is why the kind is
+            // consulted before believing IFLA_LINK.
             let lowers = match (l.kind.as_deref(), l.link) {
                 (Some(k), Some(parent)) if STACKED_ON_PARENT.contains(&k) => vec![parent],
                 _ => Vec::new(),
@@ -393,15 +369,13 @@ impl Topology {
                 // clock_t is USER_HZ hundredths of a second on every
                 // architecture this runs on: 30000 is the default 300 s.
                 ageing_ms: l.ageing.map(|c| c as u64 * 10),
-                // Not from the dump. IFLA_NUM_VF is only sent when the
-                // request carries RTEXT_FILTER_VF, which this one does not -
-                // that flag makes every driver with virtual functions answer
-                // out of its firmware, and avoiding it is why the dump is
-                // cheap. Reading one file for the interfaces that have a
-                // device behind them costs nothing by comparison, and the
-                // count is load-bearing: the autodetection looks for
-                // interfaces that hand out virtual functions, and the
-                // exclusions need the netdevs of those functions.
+                // Not from the dump: IFLA_NUM_VF is only sent with
+                // RTEXT_FILTER_VF, which makes every driver with VFs answer
+                // out of its firmware - avoiding it is why the dump is cheap.
+                // One file per device-backed interface costs nothing by
+                // comparison, and the count is load-bearing: autodetection
+                // looks for interfaces handing out VFs, and the exclusions
+                // need their netdevs.
                 numvfs: if has_device {
                     read_trim(base.join("device/sriov_numvfs"))
                         .and_then(|s| s.parse().ok())
@@ -449,9 +423,9 @@ impl Topology {
             out.push(link);
         }
         // A master relation is a lower relation seen from the other side, and
-        // assemble() derives the inverse edges anyway - but `lowers` has to
-        // hold both kinds, because that is what sysfs puts there and what
-        // every walk in here expects.
+        // assemble() derives the inverse edges anyway - but `lowers` holds
+        // both kinds, because that is what sysfs puts there and what every
+        // walk expects.
         let mut ports: Vec<(u32, u32)> = Vec::new();
         for l in &out {
             if let Some(m) = l.master {
@@ -471,9 +445,8 @@ impl Topology {
     }
 
     /// Build a topology from links whose relations are already indices, and
-    /// work out the inverse relations. Both the reading of /sys and the test
-    /// fixtures come through here, so neither can end up with a view of the
-    /// host the other does not have.
+    /// work out the inverse relations. The /sys reading and the fixtures both
+    /// come through here, so neither can see a host the other cannot.
     pub(crate) fn assemble(links: Vec<Link>, by_name: Map<String, u32>) -> Self {
         // Collected while the links are still a list: reading them out of the
         // map afterwards is a second walk over every one of them, and on a
@@ -591,10 +564,8 @@ impl Topology {
         false
     }
 
-    /// Everything at or below `roots`, the walk `leads_to` does turned the
-    /// other way up. One walk down from the bridge answers for every
-    /// interface at once, where asking each interface whether it leads to the
-    /// bridge walks the same edges once per interface.
+    /// Everything at or below `roots`: `leads_to` turned the other way up,
+    /// one walk down answering for every interface at once.
     pub fn subtree_of(&self, roots: &[u32]) -> Set<u32> {
         self.flood(roots, |l| &l.lowers)
     }
@@ -614,10 +585,9 @@ impl Topology {
     }
 
     /// The physical functions behind an interface - the PFs whose VF
-    /// addresses must never be registered through it (invariant 2).
-    /// A VF names its function's netdevs; a PF is its own; a bond has none
-    /// itself but every member's, because the kernel spreads its entries
-    /// over all of them. Empty means: no card behind this at all.
+    /// addresses must never be registered through it (invariant 2). A VF
+    /// names its function's netdevs; a PF is its own; a bond none itself but
+    /// every member's. Empty: no card behind this.
     pub fn physical_functions(&self, dev: u32) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         let mut seen = crate::hash::set();
@@ -660,11 +630,10 @@ impl Topology {
         }
     }
 
-    /// What a pair is made of. One answer to the four questions every
-    /// invariant used to ask separately, computed once per pass:
-    /// `port` is where the wire comes in (invariant 1), `functions` are
-    /// the cards whose VF addresses stay out (invariant 2), `card` holds
-    /// the filter the capacity is measured on.
+    /// What a pair is made of, computed once per pass: `port` is where the
+    /// wire comes in (invariant 1), `functions` the cards whose VF addresses
+    /// stay out (invariant 2), `card` holds the filter the capacity is
+    /// measured on.
     pub fn anatomy(&self, dev: u32, bridge: u32) -> Option<Anatomy> {
         let port = self.uplink_port(dev, bridge)?;
         let card = self.filter_carrier(dev);
@@ -698,13 +667,13 @@ impl Topology {
         }
     }
 
-    /// The interface of `bridge` under which `dev` sits; `dev` itself when it
-    /// is enslaved directly. `None` when the master chain does not reach that
-    /// bridge at all. It used to fall back to `dev` in that case, and the
-    /// fallback was a hole in invariant 1: a pass working with a detached
-    /// device as the port classifies nothing as wire - `e.ifindex == port`
-    /// never matches - and registers the cable's own peers into the filter.
-    /// A bond-member flap or an `ifreload -a` opens exactly that window.
+    /// The interface of `bridge` under which `dev` sits; `dev` itself when
+    /// enslaved directly; `None` when the master chain does not reach that
+    /// bridge. No fallback to `dev`: a pass working with a detached device as
+    /// the port classifies nothing as wire and registers the cable's own
+    /// peers
+    /// - a bond-member flap or an `ifreload -a` opens exactly that window
+    ///   (invariant 1).
     pub fn uplink_port(&self, dev: u32, bridge: u32) -> Option<u32> {
         match self.bridge_above(dev) {
             Some((br, port)) if br == bridge => Some(port),
@@ -722,9 +691,8 @@ impl Topology {
     }
 
     /// Whether an interface can be an uplink at all: a card of its own, or a
-    /// VLAN interface with a card somewhere below. A bond is neither - its
-    /// members are the candidates, the bond is only their port - and so
-    /// nothing else stacked or enslaved is.
+    /// VLAN interface with a card below. A bond is neither - its members are
+    /// the candidates, the bond only their port.
     fn could_be_uplink(&self, link: &Link) -> bool {
         if link.numvfs > 0 || !link.pf_netdevs.is_empty() {
             return true;
@@ -735,11 +703,11 @@ impl Topology {
                 .is_empty()
     }
 
-    /// The pairs this host wants: every interface that could be an uplink
-    /// and ends up in a bridge, one pair per (functions, bridge). Two vports
-    /// of one eSwitch must not both claim a bridge's addresses - a VF and its
-    /// PF, or two sister VFs - and which of them is the port is arbitrary,
-    /// so the first in name order wins and the rest are reported.
+    /// The pairs this host wants: every interface that could be an uplink and
+    /// ends up in a bridge, one pair per (functions, bridge). Two vports of
+    /// one eSwitch must not both claim a bridge's addresses, and which is the
+    /// port is arbitrary, so the first in name order wins and the rest are
+    /// reported.
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut taken: Vec<(Vec<u32>, u32, String)> = Vec::new(); // functions, bridge, by
@@ -903,10 +871,9 @@ pub(crate) mod fixture {
             self
         }
 
-        /// Every PF netdev of a virtual function's PCI function, for the
-        /// multiport-shared-function case where `physfn/net` lists more than
-        /// one. Resolved the way production does: sorted by index, with
-        /// `physfn` the lowest - build() takes care of both.
+        /// Every PF netdev of a VF's PCI function, for the multiport
+        /// shared-function case. Resolved as production does: sorted by
+        /// index, `physfn` the lowest - build() takes care of both.
         pub fn pf_netdevs(mut self, pfs: &[&str]) -> Self {
             self.last_names().pf_netdevs = pfs.iter().map(|p| p.to_string()).collect();
             self
@@ -942,10 +909,9 @@ pub(crate) mod fixture {
                         n.pf_netdevs.clone()
                     };
                     l.pf_netdevs = pf_names.iter().filter_map(idx).collect();
-                    // The same resolution production applies: sorted, and
-                    // physfn names the lowest-numbered netdev of the
-                    // function - a fixture state production cannot produce
-                    // is a state not worth testing against.
+                    // The same resolution production applies: sorted, physfn
+                    // the lowest-numbered netdev - a fixture state production
+                    // cannot produce is not worth testing.
                     l.pf_netdevs.sort_unstable();
                     if let Some(&first) = l.pf_netdevs.first() {
                         l.physfn = Some(first);
@@ -1149,10 +1115,10 @@ mod tests {
         );
     }
 
-    /// The same rule on a card whose four ports share one PCI function, where
-    /// `physfn` names an arbitrary one of them. The port holding the bridge
-    /// is deliberately the last, so a check that asks only the first is
-    /// answered "no conflict" and takes the VF - the failure this guards.
+    /// The same rule on a card whose four ports share one PCI function. The
+    /// port holding the bridge is deliberately the last, so a check asking
+    /// only the first answers "no conflict" and takes the VF - the failure
+    /// this guards.
     #[test]
     fn autodetect_asks_every_port_of_a_shared_function() {
         let t = Builder::new()
@@ -1188,10 +1154,9 @@ mod tests {
         );
     }
 
-    /// Which interface really holds a filter. A VLAN interface has none of
-    /// its own - the kernel keeps its entries on the interface below - while
-    /// a bond has one per member and carries its own. Both relations arrive
-    /// as `lowers`, so telling them apart is the whole point.
+    /// Which interface really holds a filter: a VLAN interface has none of
+    /// its own, a bond has one per member and its own. Both relations arrive
+    /// as `lowers`, so telling them apart is the point.
     #[test]
     fn a_vlan_shares_the_filter_below_it_but_a_bond_does_not() {
         let t = Builder::new()
@@ -1238,10 +1203,9 @@ mod tests {
         );
     }
 
-    /// A virtual function that reaches its bridge through a VLAN interface.
-    /// The VLAN interface is what sits in the bridge, so that is the uplink;
-    /// without this the host has to be configured by hand and loses the
-    /// orphan sweep with it.
+    /// A VF that reaches its bridge through a VLAN interface: the VLAN
+    /// interface sits in the bridge, so that is the uplink; without this the
+    /// host must be configured by hand and loses the orphan sweep.
     #[test]
     fn autodetect_finds_an_uplink_that_hangs_in_through_a_vlan() {
         let t = Builder::new()
@@ -1299,10 +1263,10 @@ mod tests {
         assert!(pairs.is_empty(), "a tunnel is no uplink, got {pairs:?}");
     }
 
-    /// 1b: the sister rule judges by the card, not by the interface in the
-    /// bridge. A VLAN of a VF must decline a bridge its PF already carries -
-    /// asked of the VLAN interface, whose netdev list is empty, the rule
-    /// let it through.
+    /// 1b: the sister rule judges by the card, not the interface in the
+    /// bridge. A VLAN of a VF must decline a bridge its PF already carries;
+    /// asked of the VLAN interface, whose netdev list is empty, the rule let
+    /// it through.
     #[test]
     fn a_vlan_uplink_declines_a_bridge_its_pf_carries() {
         // The PF sorts AFTER the VLAN interface on purpose: the "already
@@ -1334,9 +1298,8 @@ mod tests {
     }
 
     /// 1c: a bond has no card of its own but every member's. Named as an
-    /// uplink by hand, its exclusion set has to reach the sister VFs of
-    /// each member's function - the worst failure direction this program
-    /// has ran through the bond, which answered with an empty list.
+    /// uplink by hand, its exclusion set must reach each member's sister VFs
+    /// - the bond used to answer with an empty list.
     #[test]
     fn a_bond_answers_with_its_members_functions() {
         let t = Builder::new()
@@ -1533,29 +1496,9 @@ mod tests {
         assert_eq!(below(&t, "a").len(), 0);
     }
 
-    /// The netlink reading and the sysfs walk have to agree about this host,
-    /// whatever host that is. They are two descriptions of one thing, and the
-    /// one that is not used every day is the one that would drift.
-    ///
-    /// The two readings are separate moments, so a host that changes between
-    /// them disagrees with itself: this caught `enp7s0` joining a bridge
-    /// mid-test, reported it as a defect, and passed on the next run. A
-    /// disagreement therefore has to survive being looked at again - a real
-    /// difference in how the two are built survives any number of readings,
-    /// a host in motion does not.
-    ///
-    /// Skipped where a netlink socket cannot be opened at all - some build
-    /// containers - because there is then nothing to compare against.
-    /// The kernel counts the ageing time in clock_t - hundredths of a
-    /// second - and everything above works in milliseconds. The factor is
-    /// the whole of the conversion, and getting it wrong by ten dates every
-    /// deletion thirty seconds or fifty minutes into the past instead of
-    /// five minutes. Both harnesses build their bridges at the default,
-    /// where the dating provably cannot move a stamp, so nothing else here
-    /// would notice.
-    /// Of the stacked kinds only a VLAN writes into the filter below it -
-    /// a tunnel's guests never reach the underlay. Decided where the kind
-    /// is still known: on the way in.
+    /// Of the stacked kinds only a VLAN writes into the filter below it - a
+    /// tunnel's guests never reach the underlay. Decided where the kind is
+    /// still known: on the way in.
     #[test]
     fn only_a_vlan_shares_the_filter_below_it() {
         let link = |index, name: &str, kind: &str| crate::netlink::LinkInfo {
@@ -1598,6 +1541,11 @@ mod tests {
         assert_eq!(topo.filter_carrier(21), 21);
     }
 
+    /// The kernel counts the ageing time in clock_t hundredths; everything
+    /// above works in milliseconds. A factor wrong by ten dates every deletion
+    /// thirty seconds or fifty minutes into the past instead of five, and both
+    /// harnesses build their bridges at the default, where the dating provably
+    /// cannot move a stamp - nothing else would notice.
     #[test]
     fn the_ageing_time_arrives_in_milliseconds() {
         let topo = Topology::from_links(vec![crate::netlink::LinkInfo {
@@ -1628,6 +1576,12 @@ mod tests {
         assert_eq!(none.at(10).and_then(|l| l.ageing_ms), None);
     }
 
+    /// The netlink reading and the sysfs walk have to agree about this host,
+    /// whatever host that is; the one not used every day is the one that
+    /// would drift. The two readings are separate moments, so a host that
+    /// changes between them disagrees with itself (this caught `enp7s0`
+    /// joining a bridge mid-test): a disagreement has to survive being
+    /// looked at again. Skipped where no netlink socket can be opened.
     #[test]
     fn the_kernel_and_the_filesystem_describe_the_same_host() {
         let mut sock = match crate::netlink::Socket::new() {

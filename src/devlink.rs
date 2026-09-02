@@ -1,18 +1,12 @@
-//! One question, asked over generic netlink: how many unicast addresses does
-//! this card's filter actually hold?
+//! One question over generic netlink: how many unicast addresses does this
+//! card's filter hold?
 //!
-//! Everything else this daemon does is rtnetlink, and stays rtnetlink -
-//! devlink has no forwarding database, no unicast filter and no neighbour
-//! notifications, so it cannot do the work. What it does have is the one
-//! number this program otherwise guesses: `max_macs`, a generic devlink
-//! parameter meaning the per-port MAC capacity. On a ConnectX-4 Lx it reads
-//! 128, which is exactly the figure this project arrived at by experiment -
-//! with 257 entries a given address still worked, with 513 it did not.
-//!
-//! The list is finite, silently drops addresses past its end, and its size
-//! was documented here as unqueryable. It is queryable, on the drivers that
-//! register the parameter, and warning against a card's real capacity beats
-//! warning against a constant.
+//! Everything else is rtnetlink and stays so - devlink has no forwarding
+//! database, no unicast filter, no neighbour notifications. What it has is
+//! the one number this program otherwise guesses: `max_macs`, the per-port
+//! MAC capacity. On a ConnectX-4 Lx it reads 128, exactly the figure the
+//! experiment arrived at (257 entries still worked, 513 did not). Warning
+//! against a card's real capacity beats warning against a constant.
 
 use crate::netlink::{attrs, put_attr, put_nlmsghdr, Socket, NLMSG_HDR, NLM_F_DUMP, NLM_F_REQUEST};
 use std::io;
@@ -43,24 +37,20 @@ const DEVLINK_ATTR_PARAM_VALUE_CMODE: u16 = 87; // the tests still emit it, as t
 
 const MAX_MACS: &str = "max_macs";
 
-/// A capacity as one device reported it. A parameter can be offered
-/// several times - what is in effect now, what the driver would start
-/// with, what is burnt in - and the lowest number wins, because it is the
-/// one a filter can actually be pushed past. Which mode said it does not
-/// matter for that: only the value is ever read out.
+/// A capacity as one device reported it. A parameter can be offered several
+/// times (in effect, driver default, burnt in) and the lowest wins: it is the
+/// one a filter can actually be pushed past.
 struct Reported {
     bus: String,
     dev: String,
     value: u32,
 }
 
-/// The PCI address behind a network interface, and the one behind its
-/// physical function if it has one.
-///
-/// The uplink here is often a virtual function - that is the arrangement that
-/// survives an unplugged switch - and on `mlx5` a VF answers for `max_macs`
-/// itself. Where a driver only registers the parameter on the physical
-/// function, asking that instead is the difference between an answer and none.
+/// The PCI address behind a network interface, and its physical function's if
+/// it has one. The uplink is often a VF - the arrangement that survives an
+/// unplugged switch - and on `mlx5` a VF answers for `max_macs` itself; where
+/// a driver registers the parameter only on the PF, asking that is the
+/// difference between an answer and none.
 fn pci_addresses(netdev: &str) -> Vec<String> {
     let base = Path::new("/sys/class/net").join(netdev);
     let mut out = Vec::new();
@@ -209,11 +199,10 @@ pub struct Capacities {
     reported: Vec<Reported>,
 }
 
-/// One devlink reading. `Ok(None)` is a kernel without devlink - the
-/// controller answers the family question with ENOENT, which is the
-/// ordinary state of most hosts, not an error. Everything else that goes
-/// wrong says why: "the card did not answer" and "this program asked
-/// wrongly" look identical from the threshold and are not the same bug.
+/// One devlink reading. `Ok(None)` is a kernel without devlink (ENOENT on the
+/// family question), the ordinary state of most hosts. Everything else says
+/// why: "the card did not answer" and "this program asked wrongly" look
+/// identical from the threshold.
 pub fn read() -> Result<Option<Capacities>, String> {
     let mut sock = Socket::generic().map_err(|e| format!("no generic netlink socket: {e}"))?;
     let family = match resolve_family(&mut sock) {
@@ -241,10 +230,8 @@ impl Capacities {
     }
 
     /// The device itself first, its physical function only if that said
-    /// nothing: a virtual function that answers for itself is answering
-    /// about the vport this daemon actually writes to. Per device the
-    /// smallest of the offered modes binds - it is the one a filter can
-    /// actually be pushed past.
+    /// nothing: a VF answering for itself answers about the vport this daemon
+    /// writes to. Per device the smallest offered mode binds.
     fn for_pci(&self, wanted: &[String]) -> Option<u32> {
         for pci in wanted {
             let best = self

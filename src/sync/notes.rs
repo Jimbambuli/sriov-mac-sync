@@ -1,16 +1,14 @@
 //! The ownership notes: which addresses this daemon put into which card.
 //!
-//! Everything here serves one invariant - an entry in a card's filter that
-//! this daemon added must always have a line on record saying so, or nothing
-//! will ever take it back out. The note files in the state directory are the
-//! truth (a --once or --flush from a second process writes them while the
-//! daemon runs), the in-memory copies are only ever a stat-checked shortcut
-//! to them, and every writer holds the note's lock across its whole window.
-//! The sweeps in the parent module lean on that: they read, unregister and
-//! unlink under the same lock, through the write that assumes it rather than
-//! the one that takes it.
+//! One invariant: an entry this daemon added must always have a line on
+//! record saying so, or nothing will ever take it back out. The files in the
+//! state directory are the truth (a --once or --flush from a second process
+//! writes them while the daemon runs), the in-memory copies a stat-checked
+//! shortcut, and every writer holds the note's lock across its whole window;
+//! the sweeps in the parent module read, unregister and unlink under that
+//! same lock.
 //!
-//! pub(super), the lot of it: this is sync's inner organ, not an interface.
+//! pub(super), the lot of it: sync's inner organ, not an interface.
 
 use super::*;
 use crate::note;
@@ -38,10 +36,9 @@ impl Note {
     }
 }
 
-/// The first line of the quiet-keep memory file: what the numbers in it
-/// mean. Bumped whenever that changes, so an older or newer file is
-/// ignored rather than misread - losing it costs the keeps for one ARP
-/// cycle, which is what every build before the file existed did anyway.
+/// Format marker of the quiet-keep memory file, bumped whenever the numbers'
+/// meaning changes: an older or newer file is ignored, which costs the keeps
+/// for one ARP cycle.
 const PORTS_FORMAT: &str = "sriov-mac-sync ports 3";
 
 impl Syncer {
@@ -57,23 +54,14 @@ impl Syncer {
         self.state_dir.join(format!(".{dev}.owned.ports"))
     }
 
-    /// Milliseconds since this boot, the clock the quiet memory is stamped
-    /// in.
+    /// Milliseconds since boot, the clock the quiet memory is stamped in.
     ///
-    /// `Instant` cannot be written down and read back, and a wall clock can
-    /// step backwards under NTP. `CLOCK_BOOTTIME` counts monotonically from
-    /// boot, suspends included, which is exactly as long as the memory is
-    /// allowed to mean anything: the state directory lives in a tmpfs and
-    /// starts empty after a reboot, so a stamp and the clock that reads it
-    /// always come from the same boot.
-    ///
-    /// Milliseconds, not something finer: between two passes this daemon
-    /// is blind anyway, so the resolution that matters is the pass
-    /// cadence, and finer digits would only claim a precision the
-    /// observation does not have. Two passes landing in one tick - which
-    /// would make everything read as loud, since quiet means "stamped
-    /// before the last pass" - are told apart by the caller nudging the
-    /// pass stamp past its predecessor, not by counting nanoseconds.
+    /// `Instant` cannot be written down, a wall clock steps under NTP;
+    /// `CLOCK_BOOTTIME` counts monotonically from boot, suspends included -
+    /// and the memory lives in a tmpfs that starts empty after a reboot, so
+    /// stamp and clock always come from the same boot. Milliseconds because
+    /// between passes this daemon is blind anyway; two passes in one tick are
+    /// told apart by the caller nudging the pass stamp, not by nanoseconds.
     pub(super) fn boot_millis() -> u64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -88,40 +76,31 @@ impl Syncer {
             .saturating_add(ts.tv_nsec.max(0) as u64 / 1_000_000)
     }
 
-    /// The quiet memory as it was last written: which bridge port each owned
-    /// address was learnt behind, and when the bridge was last seen holding
-    /// it. Every owned learnt address has a line, the live ones included -
-    /// what makes one quiet is that its stamp is older than the last pass.
+    /// The quiet memory as last written: which bridge port each owned address
+    /// was learnt behind, and when the bridge last held it. Every owned
+    /// learnt address has a line; quiet is the one whose stamp is older than
+    /// the last pass.
     ///
-    /// Beside the note rather than in it, so the note stays a plain list of
-    /// addresses that any build of this program can read - the same
-    /// reasoning as the index record. The first line is the format marker
-    /// `sriov-mac-sync ports 3`, without which the whole file is ignored;
-    /// each line after it is
+    /// Beside the note, not in it, so the note stays a plain address list any
+    /// build can read (as with the index record). The first line is the
+    /// marker `sriov-mac-sync ports 3`; each line after it is
     ///
-    ///     <address> <port-name> <port-ifindex> <last-seen-millis>
+    /// <address> <port-name> <port-ifindex> <last-seen-millis>
     ///
-    /// where the stamp counts from boot. The port is written both ways on
-    /// purpose: the index is what the
-    /// pass works in, and the caller only believes a line whose name still
-    /// carries that very index. An interface that was replaced under the
-    /// same name, or a name that moved, therefore loses its memory rather
-    /// than inheriting somebody else's.
+    /// The port is written both ways: a line is believed only while the name
+    /// still carries that very index, so a replaced or moved interface loses
+    /// its memory instead of inheriting somebody else's.
     ///
-    /// Best-effort in both directions. This file is evidence, never
-    /// ownership: losing it costs the keeps and nothing else, which is
-    /// exactly what every build before it did.
+    /// Evidence, never ownership: losing the file costs the keeps and nothing
+    /// else.
     pub(super) fn read_ports(&self, dev: &str) -> Vec<(Mac, String, u32, u64)> {
         let Ok(text) = fs::read_to_string(self.ports_path(dev)) else {
             return Vec::new();
         };
-        // The first line says what the numbers mean. Without it this
-        // silently mis-read a file whose stamps meant something else - the
-        // format once recorded when an address went missing, in
-        // milliseconds, and reading those as "last seen, in nanoseconds"
-        // made every carried-over entry look silent since boot. A file
-        // this run does not recognise is no memory, which is the same
-        // thing every build before the file existed did.
+        // The first line says what the numbers mean: an unrecognised file is
+        // no memory. (An earlier format recorded a different quantity, and
+        // reading it as this one made every carried entry look silent since
+        // boot.)
         let mut lines = text.lines();
         if lines.next() != Some(PORTS_FORMAT) {
             return Vec::new();
@@ -148,12 +127,10 @@ impl Syncer {
     }
 
     /// Write the quiet memory, under the note's lock and through a temporary
-    /// file - the same rules the note itself is written by, for the same
-    /// reasons. Says so once per device when it cannot, and then carries on:
-    /// the memory still works in this process, it just will not outlive it.
-    /// Precondition: `lines` sorted and non-empty - the one caller sorts
-    /// for its change comparison anyway, and hands the empty case to the
-    /// file's removal instead.
+    /// file, like the note itself. Says so once per device when it cannot,
+    /// then carries on: the memory still works in this process. Precondition:
+    /// `lines` sorted and non-empty - the caller sorts for its change
+    /// comparison and hands the empty case to removal.
     pub(super) fn write_ports(&self, dev: &str, lines: &[String]) -> bool {
         let text = format!("{PORTS_FORMAT}\n{}\n", lines.join("\n"));
         if let Err(e) = self.put_file(&self.ports_path(dev), &text) {
@@ -169,23 +146,18 @@ impl Syncer {
         true
     }
 
-    /// Record which interface a device's note is about - beside the note,
-    /// not in it, so the note stays a plain list of addresses that any
-    /// build of this program can read.
+    /// Record which interface a device's note is about - beside the note, so
+    /// the note stays a plain address list.
     ///
-    /// A note is found by interface name, and a name is the one thing a
-    /// rename takes away while the interface, its filter entries and its
-    /// index all live on. The recorded index is what lets the orphan sweep
-    /// and --flush tell that case from a device that is really gone.
-    /// Within one boot an index identifies an interface outright: the
-    /// kernel hands them out from a per-namespace counter that does not
-    /// re-use one, and /run does not outlive a boot either.
+    /// A note is found by name, and a name is the one thing a rename takes
+    /// away while interface, entries and index live on; the recorded index
+    /// lets the orphan sweep and --flush tell a rename from a device really
+    /// gone. Within one boot an index identifies an interface outright: the
+    /// kernel never re-uses one, and /run does not outlive a boot.
     ///
-    /// Best-effort, on purpose: without the record a rename is simply not
-    /// followed, which is all this program ever did. The value is cached
-    /// so the write happens when the answer changes, not once per pass -
-    /// and cached even when the write fails, so the warning is said once
-    /// rather than becoming a line per pass forever.
+    /// Best-effort: without the record a rename is simply not followed.
+    /// Cached so the write happens when the answer changes, and cached even
+    /// on a failed write so the warning is said once.
     pub(super) fn note_index(&self, dev: &str, index: u32) {
         if self.indices.borrow().get(dev) == Some(&index) {
             return;
@@ -203,10 +175,9 @@ impl Syncer {
         self.indices.borrow_mut().insert(dev.to_string(), index);
     }
 
-    /// The interface index recorded for a device's note, if any run of
-    /// this program ever recorded one. Read from the file, not the cache:
-    /// the callers are the rename paths, which mostly run in a process
-    /// that never stamped the record itself.
+    /// The index recorded for a device's note, if any run recorded one. Read
+    /// from the file, not the cache: the rename paths mostly run in a process
+    /// that never stamped it.
     pub(super) fn noted_index(&self, dev: &str) -> Option<u32> {
         fs::read_to_string(self.index_path(dev))
             .ok()?
@@ -229,31 +200,21 @@ impl Syncer {
         self.indices.borrow_mut().remove(dev);
     }
 
-    /// The directory the notes live in, made if it is not there - and made
-    /// reachable by nobody but the user that runs this.
+    /// The directory the notes live in, made if absent, reachable by nobody
+    /// but the user running this.
     ///
-    /// `create_dir_all` asks for 0777 and lets the process umask take bits
-    /// off it, so the mode of this directory would be decided by whatever the
-    /// daemon happened to be started with. A umask of 0 - which is what a
-    /// process started by a unit that does not set one inherits on some
-    /// systems - leaves it writable by everybody, and then any local user can
-    /// replace a note, or put a symlink where one goes and have this daemon,
-    /// which is root, write through it. 0700 is asked for outright.
+    /// `create_dir_all` asks for 0777 minus umask, so the mode would depend
+    /// on how the daemon was started; a umask of 0 leaves it world-writable,
+    /// and any local user could replace a note or plant a symlink for a root
+    /// daemon to write through. 0700 is asked for outright.
     ///
-    /// A directory that is already there is looked at rather than trusted,
-    /// because it outlives the process that made it: the packaged unit keeps
-    /// it across restarts on purpose, so a directory made by an older build,
-    /// or by a hand, is the one this run writes into.
-    ///
-    /// What is narrowed is a directory another user may *write*, which is the
-    /// one that decides what a root daemon does. One others may only read is
-    /// left alone: that is what a source install produces, where systemd
-    /// makes the directory 0755 for a unit that names no
-    /// `RuntimeDirectoryMode=` (the packaged one sets 0700) - and a daemon
-    /// that
-    /// changed it back on every start would be a warning a day and an
-    /// argument it cannot win. The notes themselves are 0600 either way, so
-    /// there is nothing to read through it.
+    /// An existing directory is looked at, not trusted: it outlives the
+    /// process, so one made by an older build or by hand is the one this run
+    /// writes into. Narrowed is only a directory others may *write*. One
+    /// others may only read is left alone: a source install under a unit
+    /// without `RuntimeDirectoryMode=` gets 0755 from systemd, and changing
+    /// it back every start would be a warning a day. The notes themselves are
+    /// 0600 either way.
     pub fn ensure_state_dir(&self) -> io::Result<()> {
         // `recursive` returns Ok for a directory that was already there, and
         // leaves its mode alone - hence the check that follows.
@@ -283,20 +244,15 @@ impl Syncer {
         Ok(())
     }
 
-    /// What this daemon put there itself. Kept on disk so a restart does not
-    /// have to choose between forgetting its entries and claiming everybody
-    /// else's.
+    /// What this daemon put there itself, on disk so a restart neither
+    /// forgets its entries nor claims everybody else's.
     ///
-    /// The file is the truth, and it has to be: `--once` and `--flush` write
-    /// these same files while the daemon runs, and a daemon working from a
-    /// remembered copy would carry on believing it owns entries somebody has
-    /// since taken from it - and never clean them up again. That was a real
-    /// bug once and is not being reintroduced.
-    ///
-    /// What is remembered is the file's identity - inode, size, timestamp -
-    /// so *checking* the copy costs one stat instead of an open, a read and a
-    /// close. Any writer changes at least one of the three: this daemon and
-    /// --flush both replace the file through rename, which changes the inode.
+    /// The file is the truth: --once and --flush write these files while the
+    /// daemon runs, and a daemon believing a remembered copy would go on
+    /// owning entries somebody has since taken - and never clean them up.
+    /// What is remembered is the file's identity (inode, size, timestamp), so
+    /// *checking* the copy costs a stat; any writer changes at least one of
+    /// the three - this daemon and --flush replace through rename.
     pub(super) fn load_owned(&self, dev: &str) -> Set<Mac> {
         self.with_owned(dev, |s| s.clone())
     }
@@ -312,17 +268,13 @@ impl Syncer {
             Err(_) => false,
         };
         if !usable {
-            // Stat, read, stat again - and believe the copy only when the
-            // file did not move under the read. Without it, a note
-            // replaced between the read and `remember` was cached with
-            // the NEW file's identity and the OLD file's contents, and
-            // believed until something changed it again; the timestamp
-            // guard cannot see that, because inode mtimes come from the
-            // coarse clock and lag a fine-clock sample by milliseconds.
-            // Not unit-pinned: the window needs a second writer landing
-            // inside one read, which no deterministic test can arrange -
-            // what the suite does pin is that a replaced file is read
-            // again even when it kept the old timestamp.
+            // Stat, read, stat again, and believe the copy only when the file
+            // did not move under the read: a note replaced between read and
+            // `remember` was otherwise cached with the NEW identity and OLD
+            // contents, and the timestamp guard cannot see it (inode mtimes
+            // come from the coarse clock). Not unit-pinned - the window needs
+            // a second writer inside one read; the suite pins that a replaced
+            // file is read again even under the old timestamp.
             let before = fs::metadata(self.state_path(dev)).ok();
             let set = self.read_owned(dev);
             let after = fs::metadata(self.state_path(dev)).ok();
@@ -338,45 +290,35 @@ impl Syncer {
                 // `after` is Some here: `steady` cannot be true otherwise.
                 self.remember(dev, &set, after.as_ref());
             } else if self.note_is_readable(dev) {
-                // Readable, but it moved while we read it. The set is
-                // whatever we got; the next look reads again rather than
-                // trusting it. The index record lives beside the note and
-                // moves with it - a --flush from a second terminal
-                // unlinks both - so the cached index goes too, or
-                // note_index short-circuits for the life of the process
-                // and a later rename is read as a disappearance.
+                // Readable, but it moved while we read it: the set is
+                // whatever we got, the next look reads again. The cached
+                // index goes too - the record lives beside the note and a
+                // second-terminal --flush unlinks both - or note_index
+                // short-circuits for the life of the process and a later
+                // rename reads as a disappearance.
                 self.notes.borrow_mut().remove(dev);
                 self.indices.borrow_mut().remove(dev);
                 return f(&set);
             } else {
-                // The read failed, and what `read_owned` returns then is an
-                // empty set that means "could not tell", not "owns nothing".
-                // Remembering it would be worse than the failure: the copy is
-                // believed for as long as the file's identity, size and
-                // timestamp do not change, and a file this could not read is
-                // a file nothing changed - so one unreadable moment would be
-                // taken as the answer for good, long after whatever caused it
-                // had gone. Every entry the note names would stay in the card
-                // with nothing on record saying it is ours, which is the
-                // orphan the notes exist to prevent.
-                //
-                // Nothing on record instead, so the next look reads the file
-                // again and the device comes back the moment it can be read.
+                // The read failed: `read_owned` then returns "could not
+                // tell", not "owns nothing". Remembering that would be worse
+                // than the failure - the copy is believed while identity,
+                // size and timestamp hold, and a file this could not read is
+                // a file nothing changed, so one unreadable moment would
+                // stand for good and every entry the note names would sit in
+                // the card with nothing on record. Nothing on record instead,
+                // so the next look reads again.
                 self.notes.borrow_mut().remove(dev);
-                // The index record lives beside the note and goes with it -
-                // a --flush from a second terminal unlinks both. Without
-                // this the cached index short-circuits every later write,
-                // the record is never recreated, and rename-following
-                // stays dead for the life of the process: a renamed uplink
-                // then keeps its entries with no note that can reach them.
+                // The index record goes with the note - a second-terminal
+                // --flush unlinks both. Otherwise the cached index
+                // short-circuits every later write and rename-following stays
+                // dead for the life of the process.
                 self.indices.borrow_mut().remove(dev);
             }
         }
-        // The shared borrow of `notes` is held while `f` runs. Nothing `f`
-        // does today reaches back into these notes - and nothing may: a
-        // callback that calls load_owned, read_owned or remember here is an
-        // immediate double-borrow panic, which the release profile turns
-        // into an abort.
+        // The shared borrow of `notes` is held while `f` runs: a callback
+        // that calls load_owned, read_owned or remember here is a
+        // double-borrow panic, an abort in the release profile.
         match self.notes.borrow().get(dev) {
             Some(note) => f(&note.macs),
             // Nothing on record: no file, or one that could not be read.
@@ -384,15 +326,14 @@ impl Syncer {
         }
     }
 
-    /// Note what was just read or written, together with what the file looks
-    /// like now, so the next read can be a stat.
+    /// Note what was just read or written, with what the file looks like now,
+    /// so the next read can be a stat.
     ///
-    /// `meta` is what the caller already knows the file to be. `with_owned`
-    /// passes the stat it took *after* the read and proved identical to the
-    /// one before it: taking a third, later stat here would cache old
-    /// contents under a newer file's identity, which is the very window the
-    /// read-steadiness check was added to close. Callers that have just
-    /// written the file pass `None` and let this look.
+    /// `meta` is what the caller knows the file to be: `with_owned` passes
+    /// the stat it took *after* the read and proved identical to the one
+    /// before - a third, later stat here would cache old contents under a
+    /// newer identity, the window the steadiness check closes. Callers that
+    /// just wrote pass `None`.
     pub(super) fn remember(&self, dev: &str, set: &Set<Mac>, meta: Option<&fs::Metadata>) {
         let looked;
         let meta = match meta {
@@ -441,15 +382,12 @@ impl Syncer {
                         // take back out of the card. Saying so is all that can
                         // be done, but silence would look like health.
                         None => eprintln!(
-                            // Its NUMBER and LENGTH, never its bytes. What
-                            // is being read here is whatever file carries
-                            // the device's name, and `noted_devices` lists
-                            // the state directory without asking what kind
-                            // of file it found: a symlink called
-                            // `zzz.owned` pointing at /etc/shadow would
+                            // Its NUMBER and LENGTH, never its bytes:
+                            // whatever file carries the device's name is read
+                            // here, `noted_devices` does not ask what kind,
+                            // and a symlink `zzz.owned` at /etc/shadow would
                             // otherwise have its contents copied into the
-                            // journal, line by line, by a daemon that runs
-                            // as root.
+                            // journal by a root daemon.
                             "warning: {}: unreadable line {} ({} bytes) in the \
                              ownership note, the entry it named is now nobody's",
                             self.state_path(dev).display(),
@@ -462,14 +400,11 @@ impl Syncer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 // Not the same as owning nothing, and the difference is
-                // destructive: a pass would rename a fresh note over it, and
-                // --flush and the orphan sweep would unlink it - in every
-                // case abandoning entries that are still in the card with
-                // nothing left to say they are ours.
-                // Said when it starts, not on every attempt: the file is
-                // read again on every look for as long as it cannot be read -
-                // that is what stops one bad moment becoming permanent - and
-                // a look happens per batch of learning.
+                // destructive: a pass would rename a fresh note over it,
+                // --flush and the orphan sweep would unlink it - abandoning
+                // entries still in the card. Said when it starts, not per
+                // attempt: the file is read again on every look for as long
+                // as it cannot be read, and a look happens per batch.
                 if self.said.borrow_mut().unreadable.insert(dev.to_string()) {
                     eprintln!(
                         "warning: cannot read {}: {e} - leaving that device alone \
@@ -497,19 +432,16 @@ impl Syncer {
 
     /// Hold the note against everybody else while it is rewritten.
     ///
-    /// `--once` and `--flush` are run by hand while the daemon is running,
-    /// and a pass takes long enough for that to happen inside one: a single
-    /// filter write has been measured waiting seconds on rtnl. Whoever
-    /// renamed last used to keep only its own lines, so an address one of
-    /// them had registered ended up in the card owned by nobody - which is
-    /// the orphan the notes exist to prevent, and which --flush cannot clean
-    /// up because it iterates the notes.
+    /// --once and --flush run by hand beside the daemon, and a pass takes
+    /// long enough for that to land inside one (a single filter write has
+    /// waited seconds on rtnl); whoever renamed last kept only its own lines,
+    /// and an address the other had registered ended up owned by nobody -
+    /// which --flush cannot clean up, because it iterates the notes.
     pub(super) fn locked<R>(&self, dev: &str, f: impl FnOnce() -> R) -> R {
         use std::os::fd::AsRawFd;
-        // Every write to a note goes through here, so this is where the
-        // directory holding them gets its one look per run. An error is not
-        // reported here: whatever it was, the open below runs into it too and
-        // says so with the name of the file somebody is waiting on.
+        // Every write goes through here, so the directory gets its one look
+        // per run. An error is not reported here: the open below runs into it
+        // too and names the file.
         if !self.dir_checked.replace(true) {
             let _ = self.ensure_state_dir();
         }
@@ -519,12 +451,11 @@ impl Syncer {
                 .create(true)
                 .append(true)
                 .mode(0o600)
-                // Never through a symlink, like every other opener here.
-                // Nothing is ever written to this file - it exists to be
-                // flocked - but a state directory that was group-writable
-                // before `ensure_state_dir` narrowed it can hold links
-                // planted earlier, and a refusal here is a degradation the
-                // caller already handles.
+                // Never through a symlink, like every opener here: nothing is
+                // written to this file, but a directory that was
+                // group-writable before `ensure_state_dir` narrowed it can
+                // hold links planted earlier. A refusal is a degradation the
+                // caller handles.
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&path)
         };
@@ -538,14 +469,11 @@ impl Syncer {
         });
         let file = match file {
             Ok(file) => file,
-            // No lock to be had. Carrying on unlocked is what this did
-            // before there was a lock at all; refusing to write would strand
-            // whatever was just registered - so the note still gets written,
-            // and this says what it was written without.
-            //
-            // Once per device: this sits on the path a burst of learning
-            // takes, and a line per batch would bury the one that matters.
-            // A permission or a read-only filesystem does not come and go.
+            // No lock to be had. Refusing to write would strand what was just
+            // registered, so the note is written unlocked and this says so -
+            // once per device: a line per batch on the learning path would
+            // bury the one that matters, and a permission or read-only
+            // filesystem does not come and go.
             Err(e) => {
                 if self.said.borrow_mut().lock.insert(dev.to_string()) {
                     eprintln!(
@@ -559,11 +487,9 @@ impl Syncer {
             }
         };
         let fd = file.as_raw_fd();
-        // The taking of the lock can fail - EINTR, since nothing here sets
-        // SA_RESTART, is the one that actually happens. Failing and running
-        // anyway used to be silent, which is the exact hole the open-failure
-        // warning above was written to close; now it is retried, and a
-        // failure that is not an interruption gets the same warning.
+        // Taking the lock can fail - EINTR, since nothing sets SA_RESTART, is
+        // the one that happens. It is retried; any other failure gets the
+        // same warning as a failed open, rather than running on silently.
         loop {
             if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
                 break;
@@ -592,11 +518,10 @@ impl Syncer {
     /// Write the note as the difference this caller made, not as the set it
     /// started from: whatever else has been added meanwhile stays.
     pub(super) fn save_owned_merged(&self, dev: &str, before: &Set<Mac>, after: &Set<Mac>) {
-        // No caller reaches this today: the one production call site is
-        // gated on the owned set having changed, which a dry run cannot
-        // make happen. It stays because "a dry run writes nothing" is a
-        // promise to the operator, and the cost of keeping the last line
-        // of that promise where the writing happens is one comparison.
+        // No caller reaches this today (the one production site is gated on
+        // the owned set changing, which a dry run cannot cause). It stays
+        // because "a dry run writes nothing" is a promise to the operator,
+        // kept where the writing happens.
         if self.dry_run {
             return;
         }
@@ -617,10 +542,9 @@ impl Syncer {
         })
     }
 
-    /// Seed a note with exactly this set. No production path writes a
-    /// whole set any more - the pass and the reflection both write
-    /// differences, so a parallel writer's lines survive - but the tests
-    /// build their starting states this way.
+    /// Seed a note with exactly this set. No production path writes a whole
+    /// set any more - pass and reflection write differences so a parallel
+    /// writer's lines survive; the tests build starting states this way.
     #[cfg(test)]
     #[cfg(test)]
     pub(super) fn save_owned(&self, dev: &str, set: &Set<Mac>) {
@@ -630,26 +554,21 @@ impl Syncer {
         self.locked(dev, || self.write_owned(dev, set));
     }
 
-    /// The one atomic writer everything on-disk here goes through: a
-    /// temporary file, then a rename onto `dest`.
+    /// The one atomic writer everything on disk goes through: a temporary
+    /// file, then a rename onto `dest`.
     ///
-    /// Through a temporary file because a file truncated by a crash
-    /// mid-write would read as "we own nothing" (the note) or as no memory
-    /// (the ports file). The temporary's name is the destination's with a
-    /// hidden prefix and this process's id appended - a prefix, not a
-    /// suffix, because "eth0.new" is a perfectly legal interface name
-    /// whose own note would otherwise be this file; and the pid because
-    /// the daemon is not the only writer - `--once` and `--flush` are run
-    /// by hand while it is running, and two writers sharing one temporary
-    /// file means one truncates what the other is writing and then renames
-    /// it into place.
+    /// Through a temporary because a file truncated mid-write would read as
+    /// "we own nothing" or as no memory. Its name is the destination's with a
+    /// hidden prefix and this process's pid: a prefix because "eth0.new" is a
+    /// legal interface name whose own note would otherwise be this file; the
+    /// pid because --once and --flush write beside the daemon, and two
+    /// writers sharing one temporary means one truncates what the other
+    /// writes and renames it into place.
     ///
-    /// 0600 rather than what `fs::write` asks for, which is 0666 with the
-    /// process umask taken off it: the file the rename leaves behind keeps
-    /// the mode of the temporary it came from, and state other users may
-    /// write is state that decides what this daemon takes out of a card.
-    /// The directory is 0700 as well; this is the second lock on the same
-    /// door, for the case where the directory was made by something else.
+    /// 0600 rather than `fs::write`'s 0666-minus-umask: the renamed file
+    /// keeps the temporary's mode, and state other users may write decides
+    /// what this daemon takes out of a card. The second lock on the same door
+    /// as the 0700 directory, for a directory made by something else.
     fn put_file(&self, dest: &std::path::Path, text: &str) -> io::Result<()> {
         let name = dest
             .file_name()
@@ -665,10 +584,9 @@ impl Syncer {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                // Never through a symlink. `ensure_state_dir` narrows a
-                // state directory it finds group- or world-writable, but
-                // it cannot remove what was planted there before that
-                // first narrowing - and this daemon writes as root.
+                // Never through a symlink: `ensure_state_dir` narrows a
+                // writable directory but cannot remove what was planted
+                // before, and this daemon writes as root.
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(tmp)?
                 .write_all(text.as_bytes())
@@ -687,22 +605,18 @@ impl Syncer {
                 return Err(e);
             }
         }
-        // Both error paths take the temporary with them, not just this
-        // one: a failed write left a half-written `.<dev>.owned.<pid>.tmp`
-        // lying in the state directory, where the next reader has to guess
-        // what it is.
+        // Both error paths take the temporary with them: a half-written
+        // `.<dev>.owned.<pid>.tmp` left in the state directory is a file the
+        // next reader has to guess about.
         fs::rename(&tmp, dest).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             e
         })
     }
 
-    /// Take one address out of a note without touching the rest of it.
-    ///
-    /// The whole-set write sorts, and a `--check` that reordered a note it
-    /// had no business changing is a trace where the point was to leave
-    /// none. The lines that stay keep their bytes and their order; only the
-    /// one line goes. Under the caller's lock.
+    /// Take one address out of a note without touching the rest: a `--check`
+    /// that reordered a note is a trace where the point was to leave none.
+    /// The other lines keep their bytes and order. Under the caller's lock.
     pub(super) fn drop_line_locked(&self, dev: &str, mac: &Mac) {
         let Ok(text) = fs::read_to_string(self.state_path(dev)) else {
             return;
@@ -727,10 +641,9 @@ impl Syncer {
         }
     }
 
-    /// The write itself. Every caller holds the lock. Whether the note now
-    /// records the set - a caller that registered something on the strength
-    /// of this write has to know, because an entry in the card that no note
-    /// names would never be removed again.
+    /// The write itself, every caller holding the lock. Returns whether the
+    /// note now records the set: a caller that registered on the strength of
+    /// it has to know, or an entry no note names is never removed again.
     pub(super) fn write_owned(&self, dev: &str, set: &Set<Mac>) -> bool {
         if !self.note_is_readable(dev) {
             eprintln!(
@@ -739,29 +652,28 @@ impl Syncer {
             );
             return false;
         }
-        // Most passes change nothing, and rewriting the note every time would
-        // be pointless work on a host that is simply idle. The remembered
-        // copy answers this without reading the file - and when it cannot be
-        // believed, load_owned reads it and the comparison is against what is
-        // really there either way.
+        // Most passes change nothing, and rewriting the note every time is
+        // pointless work on an idle host. The remembered copy answers without
+        // reading; when it cannot be believed, load_owned reads, and the
+        // comparison is against what is really there either way.
         if self.load_owned(dev) == *set {
             return true;
         }
         let mut lines: Vec<String> = set.iter().map(format_mac).collect();
         lines.sort();
-        // An empty set is an empty file. `join + newline` wrote a lone
-        // newline for it, and the next append then produced a note with a
-        // phantom blank first line - harmless to the parser, but visible to
-        // anything comparing note contents.
+        // An empty set is an empty file: `join + newline` wrote a lone
+        // newline, and the next append produced a phantom blank first line -
+        // harmless to the parser, visible to anything comparing notes.
         let text = if lines.is_empty() {
             String::new()
         } else {
             lines.join("\n") + "\n"
         };
         // A note that cannot be written strands every entry it should have
-        // named: the next pass reads nothing and counts them as foreign,
-        // forever. That must not happen in silence. The how - temporary
-        // file, hidden pid-carrying name, 0600 - lives on put_file.
+        // named
+        // - the next pass counts them as foreign, forever - and must not fail
+        //   in silence. The how (temporary, hidden pid name, 0600) lives on
+        //   put_file.
         match self.put_file(&self.state_path(dev), &text) {
             Ok(()) => {
                 self.remember(dev, set, None);
@@ -779,18 +691,13 @@ impl Syncer {
 
     /// Add addresses to a note without rewriting it.
     ///
-    /// The fast path only ever adds, and a note is a list of addresses in no
-    /// particular order, so an addition is a line at the end. Rewriting the
-    /// whole file instead means formatting and sorting every address it holds,
-    /// once per batch - which is once per address learnt. Measured on a host
-    /// learning 200 addresses a second: 1878 rewrites of a growing file in ten
-    /// seconds, and the sorting was the single largest thing the daemon did.
-    ///
-    /// The file stops being sorted, which nothing reads it for - it is read
-    /// into a set. A full pass rewrites it in order only when the set of
-    /// addresses has changed, so an unsorted file can stay unsorted for a
-    /// long time; that is fine, and saying so here is better than implying
-    /// somebody tidies up afterwards. What matters is that a line, once
+    /// The fast path only adds, and a note is an unordered list, so an
+    /// addition is a line at the end. Rewriting meant formatting and sorting
+    /// every address once per batch - measured at 200 addresses a second:
+    /// 1878 rewrites in ten seconds, the sorting the single largest thing the
+    /// daemon did. The file stops being sorted, which nothing reads it for; a
+    /// full pass rewrites it in order only when the set changed, and an
+    /// unsorted file may stay so for a long time. What matters: a line, once
     /// written, is in the file before the entry it names is anybody's to
     /// remove.
     pub(super) fn append_owned(&self, dev: &str, added: &[Mac]) -> bool {
@@ -800,38 +707,31 @@ impl Syncer {
         if self.dry_run || added.is_empty() {
             return true;
         }
-        // Only what the note does not already name. A line that is already
-        // there would never be taken out again: a full pass rewrites the file
-        // only when the set of addresses changed, and a duplicate does not
-        // change the set - so the file would grow by a line every time an
-        // address was registered afresh, for ever. Read and write under one
-        // lock, or two writers each decide "not there yet" and both add it.
+        // Only what the note does not already name: a duplicate line does not
+        // change the set, so a full pass would never rewrite it away and the
+        // file would grow by a line per re-registration for ever. Read and
+        // write under one lock, or two writers both decide "not there yet".
         self.locked(dev, || self.append_owned_locked(dev, added).is_some())
     }
 
-    /// The addresses that were actually appended - the register paths need
-    /// them, because only a line this very call added may be taken back out
-    /// when the card refuses the address as somebody else's. `None` when
-    /// the note could not take the addresses, and the caller then must not
-    /// write any of them into the card: the note comes first.
+    /// The addresses actually appended - only a line this call added may be
+    /// taken back out when the card refuses the address as somebody else's.
+    /// `None` when the note could not take them; the caller then writes none
+    /// of them into the card.
     /// Cut back a line a previous write did not finish, before adding to it.
     ///
-    /// This is the one writer that works in place; everything else goes
-    /// through `put_file`, where a temporary and a rename make a half-write
-    /// impossible. Here a `write_all` that stops in the middle - a full
-    /// /run, which is where the notes live - leaves the file ending inside
-    /// an address with no newline, and the next append glues the two
-    /// together. The card then holds an entry no note names any more:
-    /// neither a pass nor `--flush` can reach it, because both work from
-    /// the notes. That is the permanent orphan hard invariant 3 exists
+    /// This is the one writer working in place; everything else goes through
+    /// `put_file`. A `write_all` that stops mid-address (a full /run) leaves
+    /// the file ending without a newline, the next append glues two addresses
+    /// together, and the card holds an entry no note names - neither a pass
+    /// nor --flush can reach it: the permanent orphan invariant 3 exists
     /// against, out of one full filesystem.
     ///
-    /// Cutting back rather than rolling back on the error path on purpose:
-    /// the length from before the write is not always known (the cache may
-    /// have been dropped), a stale one would cut a parallel writer's lines,
-    /// and neither helps against the write that never returned at all -
-    /// SIGKILL, a lost machine. Whatever left the file unfinished, the next
-    /// append under this lock is where it gets tidied.
+    /// Cutting back rather than rolling back on the error path: the pre-write
+    /// length is not always known, a stale one would cut a parallel writer's
+    /// lines, and neither helps against a write that never returned
+    /// (SIGKILL). The next append under this lock tidies whatever left the
+    /// file unfinished.
     fn finish_the_last_line(dev: &str, f: &mut fs::File) -> io::Result<()> {
         use std::io::{Read, Seek, SeekFrom};
         let mut all = Vec::new();
@@ -854,11 +754,9 @@ impl Syncer {
     pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> Option<Vec<Mac>> {
         use std::io::Write;
         let mut set = self.load_owned(dev);
-        // A note that cannot be read cannot be added to either: what the
-        // file holds is unknown, and read_owned has already said the device
-        // is on hold until it can be read. Appending anyway would put lines
-        // into a file this cannot check for duplicates - and, worse, let a
-        // caller register on the strength of a note nobody can believe.
+        // A note that cannot be read cannot be added to: what it holds is
+        // unknown, read_owned has put the device on hold, and appending would
+        // let a caller register on the strength of a note nobody can believe.
         if !self.note_is_readable(dev) {
             return None;
         }
@@ -896,11 +794,11 @@ impl Syncer {
                     Err(e)
                 }
             });
-        // What the file held when it was read, so that somebody else writing
-        // it in between can be told from nothing having happened. A --flush
-        // from a second process replaces this file, and appending to what it
-        // left is right - but the copy in memory would then describe a file
-        // that no longer exists, and its size is how that shows.
+        // What the file held when read, so somebody else's write in between
+        // can be told from nothing having happened: a second-process --flush
+        // replaces the file, appending to what it left is right, but the copy
+        // in memory then describes a file that no longer exists - its size
+        // shows it.
         let was = self.notes.borrow().get(dev).map(|n| n.len);
         let wrote = opened.and_then(|mut f| {
             Self::finish_the_last_line(dev, &mut f)?;
@@ -933,12 +831,11 @@ impl Syncer {
         }
     }
 
-    /// Take addresses back out of the note, the lock already held. For the
-    /// intent that turned out to be somebody else's entry: the card
-    /// answered EEXIST, and a line left standing would have that entry
-    /// deleted the day its address stops being wanted. Whether the note now
-    /// agrees - a caller that cannot un-note has claimed a foreign entry
-    /// and has to say so.
+    /// Take addresses back out of the note, the lock already held - for the
+    /// intent that turned out to be somebody else's entry (EEXIST): a line
+    /// left standing would have that entry deleted the day its address stops
+    /// being wanted. Returns whether the note agrees; a caller that cannot
+    /// un-note has claimed a foreign entry and has to say so.
     pub(super) fn unnote_locked(&self, dev: &str, macs: &[Mac]) -> bool {
         // Unreadable is not "removed": the empty could-not-tell set would
         // read as "nothing to do" and swallow the caller's warning about
@@ -957,17 +854,15 @@ impl Syncer {
         self.write_owned(dev, &after)
     }
 
-    /// Move a note - and its index record - to the name its interface now
-    /// wears. Both locks are taken, in name order so that two processes
-    /// migrating a swapped pair of names cannot deadlock; the append comes
-    /// before the unlink, so a crash between the two leaves the addresses
-    /// named twice - which the next sweep settles, the append deduplicates -
-    /// rather than named nowhere.
+    /// Move a note and its index record to the interface's new name. Both
+    /// locks in name order, so two processes migrating a swapped pair cannot
+    /// deadlock; append before unlink, so a crash between leaves the
+    /// addresses named twice (the next sweep settles it) rather than nowhere.
     pub(super) fn migrate_note(&self, old: &str, new: &str, index: u32) -> bool {
         // Two locked() sections on one name would block on the second
-        // descriptor and hang the single-threaded daemon for good. The
-        // caller cannot reach this today - renamed_target answers None for
-        // an unchanged name - but the guard belongs where the hazard is.
+        // descriptor and hang the daemon for good. Unreachable today -
+        // renamed_target answers None for an unchanged name - but the guard
+        // belongs where the hazard is.
         if old == new {
             return true;
         }
@@ -998,10 +893,9 @@ impl Syncer {
         })
     }
 
-    /// How many addresses this daemon currently has on record as its own,
-    /// across every device it has a note for. Read from the notes rather than
-    /// from memory, for the same reason everything else here is: a --flush
-    /// from a second process is a thing that happens.
+    /// How many addresses this daemon has on record as its own, across every
+    /// note. Read from the notes, not memory: a second-process --flush is a
+    /// thing that happens.
     pub fn registered(&self) -> usize {
         self.noted_devices_or_none()
             .iter()
@@ -1009,21 +903,19 @@ impl Syncer {
             .sum()
     }
 
-    /// Every device with a note. "The directory is not there" means none -
-    /// nothing was ever noted. Any other failure to list it means the
-    /// answer is unknown, which is not the same thing, and the difference
-    /// is what --flush's exit code stands on.
+    /// Every device with a note. A missing directory means none; any other
+    /// listing failure means unknown - the difference --flush's exit code
+    /// stands on.
     pub(super) fn noted_devices(&self) -> io::Result<Vec<String>> {
         let mut out = Vec::new();
         match fs::read_dir(&self.state_dir) {
             Ok(rd) => {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    // Only ordinary files. A symlink named `<x>.owned` is
-                    // not a note this program wrote, and treating it as one
-                    // means reading, and possibly rewriting, whatever it
-                    // points at - as root. `file_type` on the directory
-                    // entry does not follow the link.
+                    // Only ordinary files: a symlink named `<x>.owned` is not
+                    // a note this program wrote, and treating it as one reads
+                    // and possibly rewrites whatever it points at, as root.
+                    // `file_type` on the entry does not follow the link.
                     if !e.file_type().is_ok_and(|t| t.is_file()) {
                         continue;
                     }
@@ -1039,10 +931,10 @@ impl Syncer {
         Ok(out)
     }
 
-    /// The same list for the callers that can only shrug at a failure - a
+    /// The same list for callers that can only shrug at a failure - a
     /// scheduling heuristic and the orphan sweep. They act on "none" the
-    /// harmless way (no sweep, no warning threshold), so an unlistable
-    /// directory costs a warning, once, rather than an invented answer.
+    /// harmless way, so an unlistable directory costs a warning, once, not an
+    /// invented answer.
     pub(super) fn noted_devices_or_none(&self) -> Vec<String> {
         match self.noted_devices() {
             Ok(v) => v,

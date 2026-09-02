@@ -1,20 +1,16 @@
-//! The little bit of rtnetlink this daemon needs.
-//!
-//! Four operations - three on `AF_BRIDGE` neighbour messages, which is what
-//! the kernel calls forwarding database entries, and one on link messages:
+//! The little bit of rtnetlink this daemon needs:
 //!
 //! * dump every FDB entry the host knows, learnt and permanent alike,
-//! * add or remove an entry with `NTF_SELF`, which is the unicast filter list
-//!   of the interface itself rather than the bridge's table,
-//! * subscribe to `RTNLGRP_NEIGH` and `RTNLGRP_LINK` and read changes as they
-//!   happen - interfaces matter as much as addresses, because a VF whose MAC
-//!   is set from the host changes what must be excluded without moving a
-//!   single forwarding entry,
+//! * add or remove an entry with `NTF_SELF` - the interface's own unicast
+//!   filter, not the bridge's table,
+//! * subscribe to `RTNLGRP_NEIGH` and `RTNLGRP_LINK` - interfaces matter as
+//!   much as addresses, because a VF whose MAC is set from the host changes
+//!   the exclusions without moving a forwarding entry,
 //! * ask one interface for its virtual functions' addresses.
 //!
-//! Done by hand rather than through a netlink crate: the message layouts used
-//! here are small and stable, and a daemon that writes into a NIC's hardware
-//! filters is easier to trust when its dependency list is one crate long.
+//! By hand rather than through a netlink crate: the layouts are small and
+//! stable, and a daemon that writes into a NIC's hardware filters is easier
+//! to trust when its dependency list is one crate long.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -34,10 +30,9 @@ const NLMSG_DONE: u16 = 3;
 pub(crate) const NLM_F_REQUEST: u16 = 0x001;
 const NLM_F_ACK: u16 = 0x004;
 const NLM_F_ROOT: u16 = 0x100;
-// The same bits mean different things on GET and on NEW requests: MATCH
-// belongs to GET (and makes up NLM_F_DUMP), EXCL to NEW. Their sharing 0x200
-// is the kernel's doing, not a typo here - as with IFLA_VF_INFO and
-// IFLA_VF_MAC below, which are both 1 in their respective nesting levels.
+// The same bits mean different things on GET and NEW: MATCH belongs to GET
+// (part of NLM_F_DUMP), EXCL to NEW; sharing 0x200 is the kernel's doing - as
+// with IFLA_VF_INFO and IFLA_VF_MAC, both 1 at their nesting levels.
 const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
@@ -107,15 +102,11 @@ pub struct FdbEntry {
 }
 
 impl FdbEntry {
-    /// An address the bridge picked up from traffic, as opposed to one that was
-    /// configured: a port's own address, or an entry somebody added by hand.
-    /// Entries planted by an external agent - an SDN controller, a VXLAN
-    /// daemon - count as learnt too: they describe where a peer actually is.
-    ///
-    /// The final test is NUD_NOARP: a state given to entries that no probe
-    /// ever validates - static VXLAN destinations without NTF_EXT_LEARNED,
-    /// for instance - which therefore describe configuration, not an
-    /// observed peer.
+    /// An address the bridge picked up from traffic, as opposed to configured
+    /// (a port's own, a hand-added entry). Entries planted by an SDN
+    /// controller or a VXLAN daemon count as learnt: they say where a peer
+    /// is. NUD_NOARP entries - static VXLAN destinations without
+    /// NTF_EXT_LEARNED - describe configuration, not an observed peer.
     pub fn is_learned(&self) -> bool {
         if self.flags & NTF_SELF != 0 || self.state & NUD_PERMANENT != 0 {
             return false;
@@ -150,10 +141,8 @@ pub struct LinkInfo {
     /// is why the kind has to be consulted before believing it
     pub link: Option<u32>,
     pub kind: Option<String>,
-    /// A bridge's ageing time in clock_t hundredths of a second, where the
-    /// kernel offered one. The interval after which the bridge forgets a
-    /// silent address - which is exactly how long ago an address that has
-    /// just aged out last spoke.
+    /// A bridge's ageing time in clock_t hundredths, where the kernel offered
+    /// one: how long ago an address that has just aged out last spoke.
     pub ageing: Option<u32>,
     /// the bus device behind this interface, when the kernel names one. Its
     /// presence answers "is there a device/ directory" without a stat.
@@ -190,32 +179,27 @@ enum DumpEnd {
 pub struct Events {
     pub fdb: Vec<(u16, FdbEntry)>,
     pub links_changed: bool,
-    /// Which interfaces the link messages were about. An interface appearing
-    /// or going says the picture has to be read again; whether it says the
-    /// virtual functions' addresses have to be asked for again depends on
-    /// which interface it was, and that is the caller's judgement to make.
+    /// Which interfaces the link messages were about: the picture has to be
+    /// read again; whether the VFs' addresses must be re-asked depends on
+    /// which interface, and that is the caller's call.
     pub changed_links: Vec<u32>,
 }
 
 pub struct Socket {
-    /// Whether the drop of a spoofed datagram has been said out loud this
-    /// run. Once: draining them is unavoidable - left queued they would
-    /// crowd out real notifications until ENOBUFS - but doing it silently
-    /// hides that a local process is aiming unicast netlink at this socket.
+    /// Whether a spoofed datagram's drop has been said this run. Draining
+    /// them is unavoidable (left queued they crowd out real notifications),
+    /// but silently hides that a local process aims unicast netlink at this
+    /// socket.
     spoof_warned: std::cell::Cell<bool>,
-    /// The receive buffer, kept rather than allocated per call. Every read
-    /// here wants tens or hundreds of kilobytes, and `vec![0u8; n]` is both
-    /// an allocation and a walk over n bytes to zero them - paid on every
-    /// notification batch, every dump attempt and every acknowledgement. It
-    /// only ever grows, to whatever the largest answer needed.
+    /// The receive buffer, kept rather than allocated per call: every read
+    /// wants tens or hundreds of kilobytes, and `vec![0u8; n]` is an
+    /// allocation plus a walk to zero it, per batch, dump and
+    /// acknowledgement.
     ///
-    /// It is deliberately not shrunk afterwards. What it grows to is not a
-    /// spike that passed: it is the size of this host's forwarding table in
-    /// one datagram, which the next dump asks for again in five minutes.
-    /// Giving it back means finding it out again the only way there is - a
-    /// dump that overruns, is thrown away, and is asked for a second time -
-    /// on a host large enough for that to be the expensive case. The ceiling
-    /// on the growing is what keeps this bounded, and it is in `dump_into`.
+    /// It only grows, and is not shrunk: what it grew to is this host's
+    /// forwarding table in one datagram, which the next dump asks for again -
+    /// giving it back means finding it out again by a dump that overruns. The
+    /// ceiling is in `dump_into`.
     buf: Vec<u8>,
     fd: OwnedFd,
     seq: u32,
@@ -237,20 +221,17 @@ impl Socket {
         Self::open(0)
     }
 
-    /// A socket that also receives forwarding and interface notifications.
-    ///
-    /// Interfaces matter as much as addresses here: a NIC that gets virtual
-    /// functions, a bridge built after boot, or a VF whose address is set from
-    /// the host all change what belongs in the filter, and none of them moves
-    /// a single forwarding entry.
+    /// A socket that also receives forwarding and interface notifications: a
+    /// NIC that gets VFs, a bridge built after boot, a VF whose address is
+    /// set from the host all change the filter without moving a forwarding
+    /// entry.
     pub fn subscribed() -> io::Result<Self> {
         Self::open((1 << (RTNLGRP_NEIGH - 1)) | (1 << (RTNLGRP_LINK - 1)))
     }
 
-    /// A socket on the generic netlink family, which is where devlink lives.
-    /// Everything below this line - sequence numbers, the grow-and-retry, the
-    /// acknowledgement handling - is protocol-independent, and duplicating it
-    /// for one question would have been the worst of both.
+    /// A socket on generic netlink, where devlink lives. Everything below -
+    /// sequence numbers, grow-and-retry, acknowledgements - is
+    /// protocol-independent.
     pub(crate) fn generic() -> io::Result<Self> {
         Self::open_on(0, libc::NETLINK_GENERIC)
     }
@@ -273,17 +254,13 @@ impl Socket {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 
         // A dump of a large forwarding database overruns the default receive
-        // buffer easily, and netlink answers that with ENOBUFS rather than
-        // with short reads.
+        // buffer, and netlink answers with ENOBUFS rather than short reads.
         //
-        // SO_RCVBUF is silently capped at net.core.rmem_max - 208 KiB on a
-        // stock kernel against the megabyte asked for here (the kernel then
-        // doubles whatever value wins, for its own bookkeeping), and nothing
-        // would say so. SO_RCVBUFFORCE ignores that ceiling; it needs
-        // CAP_NET_ADMIN, which this program holds for programming the filter
-        // anyway. Fall back to the capped request where it is refused, because
-        // a smaller buffer still works and losing notifications is survivable -
-        // the full pass reads the real state.
+        // SO_RCVBUF is silently capped at net.core.rmem_max (208 KiB stock,
+        // against the megabyte asked for); SO_RCVBUFFORCE ignores the ceiling
+        // and needs CAP_NET_ADMIN, which this program holds anyway. Falls
+        // back to the capped request where refused: losing notifications is
+        // survivable, the full pass reads the real state.
         let size: libc::c_int = 1 << 20;
         let set = |opt| unsafe {
             libc::setsockopt(
@@ -300,13 +277,12 @@ impl Socket {
             );
         }
 
-        // A receive that waits for ever is how a hung kernel stops this daemon
-        // without a word, so every read has a deadline. Carrying it in the
-        // socket rather than in a poll before each read halves the syscalls of
-        // a registration - which is the one thing here whose latency anybody
-        // measures. The value is the longest any single read may take; a
-        // caller with a shorter deadline of its own checks the clock and comes
-        // back, and one with a longer one goes round again.
+        // A receive that waits for ever is how a hung kernel stops this
+        // daemon without a word, so every read has a deadline - in the socket
+        // rather than a poll before each read, which halves the syscalls of a
+        // registration. The value is the longest a single read may take; a
+        // caller with a shorter deadline checks the clock and comes back, one
+        // with a longer one goes round again.
         let tv = libc::timeval {
             // Inferred from the field rather than named: `time_t` is 32-bit on
             // some musl targets and 64-bit on others, and naming it means
@@ -327,36 +303,24 @@ impl Socket {
             return Err(io::Error::last_os_error());
         }
 
-        // Zeroed and then filled in, rather than written as a literal: the
-        // struct has a padding field libc does not make public, so there is
-        // no literal to write. That is deliberate on libc's part, and it is
-        // what makes zeroing the right way to start one of these - the
-        // padding has to be zero and this is the only way to say so. It is
-        // sound for the same reason it is necessary: every field of a
-        // `sockaddr_nl` is an integer, and all-zero is a value each of them
-        // can hold. A struct that ever held something that cannot be zero -
-        // a reference, a `NonNull` - would need a different treatment, and
-        // libc cannot add one to this without breaking every caller.
-        // The subscription hears the whole neighbour table, and most of
-        // what arrives is ARP and ND churn that concerns nobody here. The
-        // userspace check in events_from already drops it - but each of
-        // those datagrams still queued, still woke this process, and an ARP
-        // storm could still fill the receive buffer and buy a full recovery
-        // pass for losses that were all irrelevant. This classic BPF filter
-        // drops the noise in the kernel instead, before it costs anything.
-        // Built to fail open: dropped is only a datagram that provably
-        // holds a single RTM_NEWNEIGH/RTM_DELNEIGH whose family is not
-        // AF_BRIDGE - anything multi-message, overlong or otherwise odd is
-        // accepted and left to the userspace check. Attached before bind,
-        // so no unfiltered datagram slips in first; a kernel that refuses
-        // it gets a warning and the unfiltered behaviour, like the receive
-        // buffer above.
+        // Zeroed and then filled in: the struct has a padding field libc does
+        // not make public, so there is no literal to write, and the padding
+        // has to be zero. Sound because every field of a `sockaddr_nl` is an
+        // integer that can hold zero.
+        // The subscription hears the whole neighbour table, mostly ARP and ND
+        // churn. The userspace check in events_from drops it, but each
+        // datagram still queued, still woke this process, and an ARP storm
+        // could fill the receive buffer and buy a recovery pass for
+        // irrelevant losses. This classic BPF filter drops the noise in the
+        // kernel. Fails open: dropped is only a datagram that provably holds
+        // a single RTM_NEWNEIGH/ RTM_DELNEIGH whose family is not AF_BRIDGE.
+        // Attached before bind; a kernel that refuses it gets a warning and
+        // the unfiltered behaviour.
         if groups != 0 {
-            // The filter reconstructs multi-byte fields byte-wise and
-            // hard-codes their little-endian storage; on a big-endian host
-            // it would degrade to accept-everything anyway, so it is not
-            // attached there - the daemon then merely wakes for noise, as
-            // it did before the filter existed.
+            // The filter hard-codes little-endian storage; on a big-endian
+            // host it would degrade to accept-everything anyway, so it is not
+            // attached there
+            // - the daemon merely wakes for noise.
             if cfg!(target_endian = "little") {
                 if let Err(e) = attach_noise_filter(fd.as_raw_fd()) {
                     eprintln!("warning: cannot filter neighbour noise in the kernel: {e}");
@@ -403,15 +367,14 @@ impl Socket {
         Ok(())
     }
 
-    /// Reads one datagram. `MSG_TRUNC` makes the kernel report the real size
-    /// even when it did not fit, so a buffer that is too small shows up as a
-    /// number larger than the buffer instead of as silently missing entries.
+    /// Reads one datagram. `MSG_TRUNC` makes the kernel report the real size,
+    /// so a too-small buffer shows up as a number larger than the buffer
+    /// instead of silently missing entries.
     ///
-    /// Only the kernel is listened to. A netlink socket accepts unicast from
-    /// any local process, and everything downstream believes what arrives -
-    /// a forged NLMSG_DONE would end a dump early and an empty dump reads as
-    /// an empty forwarding table, which ends with every entry removed. The
-    /// sender's port id says who it was: zero is the kernel.
+    /// Only the kernel is listened to: a netlink socket accepts unicast from
+    /// any local process, and a forged NLMSG_DONE would end a dump early - an
+    /// empty dump reads as an empty table, which ends with every entry
+    /// removed. Port id zero is the kernel.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.recv_flags(buf, 0)
     }
@@ -424,24 +387,19 @@ impl Socket {
     }
 
     fn recv_flags(&self, buf: &mut [u8], extra: libc::c_int) -> io::Result<usize> {
-        // Dropping a datagram that is not the kernel's is the anti-spoofing
-        // rule; dropping them for ever is a way to be wedged. Unicast to a
-        // netlink pid DOES take CAP_NET_ADMIN in this netns (measured on
-        // 6.12: unprivileged sendto answers EPERM) - so the feeder this
-        // bound defends against is already root-equivalent for the
-        // network, and the bound is defence in depth, not the last line.
-        // The callers' deadlines are checked between calls, not in here.
-        // A bounded batch of drops, then WouldBlock: the
-        // deadline caller re-enters (and re-checks its clock), the event
-        // reader reports an empty batch and the next poll wakes it again.
+        // Dropping a non-kernel datagram is the anti-spoofing rule; dropping
+        // them for ever is a way to be wedged. Unicast to a netlink pid takes
+        // CAP_NET_ADMIN (measured on 6.12), so the bound is defence in depth.
+        // A bounded batch of drops, then WouldBlock: the deadline caller
+        // re-enters and re-checks its clock, the event reader reports an
+        // empty batch.
         let mut dropped = 0;
         loop {
             let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-            // After a spoofed datagram was skipped, the queue may well be
-            // empty - and blocking then would hand any local process a
-            // five-second brake on the daemon loop, one unicast datagram at
-            // a time. Drain what is there without waiting.
+            // After a spoofed datagram was skipped the queue may be empty,
+            // and blocking then would hand any local process a five-second
+            // brake on the loop per datagram. Drain without waiting.
             let flags = if dropped > 0 {
                 libc::MSG_TRUNC | libc::MSG_DONTWAIT | extra
             } else {
@@ -482,10 +440,9 @@ impl Socket {
         }
     }
 
-    /// `recv`, but gives up when the deadline passes instead of blocking for
-    /// good. A reply that never comes - a dump whose final message was lost,
-    /// an acknowledgement that went missing - would otherwise stop the whole
-    /// daemon, and nothing upstream could even say why.
+    /// `recv`, but gives up at the deadline: a reply that never comes - a
+    /// lost final message, a missing acknowledgement - would otherwise stop
+    /// the whole daemon.
     fn recv_deadline(&self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
         loop {
             if Instant::now() >= deadline {
@@ -494,10 +451,9 @@ impl Socket {
                     "no answer from the kernel in time",
                 ));
             }
-            // The socket's own timeout does the waiting; there is no poll in
-            // front of it to say whether waiting is necessary. Nothing to
-            // read yet comes back as WouldBlock, and the caller's deadline
-            // decides whether that is the end of it.
+            // The socket's own timeout does the waiting; nothing to read
+            // comes back as WouldBlock, and the caller's deadline decides
+            // whether that is the end.
             match self.recv(buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 other => return other,
@@ -507,13 +463,11 @@ impl Socket {
 
     /// Runs one dump and hands every message body of type `want` to `sink`.
     ///
-    /// The two ways an answer can fail to be trustworthy need different
-    /// answers from the caller, so they are told apart. A dump the kernel
-    /// flagged as interrupted has to be asked for again; one whose datagram
-    /// did not fit has to be asked for again *into a bigger buffer*, and
-    /// retrying into the same one is how a host large enough to overflow it
-    /// gets six identical failures and an error message about interruptions
-    /// that never happened.
+    /// The two untrustworthy answers are told apart: a dump the kernel
+    /// flagged as interrupted is asked again; one whose datagram did not fit
+    /// is asked again *into a bigger buffer* - retrying into the same one
+    /// gave a large host six identical failures and an error about
+    /// interruptions that never happened.
     fn run_dump(
         &self,
         buf: &mut [u8],
@@ -538,13 +492,12 @@ impl Socket {
                     return Ok(DumpEnd::Interrupted);
                 }
                 match msg.kind {
-                    // The end of a dump carries the dump callback's exit
-                    // code, and it is negative when the kernel gave up
-                    // partway - out of memory building the answer, say. Read
-                    // as a finished dump, that is a short forwarding table
-                    // read as a complete one, which ends with every
-                    // registration past the cut removed. Kernels that send no
-                    // body are taken at their word, as before.
+                    // The end of a dump carries the callback's exit code,
+                    // negative when the kernel gave up partway (out of
+                    // memory, say). Read as finished, a short table passes
+                    // for a complete one and every registration past the cut
+                    // is removed. Kernels that send no body are taken at
+                    // their word.
                     NLMSG_DONE => {
                         if let Some(e) = nlmsg_error(msg.payload) {
                             return Err(e);
@@ -552,11 +505,11 @@ impl Socket {
                         return Ok(DumpEnd::Done);
                     }
                     NLMSG_ERROR => {
-                        // The request asks for no acknowledgement, so an error
+                        // No acknowledgement was asked for, so an error
                         // message is only ever bad news. One whose code reads
-                        // as zero - or one too short to carry a code - must
-                        // not pass for a finished dump: an "empty" forwarding
-                        // table would have every registration removed.
+                        // zero, or too short to carry one, must not pass for
+                        // a finished dump: an "empty" table would have every
+                        // registration removed.
                         return Err(nlmsg_error(msg.payload).unwrap_or_else(|| {
                             io::Error::other("the dump ended in a malformed error message")
                         }));
@@ -569,12 +522,9 @@ impl Socket {
         }
     }
 
-    /// One question about one interface, and the single answer to it.
-    ///
-    /// `RTM_GETLINK` with `NLM_F_DUMP` ignores the index it is given and
-    /// describes every interface in the system. Without the flag the index is
-    /// honoured and one message comes back - no `NLMSG_DONE` to wait for, so
-    /// the first matching answer ends it.
+    /// One question about one interface, and its single answer: `RTM_GETLINK`
+    /// without `NLM_F_DUMP` honours the index and one message comes back - no
+    /// `NLMSG_DONE`, so the first matching answer ends it.
     pub(crate) fn request_one(
         &mut self,
         request: &[u8],
@@ -584,18 +534,14 @@ impl Socket {
         self.request_one_from(64 * 1024, request, want, sink)
     }
 
-    /// `request_one`, with the size its buffer starts from spelt out. Only a
-    /// test passes anything but the default, for the same reason `dump_from`
-    /// exists: growing is meant to be the rare path, and a test that cannot
-    /// reach it does not test it.
+    /// `request_one` with its starting buffer size spelt out; only a test
+    /// passes anything but the default, so the growing path is reachable.
     ///
-    /// An answer that does not fit is not an error, it is a big host: a
-    /// virtual-function list a few hundred entries long outgrows any fixed
-    /// buffer. The question is asked again into a bigger one - the same
-    /// grow-and-retry the dumps do, against the same ceiling. It used to be
-    /// a hard error instead, which failed vf_macs_of and with it the WHOLE
-    /// pass, on every pass, on exactly the hosts with the most functions to
-    /// exclude.
+    /// An answer that does not fit is a big host, not an error: a VF list a
+    /// few hundred long outgrows any fixed buffer, so the question is asked
+    /// again into a bigger one - the dumps' grow-and-retry, same ceiling. A
+    /// hard error here failed vf_macs_of and the WHOLE pass, on exactly the
+    /// hosts with the most functions to exclude.
     fn request_one_from(
         &mut self,
         start: usize,
@@ -668,18 +614,14 @@ impl Socket {
                         }
                         return Ok(OneEnd::Answered);
                     }
-                    // The question was asked without NLM_F_DUMP, so there is
-                    // nothing to end - but a kernel is free to end it anyway,
-                    // and a request that names an interface which has just
-                    // gone gets exactly this and no RTM_NEWLINK. Ignoring it
-                    // leaves the caller waiting out the whole five-second
-                    // deadline for an answer that has already been given.
-                    // "Nothing to report" is the answer: sink is not called
-                    // and the caller sees an empty result. Unless the DONE
-                    // carries a negative code - then the kernel is saying
-                    // the question FAILED, and reading that as "empty" is
-                    // how a VF list quietly loses its exclusions. The dump
-                    // path checks this code; this path must too.
+                    // Asked without NLM_F_DUMP, so there is nothing to end -
+                    // but a kernel ends it anyway for an interface that has
+                    // just gone, with no RTM_NEWLINK. Ignoring it leaves the
+                    // caller waiting out the five-second deadline. "Nothing
+                    // to report" is the answer - unless the DONE carries a
+                    // negative code, which says the question FAILED, and
+                    // reading that as "empty" is how a VF list loses its
+                    // exclusions.
                     NLMSG_DONE => {
                         if let Some(e) = nlmsg_error(msg.payload) {
                             return Err(e);
@@ -697,21 +639,15 @@ impl Socket {
         }
     }
 
-    /// Runs a dump to completion, retrying when the kernel flags it as
-    /// interrupted, and returns everything `parse` collected.
+    /// Runs a dump to completion, retrying when the kernel flags it
+    /// interrupted, and returns what `parse` collected.
     ///
-    /// The result belongs to this function so a retry starts from nothing -
-    /// collecting into a caller's list would keep the half-read attempt's
-    /// entries in front of the real ones. Each retry sends under a fresh
-    /// sequence number, so whatever an abandoned attempt left queued cannot
-    /// pass for the new answer.
-    ///
-    /// The buffer grows to whatever a datagram turns out to need. It used to
-    /// be fixed, on the reasoning that the kernel's own cap on a dump
-    /// datagram made growing pointless - but the cap is the kernel's
-    /// business, not a promise to us, and the failure it left was a bad one:
-    /// the same too-small buffer offered six times over, and then an error
-    /// blaming interruptions that never happened.
+    /// The result belongs to this function so a retry starts from nothing;
+    /// each retry sends under a fresh sequence number, so an abandoned
+    /// attempt's leftovers cannot pass for the new answer. The buffer grows
+    /// to whatever a datagram needs: the kernel's cap on a dump datagram is
+    /// its business, not a promise, and a fixed buffer left six identical
+    /// failures and an error blaming interruptions.
     pub(crate) fn dump<T>(
         &mut self,
         request: &[u8],
@@ -719,12 +655,10 @@ impl Socket {
         what: &str,
         parse: impl FnMut(&[u8], &mut Vec<T>),
     ) -> io::Result<Vec<T>> {
-        // One kernel dump datagram, near enough: the kernel keeps them well
-        // under this. It used to start at 256 KiB on the reasoning that
-        // growing was not possible - it is now, and starting there cost an
-        // allocation and a walk over a quarter megabyte to zero it, every
-        // time the buffer was fresh. Whatever a host really needs, the
-        // buffer reaches on its first dump and keeps.
+        // One kernel dump datagram, near enough. Starting larger cost an
+        // allocation and a walk over a quarter megabyte to zero it every time
+        // the buffer was fresh; whatever a host really needs, the buffer
+        // reaches on its first dump and keeps.
         self.dump_from(64 * 1024, request, want, what, parse)
     }
 
@@ -792,12 +726,10 @@ impl Socket {
         )))
     }
 
-    /// Throws away whatever is still queued from an abandoned request.
-    ///
-    /// A signal must not end the draining early: what stays queued would be
-    /// read as the answer to the next question - the sequence number cannot
-    /// tell them apart when a retry reuses it, and an acknowledgement read
-    /// one question late misreports every call after it.
+    /// Throws away whatever is still queued from an abandoned request. A
+    /// signal must not end the draining early: what stays queued would be
+    /// read as the next answer - a sequence number cannot tell them apart
+    /// when a retry reuses it.
     fn drain(&self) {
         let mut buf = [0u8; 4096];
         loop {
@@ -823,12 +755,11 @@ impl Socket {
 
     /// Every interface on the host, in one dump.
     ///
-    /// Without RTEXT_FILTER_VF: asking for virtual function details makes the
-    /// driver answer out of its firmware for every interface that has any,
-    /// which was measured at 1.35 ms per physical function. The count comes
-    /// from sysfs instead - without the flag the kernel does not send
-    /// IFLA_NUM_VF at all - and the addresses are asked for separately for
-    /// the two or three interfaces that turn out to matter.
+    /// Without RTEXT_FILTER_VF: asking for VF details makes the driver answer
+    /// out of firmware for every interface that has any (measured 1.35 ms per
+    /// PF). The count comes from sysfs - without the flag the kernel sends no
+    /// IFLA_NUM_VF - and the addresses are asked separately for the few
+    /// interfaces that matter.
     pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
         let len = NLMSG_HDR + IFINFOMSG_LEN;
         let mut req = Vec::with_capacity(len);
@@ -877,18 +808,12 @@ impl Socket {
         })
     }
 
-    /// The addresses administratively set on the virtual functions of the
-    /// named interfaces.
+    /// The addresses administratively set on the VFs of the named interfaces.
     ///
-    /// Only the physical functions of the pairs contribute exclusions, and
-    /// there are as many of those as there are uplinks. Asking by index costs
-    /// one question each; the dump this replaced had the kernel describe
-    /// every interface on the host to reach the few that have VFs, and the
-    /// serialisation dominated the cost.
-    ///
-    /// An interface that has gone away answers ENODEV. That is not a failure
-    /// worth stopping for: the dump would simply not have listed it, and an
-    /// uplink that no longer exists has no virtual functions to exclude.
+    /// Asked by index, one question each: the dump this replaced had the
+    /// kernel describe every interface to reach the few with VFs, and
+    /// serialisation dominated. A gone interface answers ENODEV, which is no
+    /// failure: it has no VFs to exclude.
     pub fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, [u8; 6])>> {
         let mut out = Vec::new();
         for &index in indices {
@@ -932,12 +857,11 @@ impl Socket {
         put_attr(&mut req, NDA_LLADDR, mac);
         self.send(&req)?;
 
-        // The request asks for an acknowledgement, so one message with this
-        // sequence number is coming. Reading exactly one datagram and hoping
-        // it is the right one is not the same thing: a stray message left
-        // over from an earlier error path would be read instead, the real
-        // acknowledgement would stay queued, and every call after this one
-        // would judge itself by its predecessor's answer.
+        // An acknowledgement was asked for, so one message with this sequence
+        // number is coming. Reading one datagram and hoping is not the same:
+        // a stray message from an earlier error path would be read instead,
+        // and every call after would judge itself by its predecessor's
+        // answer.
         let mut buf = [0u8; 8192];
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
@@ -947,11 +871,10 @@ impl Socket {
                     continue;
                 }
                 if msg.kind == NLMSG_ERROR {
-                    // Too short to carry a code is not an acknowledgement -
-                    // the dump path refuses that shape, and booking a
-                    // registration that never happened as done would leave
-                    // the guest's traffic falling off the uplink until the
-                    // next pass notices the gap.
+                    // Too short to carry a code is not an acknowledgement:
+                    // booking a registration that never happened as done
+                    // leaves the guest's traffic falling off the uplink until
+                    // the next pass.
                     if msg.payload.len() < 4 {
                         return Err(io::Error::other(
                             "a malformed acknowledgement, too short to carry a code",
@@ -975,27 +898,22 @@ impl Socket {
     }
 
     /// One wake takes the whole queue. The kernel hands notifications over
-    /// one datagram at a time - measured, never coalesced - so "a batch"
-    /// used to mean "one message", and a burst of N learns became N
-    /// batches, each paying its own driver question and, for link messages,
-    /// its own topology re-read. What is already queued is the same moment;
-    /// taking it all is strictly fresher and waits for nothing. Capped so a
-    /// firehose cannot starve the loop's own clock checks - the leftover
-    /// wakes the next poll.
+    /// one datagram at a time, so a burst of N learns was N batches, each
+    /// paying its own driver question and topology re-read. What is queued is
+    /// the same moment; taking it all waits for nothing. Capped so a firehose
+    /// cannot starve the loop's clock checks.
     const DRAIN_CAP: usize = 256;
 
     fn events_from(&self, buf: &mut [u8]) -> io::Result<Events> {
         let mut out = Events::default();
         for _ in 0..Self::DRAIN_CAP {
-            // A notification that did not fit is a loss like ENOBUFS: what
-            // was in it is unknowable, so the caller has to stop trusting
-            // what it holds and read the real state - saying so is the
-            // difference between that and quietly working from half a batch.
+            // A notification that did not fit is a loss like ENOBUFS:
+            // unknowable content, so the caller stops trusting what it holds
+            // and reads the real state.
             let n = match self.recv_nowait(buf) {
                 Ok(n) => n,
-                // The queue is empty - on the first round because the batch
-                // was taken by something else or never was (the caller
-                // polls before asking), later because the drain is done.
+                // The queue is empty - on the first round because the caller
+                // polls before asking, later because the drain is done.
                 // Neither is a loss.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -1025,11 +943,10 @@ impl Socket {
             if msg.kind != RTM_NEWNEIGH && msg.kind != RTM_DELNEIGH {
                 continue;
             }
-            // RTNLGRP_NEIGH carries the whole neighbour table, not just the
-            // bridge's; only AF_BRIDGE concerns us. The kernel-side filter in
-            // open_on drops the ARP and ND churn before it wakes anybody -
-            // this check is the backstop for what that filter deliberately
-            // lets through, and for kernels that refused it.
+            // RTNLGRP_NEIGH carries the whole neighbour table; only AF_BRIDGE
+            // concerns us. The kernel-side filter drops most of the ARP/ND
+            // churn first - this is the backstop, and the whole check on
+            // kernels that refused the filter.
             if msg.payload.first() != Some(&(libc::AF_BRIDGE as u8)) {
                 continue;
             }
@@ -1052,11 +969,10 @@ impl Socket {
             events: libc::POLLIN,
             revents: 0,
         };
-        // A signal returns "nothing arrived" rather than polling again. Every
-        // caller is in a loop against a deadline it holds itself and comes
-        // straight back if there is time left, so nothing is lost - and it
-        // gets a chance to look at why it was interrupted. A stop request
-        // that has to wait out a five-minute interval is not a stop request.
+        // A signal returns "nothing arrived" rather than polling again: every
+        // caller loops against its own deadline and comes straight back, and
+        // gets to look at why it was interrupted. A stop that waits out an
+        // interval is not a stop.
         let rc = unsafe { libc::poll(&mut pfd, 1, millis.max(0)) };
         if rc < 0 {
             let e = io::Error::last_os_error();
@@ -1069,14 +985,11 @@ impl Socket {
     }
 }
 
-/// The request that asks one interface about its virtual functions.
-///
-/// Its own function so a test can look at what goes out. The one thing that
-/// matters in it is easy to lose and expensive to lose: without
-/// RTEXT_FILTER_SKIP_STATS the kernel also collects each virtual function's
-/// traffic counters, out of the hardware, and hands them over unasked. On a
-/// ConnectX-4 with two functions of two VFs each that was two thirds of the
-/// call - 2.17 ms against 0.73 - for numbers nothing here reads.
+/// The request that asks one interface about its VFs, its own function so a
+/// test can look at what goes out. Without RTEXT_FILTER_SKIP_STATS the kernel
+/// also collects each VF's traffic counters out of the hardware: on a
+/// ConnectX-4 with two functions of two VFs that was two thirds of the call
+/// (2.17 ms against 0.73) for numbers nothing reads.
 fn vf_request(index: u32, seq: u32) -> Vec<u8> {
     let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
     let mut req = Vec::with_capacity(len);
@@ -1105,10 +1018,9 @@ pub(crate) fn put_nlmsghdr(buf: &mut Vec<u8>, len: u32, kind: u16, flags: u16, s
 
 pub(crate) fn put_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
     let len = RTATTR_HDR + value.len();
-    // A netlink attribute's length field is 16 bits. Nothing here writes an
-    // attribute anywhere near that - the largest is a six-byte address - but
-    // a truncated length would be a silently malformed message rather than a
-    // refusal, and those are the ones that cost an afternoon.
+    // A netlink attribute's length is 16 bits. Nothing here comes near it
+    // (six-byte addresses), but a truncated length would be a silently
+    // malformed message rather than a refusal.
     assert!(
         len <= u16::MAX as usize,
         "netlink attribute of {len} bytes cannot state its own length"
@@ -1151,14 +1063,12 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                 let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
                 out.name = String::from_utf8_lossy(&value[..end]).into_owned();
             }
-            // The length guard is the whole of the check, and what follows
-            // it cannot fail. Written with `?` it could nevertheless
+            // The length guard is the whole check. Written with `?` it could
             // abandon the WHOLE interface over one attribute - and an
-            // interface that fell out of the reading takes its physical
-            // function with it, which loses the exclusion set its virtual
-            // functions' addresses: the worst direction this program has.
-            // So the conversion is spelled the way the ageing time next
-            // door is, where a bad attribute costs that attribute.
+            // interface that falls out of the reading takes its PF and the
+            // exclusion set with it, the worst direction this program has. So
+            // a bad attribute costs that attribute, as with the ageing time
+            // next door.
             IFLA_ADDRESS if value.len() == 6 => {
                 let mut m = [0u8; 6];
                 m.copy_from_slice(&value[..6]);
@@ -1214,11 +1124,10 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
     Some(out)
 }
 
-/// Walks the netlink messages in a received buffer. A trailing fragment that
-/// does not fit is dropped rather than parsed, so a short read cannot turn into
-/// nonsense. An iterator rather than a list: a dump of a large forwarding
-/// database arrives as thousands of messages per datagram, and none of them
-/// needs to be kept.
+/// Walks the netlink messages in a buffer. A trailing fragment is dropped,
+/// not parsed, so a short read cannot turn into nonsense. An iterator: a
+/// large dump arrives as thousands of messages per datagram and none needs
+/// keeping.
 struct Messages<'a> {
     buf: &'a [u8],
     off: usize,
@@ -1234,10 +1143,9 @@ impl<'a> Iterator for Messages<'a> {
         let kind = u16::from_ne_bytes(self.buf[self.off + 4..self.off + 6].try_into().unwrap());
         let flags = u16::from_ne_bytes(self.buf[self.off + 6..self.off + 8].try_into().unwrap());
         let seq = u32::from_ne_bytes(self.buf[self.off + 8..self.off + 12].try_into().unwrap());
-        // checked_add, because len is four wire bytes taken at face value:
-        // on a 32-bit usize the plain sum can wrap, slip past this check and
-        // panic on the slice below. A 64-bit build cannot wrap here - this
-        // costs nothing and holds for both.
+        // checked_add, because len is four wire bytes at face value: on a
+        // 32-bit usize the sum can wrap, slip past this check and panic on
+        // the slice below.
         let end = self.off.checked_add(len)?;
         if len < NLMSG_HDR || end > self.buf.len() {
             return None;
@@ -1257,11 +1165,11 @@ fn messages(buf: &[u8]) -> Messages<'_> {
     Messages { buf, off: 0 }
 }
 
-/// The status code at the front of an NLMSG_ERROR or NLMSG_DONE payload,
-/// as an error when it is one. The kernel writes 0 or -errno; anything
-/// positive would be a spoof or a bug, refused with the same errno rather
-/// than trusted - and `saturating_abs` keeps even i32::MIN from panicking
-/// a debug build. One arithmetic for every reader of this wire field.
+/// The status code at the front of an NLMSG_ERROR or NLMSG_DONE payload, as
+/// an error when it is one. The kernel writes 0 or -errno; anything positive
+/// is a spoof or a bug, refused with the same errno - and `saturating_abs`
+/// keeps i32::MIN from panicking a debug build. One arithmetic for every
+/// reader.
 fn nlmsg_error(payload: &[u8]) -> Option<io::Error> {
     if payload.len() < 4 {
         return None;
@@ -1295,12 +1203,10 @@ impl<'a> Iterator for Attrs<'a> {
         let value = &self.buf[self.off + RTATTR_HDR..self.off + len];
         self.off += align4(len);
         // The top two bits are NLA_F_NESTED and NLA_F_NET_BYTEORDER, not
-        // part of the type. Today's kernels emit the attributes this
-        // program matches flag-free, but a kernel that one day stamps
-        // NLA_F_NESTED on IFLA_VFINFO_LIST would otherwise make the VF
-        // list come back empty - and an exclusion set silently missing
-        // the sister VFs' own addresses is the worst failure direction
-        // this program has.
+        // type. Today's kernels emit these attributes flag-free, but a kernel
+        // that stamps NLA_F_NESTED on IFLA_VFINFO_LIST would otherwise return
+        // an empty VF list - an exclusion set missing the sister VFs, the
+        // worst failure direction this program has.
         Some((kind & 0x3fff, value))
     }
 }
@@ -1346,12 +1252,10 @@ fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
     })
 }
 
-/// Known limit: rtattr lengths are u16 on the wire. A VFINFO list beyond
-/// 64 KiB - roughly three hundred virtual functions on one PF with
-/// SKIP_STATS - arrives with its length silently wrapped by the kernel, and
-/// no parser on this side can tell a wrapped length from a true one. Hosts
-/// of that size need the kernel's own fix (split dumps); none of the driver
-/// families this has run on hands out that many per PF.
+/// Known limit: rtattr lengths are u16 on the wire. A VFINFO list beyond 64
+/// KiB (roughly three hundred VFs on one PF) arrives with its length wrapped
+/// by the kernel, and no parser can tell. Such hosts need the kernel's own
+/// fix; no driver family this has run on hands out that many per PF.
 fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
     if payload.len() < IFINFOMSG_LEN {
         return;
@@ -1370,10 +1274,9 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
                 continue;
             }
             for (mac_kind, mac_value) in attrs(vf_info) {
-                // struct ifla_vf_mac { __u32 vf; __u8 mac[32]; } - the vf
-                // number first, then the address, of which only the usual six
-                // bytes carry meaning. Anything shorter than number-plus-six
-                // cannot be that struct.
+                // struct ifla_vf_mac { __u32 vf; __u8 mac[32]; }: number
+                // first, then the address, of which six bytes carry meaning.
+                // Shorter than number-plus-six cannot be that struct.
                 const VF_MAC_OFF: usize = 4;
                 const VF_MAC_LEN: usize = 6;
                 if mac_kind == IFLA_VF_MAC && mac_value.len() >= VF_MAC_OFF + VF_MAC_LEN {
@@ -1412,19 +1315,16 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     }
 }
 
-/// The kernel-side noise filter for the subscription socket.
+/// The kernel-side noise filter for the subscription socket: classic BPF, 25
+/// instructions, no dependency. Reads the header byte-wise because cBPF loads
+/// are big-endian and the header is host-order.
 ///
-/// Classic BPF, 25 instructions, no dependency and no toolchain. It reads
-/// the netlink header byte-wise because cBPF's 16/32-bit loads are
-/// big-endian and the header is host-order - the classic trap. The logic,
-/// in order: a message longer than 64 KiB is accepted unseen (its length
-/// cannot be judged in 16 bits); a datagram with room for a second header
-/// behind align4(nlmsg_len) is accepted unseen (multi-message); a type
-/// other than RTM_NEWNEIGH/RTM_DELNEIGH is accepted; and only then, with
-/// the datagram proven to be a single neighbour message, is ndm_family
-/// compared against AF_BRIDGE - the one case that is dropped. Verified
-/// end to end in a network namespace: all bridge events delivered, all
-/// ARP and ND noise gone.
+/// In order: a message over 64 KiB is accepted unseen; a datagram with room
+/// for a second header behind align4(nlmsg_len) is accepted (multi-message);
+/// a type other than RTM_NEWNEIGH/RTM_DELNEIGH is accepted; only then, the
+/// datagram proven a single neighbour message, is ndm_family compared against
+/// AF_BRIDGE - the one case dropped. Verified in a netns: all bridge events
+/// delivered, all ARP/ND noise gone.
 fn attach_noise_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
     const fn stmt(code: u16, k: u32) -> libc::sock_filter {
         libc::sock_filter {
@@ -1507,14 +1407,11 @@ mod tests {
     }
     use super::*;
 
-    /// A netlink socket whose kernel is a thread in this test.
-    ///
-    /// A socketpair stands in for the netlink socket: everything the code
-    /// under test sends arrives at the other end, and what that end sends
-    /// arrives back with a zeroed sender address - which is what `recv`
-    /// insists on, a port id of zero, "the kernel". This is the only way to
-    /// reach the paths that only a kernel behaving in a particular way can
-    /// produce: a dump that does not fit, a question answered with nothing.
+    /// A netlink socket whose kernel is a thread in this test: a socketpair,
+    /// whose other end sends back with a zeroed sender address - port id
+    /// zero, "the kernel". The only way to reach paths only a particular
+    /// kernel behaviour produces: a dump that does not fit, a question
+    /// answered with nothing.
     fn kernel_pair() -> (Socket, std::os::fd::OwnedFd) {
         use std::os::fd::FromRawFd;
         let mut fds = [0 as libc::c_int; 2];
@@ -1523,10 +1420,9 @@ mod tests {
         let ours = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
         let theirs = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
         // Both ends give up waiting: the kernel side after half a second,
-        // because a datagram socketpair does not tell it when our end closes
-        // and the thread it runs on would never be joinable; our side the way
-        // a real netlink socket does, so the code under test meets the same
-        // WouldBlock it meets in production.
+        // because a datagram socketpair does not tell it when our end closes;
+        // our side the way a real netlink socket does, so the code under test
+        // meets the same WouldBlock.
         let timeout = |fd: &std::os::fd::OwnedFd, usec| {
             let tv = libc::timeval {
                 tv_sec: 0,
@@ -1784,14 +1680,11 @@ mod tests {
         put_attr(&mut nested, IFLA_INFO_KIND, b"vlan\0");
         put_attr(&mut body, IFLA_LINKINFO, &nested);
 
-        // A bridge's ageing time rides one level deeper still, inside
-        // IFLA_INFO_DATA. Nothing else in the tree reads it, so a wrong
-        // attribute id here is invisible everywhere else: the deletion
-        // dating simply stops moving stamps and every test still passes.
-        // The two ids are written as the numbers the kernel headers give
-        // - IFLA_INFO_DATA is 2, IFLA_BR_AGEING_TIME is 4 - and not as
-        // this file's constants, which would let the test agree with a
-        // decoder that reads the wrong attribute.
+        // A bridge's ageing time rides inside IFLA_INFO_DATA, and nothing
+        // else reads it, so a wrong attribute id here is invisible everywhere
+        // else. The ids are the kernel headers' numbers (IFLA_INFO_DATA 2,
+        // IFLA_BR_AGEING_TIME 4), not this file's constants, which would let
+        // the test agree with a wrong decoder.
         let mut br_data = Vec::new();
         put_attr(&mut br_data, 4, &30_000u32.to_ne_bytes());
         let mut br_info = Vec::new();
@@ -1865,17 +1758,12 @@ mod tests {
         attach_noise_filter(s.as_raw_fd()).expect("the kernel accepts the filter");
     }
 
-    /// A netlink attribute states its own length in sixteen bits, and
-    /// `nla_nest_end()` in the kernel writes that length without checking it
-    /// fits: a nest grown past 65535 bytes - IFLA_VFINFO_LIST on a card with
-    /// some hundreds of virtual functions - has its length silently truncated
-    /// to the low sixteen. Nothing here can repair such a message. What it
-    /// must do is refuse to be led out of the buffer by it, and come out
+    /// `nla_nest_end()` writes a nest's 16-bit length without checking it
+    /// fits: IFLA_VFINFO_LIST on a card with hundreds of VFs is silently
+    /// truncated to the low sixteen bits. Nothing can repair such a message;
+    /// the decoder must refuse to be led out of the buffer and come out
     /// *short* rather than plausible, because a short answer is what
-    /// warn_about_unknowable_vfs compares against sriov_numvfs and warns
-    /// about. This daemon asks one interface at a time and never for the
-    /// host-wide list, so the ceiling is one function's own VFs - but the
-    /// decoder is not allowed to depend on that.
+    /// warn_about_unknowable_vfs compares against sriov_numvfs.
     #[test]
     fn a_nest_that_lies_about_its_length_is_read_short_not_dangerously() {
         let vf_mac = |mac: [u8; 6]| {
@@ -1962,13 +1850,10 @@ mod tests {
         collect_vf_macs(&body, &mut out);
         assert_eq!(out, vec![(5, [2, 0, 0, 0, 0, 1]), (5, [2, 0, 0, 0, 0, 2])]);
 
-        // The same message with NLA_F_NESTED stamped on every nest type -
-        // the shape a kernel with strict netlink validation sends one day.
-        // The flag mask (`kind & 0x3fff`) is what makes this come out
-        // equal; its own comment calls the failure "the worst failure
-        // direction this program has" (an empty VF list loses the sibling
-        // VF addresses from the exclusion set), and until this test the
-        // mask was the suite's only surviving mutation.
+        // The same message with NLA_F_NESTED on every nest type - the shape a
+        // kernel with strict validation sends one day. The flag mask (`kind &
+        // 0x3fff`) makes this come out equal; until this test the mask was
+        // the suite's only surviving mutation.
         const NLA_F_NESTED: u16 = 0x8000;
         let mut list = Vec::new();
         let mut info = Vec::new();
@@ -2027,15 +1912,12 @@ mod tests {
         assert!(quiet.fdb.is_empty() && !quiet.links_changed);
     }
 
-    /// The kernel filter's DROP direction, which is its whole reason to
-    /// exist and had no test: an off-by-one in the hand-coded jump offsets
-    /// degrades silently to accept-everything, every suite stays green, and
-    /// the measured zero-wakeups-under-ARP-storm property is quietly dead.
-    /// AF_UNIX datagram pairs honour SO_ATTACH_FILTER with the production
-    /// semantics, so the program itself can be put on the wire here. The
-    /// deliver direction needs no twin: the daemon attaches this filter in
-    /// production, so a filter that dropped bridge events would fail every
-    /// event scenario in the netns suite.
+    /// The kernel filter's DROP direction had no test: an off-by-one in the
+    /// hand-coded jumps degrades silently to accept-everything with every
+    /// suite green. AF_UNIX datagram pairs honour SO_ATTACH_FILTER with
+    /// production semantics, so the program itself is put on the wire. The
+    /// deliver direction needs no twin: a filter that dropped bridge events
+    /// would fail every event scenario in the netns suite.
     #[cfg(target_endian = "little")]
     #[test]
     fn the_noise_filter_drops_what_it_exists_to_drop() {
@@ -2068,10 +1950,9 @@ mod tests {
         assert!(quiet.fdb.is_empty(), "nothing else should be queued");
     }
 
-    /// The registration request, byte for byte, and both answers to it. The
-    /// encoder had no test; a wrong flag here (CREATE without EXCL, a missing
-    /// NTF_SELF) would still "work" against a kernel and quietly mean
-    /// something else.
+    /// The registration request byte for byte, and both answers: a wrong flag
+    /// (CREATE without EXCL, a missing NTF_SELF) would still "work" against a
+    /// kernel and quietly mean something else.
     #[test]
     fn a_registration_is_asked_for_exactly_and_both_answers_are_understood() {
         let (mut sock, kernel) = kernel_pair();
@@ -2128,11 +2009,11 @@ mod tests {
         assert_eq!(&req[32..38], &[2, 0, 0, 0, 0, 5]);
     }
 
-    /// Lengths come off the wire and are believed nowhere: a message that
-    /// claims four gigabytes, an attribute that runs past its buffer, an
-    /// attribute shorter than its own header - each ends the walk, none
-    /// panics. The kernel does not send these; the point is that nothing
-    /// else may be able to make this daemon abort by sending them either.
+    /// Lengths come off the wire and are believed nowhere: a message claiming
+    /// four gigabytes, an attribute past its buffer or shorter than its
+    /// header
+    /// - each ends the walk, none panics. The kernel does not send these;
+    ///   nothing else may abort this daemon by sending them either.
     #[test]
     fn hostile_lengths_end_the_walk_instead_of_the_process() {
         // A message header claiming u32::MAX bytes.
@@ -2162,14 +2043,11 @@ mod tests {
         assert_eq!(attrs(&b).count(), 0);
     }
 
-    /// A question asked without NLM_F_DUMP has nothing to end, but a kernel
-    /// may end it anyway - an interface that disappears between the asking
-    /// and the answering gets exactly this. It used to fall through to the
-    /// catch-all arm and the caller waited out the whole five-second
-    /// deadline for an answer it had already been given.
-    ///
-    /// Verified by mutation: with the NLMSG_DONE arm removed this takes five
-    /// seconds and fails on the elapsed-time assertion.
+    /// A question without NLM_F_DUMP has nothing to end, but a kernel ends it
+    /// anyway for an interface that disappears between asking and answering;
+    /// falling through to the catch-all arm waited out the five-second
+    /// deadline. Verified by mutation: without the NLMSG_DONE arm this takes
+    /// five seconds.
     #[test]
     fn a_question_ended_by_the_kernel_returns_at_once() {
         let (mut sock, kernel) = kernel_pair();
@@ -2189,11 +2067,8 @@ mod tests {
         );
     }
 
-    /// A dump datagram larger than the buffer has to be asked for again into
-    /// a bigger one. Retrying into the same buffer is what used to happen,
-    /// and it produced six identical failures followed by an error about
-    /// interruptions that had not occurred.
-    ///
+    /// A dump datagram larger than the buffer is asked for again into a
+    /// bigger one; retrying into the same buffer gave six identical failures.
     /// Verified by mutation: with the resize removed the dump fails.
     #[test]
     fn a_dump_that_does_not_fit_grows_rather_than_giving_up() {
@@ -2248,15 +2123,11 @@ mod tests {
         );
     }
 
-    /// The one-interface question grows its buffer the way a dump does. It
-    /// used to give up instead: a PF whose virtual-function list outgrew
-    /// 64 KiB - a few hundred functions, which ConnectX hardware sells -
-    /// failed vf_macs_of, which failed the WHOLE pass, on every pass, for
-    /// ever. Fail-closed was the right direction, but "this host is too big
-    /// to reconcile at all" is not a state, it is a bug.
-    ///
-    /// Verified by mutation: with the resend-after-growing removed, this
-    /// fails with "the answer outgrew the buffer".
+    /// The one-interface question grows its buffer like a dump: a PF whose VF
+    /// list outgrew 64 KiB failed vf_macs_of and the WHOLE pass, for ever -
+    /// fail-closed was right, but "this host is too big to reconcile" is a
+    /// bug, not a state. Verified by mutation: without the resend after
+    /// growing this fails with "the answer outgrew the buffer".
     #[test]
     fn a_one_interface_answer_that_does_not_fit_grows_rather_than_failing() {
         let (mut sock, kernel) = kernel_pair();
@@ -2293,11 +2164,10 @@ mod tests {
         );
     }
 
-    /// The request that asks about virtual functions has to say that it does
-    /// not want their statistics. Nothing reads them, they come out of the
-    /// hardware, and they were two thirds of what a pass spent on this call.
-    /// A regression here would be invisible in behaviour and only show up as
-    /// the daemon quietly costing three times as much.
+    /// The VF request has to say it does not want statistics: they come out
+    /// of the hardware and were two thirds of the call. A regression here is
+    /// invisible in behaviour and shows only as the daemon costing three
+    /// times as much.
     #[test]
     fn the_virtual_function_request_asks_for_no_statistics() {
         let req = vf_request(7, 3);
@@ -2329,11 +2199,9 @@ mod tests {
     }
 
     /// A dump the kernel abandons ends with NLMSG_DONE carrying a negative
-    /// errno. Believing that end is believing a short table is the whole
-    /// table - which is how every registration past the cut gets removed.
-    ///
-    /// Verified by mutation: without reading the code this returns Ok and the
-    /// entries are silently lost.
+    /// errno; believing that end is believing a short table is the whole
+    /// table. Verified by mutation: without reading the code this returns Ok
+    /// and the entries are silently lost.
     #[test]
     fn a_dump_the_kernel_gave_up_on_is_not_a_finished_dump() {
         let (mut sock, kernel) = kernel_pair();

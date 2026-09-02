@@ -99,13 +99,11 @@ fn the_notes_are_out_of_other_users_reach() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A note that cannot be read means "could not tell", and the daemon
-/// leaves that device alone until it can. What it must not do is decide
-/// that once: the copy in memory is believed for as long as the file's
-/// identity, size and timestamp do not change, and a file that could not
-/// be read is a file nothing changed - so remembering the empty set that
-/// a failed read returns would make one bad moment permanent, and every
-/// entry the note names would stay in the card owned by nobody.
+/// A note that cannot be read means "could not tell", and the daemon leaves
+/// the device alone until it can - but must not decide that once: the copy is
+/// believed while identity, size and timestamp hold, and a file that could
+/// not be read is a file nothing changed, so a remembered empty set would
+/// make one bad moment permanent.
 #[test]
 fn a_note_that_could_not_be_read_is_not_remembered_as_an_empty_one() {
     let dir = scratch("unreadable");
@@ -449,13 +447,11 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
 }
 
 /// A batch that would grow the filter asks the driver afresh instead of
-/// believing the carried answer - always. A virtual function's address can
-/// change without any link message: a down PF announces nothing, and even
-/// an up one is silent when the guest changes it over the ixgbe/i40e
-/// mailbox - so no event reliably marks the carried answer stale, and the
-/// carried answer may be the only thing standing between a guest and its
-/// traffic being sent past it. Shrinking batches keep the carried answer:
-/// they cost at most a filter slot until the next pass.
+/// believing the carried answer - always: a VF's address can change without
+/// any link message (down PF, guest-side mailbox), and the carried answer may
+/// be the only thing between a guest and its traffic being sent past it.
+/// Shrinking batches keep the carried answer: at most a filter slot until the
+/// next pass.
 #[test]
 fn a_batch_that_would_register_asks_the_driver_afresh() {
     let dir = scratch("grow-refresh");
@@ -736,14 +732,11 @@ fn eexist_is_not_claimed_as_ours() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The note takes an address before the card does. Killed between the two,
-/// the old order left an entry in the card that no note named - permanent,
-/// counted as foreign, never touched again. The new order leaves a note
-/// naming an entry that is not there, and the ordinary paths heal that:
-/// the add is retried while the address is wanted, and the removal's
-/// ENOENT settles the note once it is not. A failed add is the observable
-/// half of that crash window - the intent has to be on file although the
-/// card never took the address.
+/// The note takes an address before the card does: killed between the two,
+/// the old order left an entry no note named - foreign, never touched again -
+/// where the new order leaves a note naming an absent entry, which the
+/// ordinary paths heal. A failed add is the observable half of that window:
+/// the intent has to be on file although the card never took the address.
 #[test]
 fn an_addition_is_noted_before_the_card_is_written() {
     let dir = scratch("note-first");
@@ -1135,13 +1128,11 @@ fn with_no_pairs_left_the_pass_still_sweeps_orphans() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An orphan whose note cannot be read is not an orphan that owns
-/// nothing - it is an orphan nobody can answer for. load_owned returns
-/// the empty set for both, and the empty branch used to unlink the note
-/// on that answer: one unreadable moment and the note was gone for good,
-/// with every entry it named still in the card and nothing left to say
-/// it was ours. The sibling branch fifteen lines down guards exactly
-/// this with note_is_readable; the empty branch has to as well.
+/// An orphan whose note cannot be read is one nobody can answer for, not one
+/// that owns nothing. load_owned returns the empty set for both, and the
+/// empty branch used to unlink the note on that answer - every entry it named
+/// left in the card with nothing to say it was ours. The sibling branch
+/// guards this with note_is_readable; the empty branch has to as well.
 #[test]
 fn an_orphan_with_an_unreadable_note_keeps_it() {
     let dir = scratch("orphan-unreadable");
@@ -1254,13 +1245,11 @@ fn a_missing_bridge_fails_closed() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A line appended while --flush is inside its read-unregister-unlink
-/// window must not be destroyed by the unlink. The window is real: a
-/// removal waits on rtnl, and the daemon appends the moment it registers.
-/// Losing the line leaves the freshly registered entry in the card with
-/// no owner on record - the orphan everything here exists to prevent.
-/// The writers hold the note's lock for exactly this reason, so the
-/// flush has to hold it across its window too.
+/// A line appended while --flush is inside its read-unregister-unlink window
+/// must not be destroyed by the unlink: a removal waits on rtnl, the daemon
+/// appends the moment it registers, and losing the line leaves the fresh
+/// entry with no owner on record. The writers hold the note's lock for this;
+/// the flush has to hold it across its window too.
 #[test]
 fn a_flush_cannot_lose_a_line_appended_while_it_runs() {
     let dir = scratch("flush-interleave");
@@ -1374,13 +1363,10 @@ fn a_detached_device_is_left_alone_rather_than_mistaken_for_the_port() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The unknowable-VF warning is for when the situation arises - which is
-/// not necessarily the first pass. A VF that is fully named today and
-/// handed to a guest tomorrow (its admin address cleared) becomes
-/// unknowable then; marking the uplink "warned" on a pass that had
-/// nothing to warn about silences the warning for the life of the
-/// process. And once the situation passes, it re-arms, the way the
-/// pinned-address warning does.
+/// The unknowable-VF warning is for when the situation arises, not
+/// necessarily the first pass: a VF fully named today and handed to a guest
+/// tomorrow becomes unknowable then, and marking the uplink "warned" on a
+/// harmless pass silences it for life. Once the situation passes, it re-arms.
 #[test]
 fn the_unknowable_vf_warning_fires_when_the_situation_arises() {
     let dir = scratch("unknowable-late");
@@ -1612,14 +1598,12 @@ fn scaling_stays_roughly_linear_in_the_forwarding_table() {
 }
 
 /// A guest that moves to another host takes its address with it, and the
-/// bridge learns that address on the uplink's own port from then on. The
-/// registration left behind is worse than useless: the eSwitch keeps
-/// handing that traffic to the uplink, and the bridge cannot send it back
-/// out of the port it came in on, so it is dropped. The batch that brings
-/// the news has to undo it.
+/// bridge learns it on the uplink's own port from then on. The registration
+/// left behind sends its traffic to the uplink, where the bridge drops it;
+/// the batch that brings the news has to undo it.
 ///
-/// Verified by mutation: with the reflection loop removed, nothing is
-/// removed and the note keeps the address.
+/// Verified by mutation: with the reflection loop removed, nothing is removed
+/// and the note keeps the address.
 #[test]
 fn an_address_that_reappears_on_the_wire_is_unregistered_at_once() {
     let dir = scratch("reflection");
@@ -1872,12 +1856,11 @@ fn a_note_replaced_by_another_process_is_read_again() {
 }
 
 /// A note written in the same instant it was read cannot be told from one
-/// written before it, and believing the copy then would mean believing
-/// something that was already out of date when it was made. The rule is
-/// that the timestamp has to be strictly older than the read.
+/// written before, and the copy would then be out of date when made: the
+/// timestamp has to be strictly older than the read.
 ///
-/// Verified by mutation: without the `mtime < read_at` condition this
-/// returns the stale set and fails.
+/// Verified by mutation: without `mtime < read_at` this returns the stale
+/// set.
 #[test]
 fn a_note_not_older_than_its_reading_is_never_believed() {
     let dir = scratch("note-instant");
@@ -1908,13 +1891,13 @@ fn a_note_not_older_than_its_reading_is_never_believed() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A pass dumps the host's whole forwarding table, so what a batch is
-/// worth has to be decided before one is scheduled. These are the four
-/// answers - and the difference between the first two is what the eBPF
-/// experiment measured as 3.5 seconds of CPU for nothing.
+/// A pass dumps the whole forwarding table, so what a batch is worth is
+/// decided before one is scheduled. Four answers; the difference between the
+/// first two is what the eBPF experiment measured as 3.5 seconds of CPU for
+/// nothing.
 ///
-/// Verified by mutation: returning true unconditionally makes the
-/// wire-side cases fail; returning false makes the others fail.
+/// Verified by mutation: true unconditionally fails the wire-side cases,
+/// false the others.
 #[test]
 fn only_a_batch_with_something_in_it_earns_a_pass() {
     let dir = scratch("worth");
@@ -2020,11 +2003,10 @@ fn a_note_is_added_to_rather_than_rewritten() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An address the note already names is not written again. It sounds like
-/// tidiness and is not: a full pass rewrites the file only when the set of
-/// addresses changed, and a second copy of a line does not change the set -
-/// so the file would grow by a line every time an address was registered
-/// afresh, and nothing would ever shorten it again.
+/// An address the note already names is not written again: a full pass
+/// rewrites the file only when the set changed, and a duplicate line does not
+/// change the set - the file would grow by a line per re-registration for
+/// ever.
 ///
 /// Verified by mutation: appending unconditionally leaves two lines.
 #[test]
@@ -2047,18 +2029,14 @@ fn a_note_does_not_collect_duplicate_lines() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A --flush from a second process replaces the note while the daemon is
-/// adding to it. Appending to what it left behind is right; carrying on
-/// with a copy in memory that describes the file it replaced is not.
+/// A --flush from a second process replaces the note while the daemon adds to
+/// it: appending to what it left is right, carrying on with a copy that
+/// describes the replaced file is not.
 ///
-/// This pins the ordinary case: the flush lands before the append reads
-/// the file, and the append works from what it found. It does *not*
-/// exercise the size check in `append_owned`, which covers the flush
-/// landing between that read and the write - a window this test cannot
-/// produce without a hook in the code to stop in. The check is kept
-/// because it is two comparisons and the alternative is a copy in memory
-/// that quietly disagrees with the file; its worth is argued, not
-/// measured.
+/// This pins the ordinary case (flush before the append's read). It does
+/// *not* exercise the size check in `append_owned`, which covers a flush
+/// between that read and the write - a window no test can produce without a
+/// hook; that check is kept on argument, not measurement.
 #[test]
 fn a_note_rewritten_between_read_and_append_is_not_remembered() {
     let dir = scratch("append-race");
@@ -2086,13 +2064,12 @@ fn a_note_rewritten_between_read_and_append_is_not_remembered() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// What a link message is about decides whether the driver has to be
-/// asked about virtual function addresses again - the most expensive
-/// thing a pass does. A container's veth is not a reason; the interface
-/// that hands out the functions is.
+/// What a link message is about decides whether the driver is asked about VF
+/// addresses again - the most expensive thing a pass does. A container's veth
+/// is no reason; the interface handing out the functions is.
 ///
-/// Verified by mutation: answering true always makes the veth case fail,
-/// answering false always makes the other three fail.
+/// Verified by mutation: always true fails the veth case, always false the
+/// other three.
 #[test]
 fn only_an_interface_with_virtual_functions_makes_their_addresses_stale() {
     let topo = host(mac(1));
@@ -2191,16 +2168,14 @@ fn the_temporary_note_is_this_process_alone() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A guest that moved away and came back: its address is in the set the
-/// last pass saw on the wire, so the fast path refuses to register it -
-/// rightly, because only a full dump can say where it is now. What it
-/// must not do is refuse *and* decide the batch was worth nothing: the
-/// full pass is the only thing that ever replaces that set, so the
-/// refusal would suppress its own correction and the guest would stay
-/// unreachable from the VFs until the timer, up to a full interval.
+/// A guest that moved away and came back: its address is in the set the last
+/// pass saw on the wire, so the fast path rightly refuses it - only a full
+/// dump can say where it is now. It must not also decide the batch was worth
+/// nothing: the full pass is the only thing that replaces that set, so the
+/// refusal would suppress its own correction until the timer.
 ///
-/// Verified by mutation: without `ours = true` on that path this returns
-/// Nothing and no pass is bought.
+/// Verified by mutation: without `ours = true` on that path no pass is
+/// bought.
 #[test]
 fn an_address_the_wire_set_still_holds_still_buys_a_pass() {
     let dir = scratch("wire-return");
@@ -2233,14 +2208,13 @@ fn an_address_the_wire_set_still_holds_still_buys_a_pass() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The fast path and the full pass have to agree about whether the
-/// carried answer on the virtual functions can still be believed. It used
-/// to be the pass's business alone: the fast path reused the answer
-/// whenever the list of physical functions matched, which is not the
-/// question - the addresses change without that list changing at all.
+/// The fast path and the full pass have to agree about whether the carried VF
+/// answer can still be believed. Reusing the answer whenever the PF list
+/// matched was not the question: the addresses change without that list
+/// changing.
 ///
-/// Verified by mutation: reusing the answer on a PF-list match alone lets
-/// the fast path register a virtual function's own address here.
+/// Verified by mutation: reusing on a PF-list match alone lets the fast path
+/// register a VF's own address.
 #[test]
 fn the_fast_path_asks_again_when_the_answer_went_stale() {
     let dir = scratch("vf-stale");
@@ -2268,14 +2242,13 @@ fn the_fast_path_asks_again_when_the_answer_went_stale() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An interface reload takes a bridge away for a moment. Deleting a live
-/// uplink's registrations over that - within 200 ms, on a routine
-/// `ifreload -a` - is the outage this daemon exists to prevent, performed
-/// by the daemon. A device has to stay gone before its note is believed
-/// to be an orphan.
+/// An interface reload takes a bridge away for a moment, and deleting a live
+/// uplink's registrations within 200 ms of a routine `ifreload -a` is the
+/// outage this daemon exists to prevent. A device has to stay gone before its
+/// note is believed an orphan.
 ///
-/// Verified by mutation: with the grace period ignored the first pass
-/// takes the addresses out.
+/// Verified by mutation: with the grace period ignored the first pass takes
+/// the addresses out.
 #[test]
 fn a_device_that_blinks_is_not_an_orphan() {
     let dir = scratch("orphan-grace");
@@ -2316,12 +2289,10 @@ fn a_device_that_blinks_is_not_an_orphan() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `--once` beside a running daemon writes the same note. A pass takes
-/// long enough for that to happen inside one - a single filter write has
-/// waited seconds on rtnl - and whoever wrote last used to keep only its
-/// own lines. The address the other one registered was then in the card
-/// owned by nobody: the orphan the notes exist to prevent, and one
-/// --flush cannot clean up, because it iterates the notes.
+/// `--once` beside a running daemon writes the same note, and a pass takes
+/// long enough for that to land inside one. Whoever wrote last used to keep
+/// only its own lines, leaving the other's address in the card owned by
+/// nobody - which --flush cannot clean up, because it iterates the notes.
 ///
 /// Verified by mutation: writing the pass's own picture instead of its
 /// difference loses the other writer's address.
@@ -2396,13 +2367,12 @@ fn a_pass_does_not_overwrite_what_appeared_while_it_ran() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A virtual function handed straight to a guest, with no address set
-/// from the host and no interface here, is in no exclusion set: its
-/// address is not knowable. Nothing can be done about that in code - so
-/// it has to be said, once, with the two ways to close it.
+/// A VF handed straight to a guest, with no host-set address and no interface
+/// here, is in no exclusion set: its address is not knowable, so it has to be
+/// said, once, with the two ways to close it.
 ///
-/// Verified by mutation: with the count comparison inverted the quiet
-/// case warns and this fails.
+/// Verified by mutation: with the count comparison inverted the quiet case
+/// warns.
 #[test]
 fn an_unknowable_virtual_function_is_reported_once() {
     let dir = scratch("vf-unknown");
@@ -2829,12 +2799,10 @@ fn a_replaced_port_does_not_inherit_the_memory() {
 }
 
 /// The clock survives with the memory: an address that went quiet before a
-/// restart keeps its age, so the valve still sheds the longest-silent
-/// first rather than treating every survivor as newborn. Asserted through
-/// the valve, because ordering evictions is the only thing the number is
-/// for - reading it back out of the file would pass even if the loading
-/// process had restamped it, because then it would write the same value
-/// back.
+/// restart keeps its age, so the valve still sheds longest-silent first.
+/// Asserted through the valve, because ordering evictions is the only thing
+/// the number is for - reading it back out of the file would pass even if
+/// loading had restamped it.
 #[test]
 fn the_missing_clock_survives_a_restart() {
     let dir = scratch("quiet-clock-restart");
@@ -2937,12 +2905,10 @@ fn a_damaged_memory_file_is_stepped_over() {
 }
 
 /// A kept address missing from the filter is a growth, and a growth on a
-/// carried VF answer is the bug class the grow-refresh exists for: the
-/// fresh answer may call it a VF's own address, and then it must not come
-/// back. The card holds everything else, so the kept address is the ONLY
-/// thing that can trip the trigger - a pass that puts the survivors into
-/// `want` after the trigger decided would sail past it and register on
-/// the carried answer.
+/// carried VF answer is the bug class the grow-refresh exists for. The card
+/// holds everything else, so the kept address is the ONLY thing that can trip
+/// the trigger - a pass that puts the survivors into `want` after the trigger
+/// decided would register on the carried answer.
 #[test]
 fn a_kept_absent_address_triggers_the_grow_refresh() {
     let dir = scratch("quiet-grow");
@@ -4003,15 +3969,10 @@ fn an_empty_memory_leaves_no_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A stamp from the future is brought back to now, not believed.
-///
-/// The clock counts from boot, so a memory file that outlives a reboot
-/// carries stamps that are hours ahead of a freshly started machine's.
-/// Believed, such a stamp says "spoke since the last pass" for the life of
-/// the process - which is not a harmless "youngest": an address that is
-/// never quiet is never a candidate the pressure valve can surrender, so
-/// the slot is held until the guest itself leaves the bridge, which is
-/// exactly the deadlock the valve exists to prevent.
+/// A stamp from the future is brought back to now, not believed: believed, it
+/// says "spoke since the last pass" for the life of the process, so the
+/// address is never a candidate the valve can surrender and the slot is held
+/// until the guest itself leaves - the deadlock the valve exists to prevent.
 #[test]
 fn a_future_stamp_is_clamped_not_believed() {
     let dir = scratch("quiet-future-stamp");
@@ -4861,13 +4822,11 @@ fn a_memory_file_from_another_format_is_ignored() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A bridge forgets an address exactly its ageing time after the last
-/// frame from it, so the deletion it announces dates that frame: the
-/// guest spoke one ageing time ago. Where the pass had only "it was
-/// still there when I looked", the deletion can say "and it went on
-/// speaking after that" - never the reverse, which is what the
-/// only-if-later guard is for. The valve evicts by this number, so an
-/// address the bridge vouches for outlives one it says nothing about.
+/// A bridge forgets an address exactly its ageing time after the last frame,
+/// so the deletion dates that frame: where the pass had only "still there
+/// when I looked", the deletion says "and it went on speaking after that" -
+/// never the reverse, which is what the only-if-later guard is for. The valve
+/// evicts by this number.
 #[test]
 fn a_deletion_says_how_long_after_the_pass_the_guest_spoke() {
     let dir = scratch("delneigh-dates");
@@ -5029,13 +4988,11 @@ fn the_date_is_one_ageing_time_before_the_deletion() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Stamps only ever move forward, whoever writes them. The sources do
-/// not share a clock reading: a pass stamp is nudged past its
-/// predecessor and can sit a millisecond ahead of the clock a learn
-/// moments later reads, and a deletion's date is deliberately older than
-/// now. Written without that rule, a learn - the very evidence that a
-/// guest is alive - could set its stamp back and make it the pressure
-/// valve's first victim.
+/// Stamps only ever move forward, whoever writes them: the sources do not
+/// share a clock reading (a nudged pass stamp can sit ahead of the clock a
+/// learn reads moments later, a deletion's date is older than now), and a
+/// learn that set a stamp back would make a live guest the valve's first
+/// victim.
 #[test]
 fn a_stamp_never_moves_backwards_whoever_writes_it() {
     let dir = scratch("stamp-monotone");
@@ -5220,13 +5177,11 @@ fn a_blind_pass_does_not_move_the_ground() {
 
 /// The memory only ever learns about addresses this daemon registered.
 ///
-/// A deletion arrives for every address the bridge forgets, ours or not,
-/// and `date_the_silence` dates them all - but an address with no entry
-/// yet gets one only when a port comes with it, and a deletion carries
-/// none. Without that, the neighbour's printer would sit in the memory,
-/// and the pressure valve draws its victims from there: it would send a
-/// `bridge fdb del` for an entry this daemon never put in the card, which
-/// is the one thing the removal path may never do.
+/// A deletion arrives for every address the bridge forgets, and
+/// `date_the_silence` dates them all - but an address with no entry gets one
+/// only with a port, which a deletion does not carry. Otherwise the
+/// neighbour's printer would sit in the memory and the valve would `bridge
+/// fdb del` an entry this daemon never put in the card.
 #[test]
 fn a_deletion_alone_never_puts_an_address_into_the_memory() {
     let dir = scratch("memory-owned-only");
@@ -5261,13 +5216,11 @@ fn a_deletion_alone_never_puts_an_address_into_the_memory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// What the valve surrenders, it also stops counting.
-///
-/// The occupancy is what the next burst measures its room against, and
-/// `present` is what tells the decide phase an address is already in the
-/// card. A shed entry that stays in either makes the valve believe it
-/// freed nothing - so it sheds again, and again, one guest per burst,
-/// while the card never gets any emptier.
+/// What the valve surrenders, it also stops counting: the occupancy is what
+/// the next burst measures against, and `present` tells the decide phase an
+/// address is already in. A shed entry left in either makes the valve believe
+/// it freed nothing and shed again, one guest per burst, while the card never
+/// gets emptier.
 #[test]
 fn a_shed_entry_stops_being_counted() {
     let dir = scratch("shed-bookkeeping");
@@ -5312,15 +5265,11 @@ fn a_shed_entry_stops_being_counted() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The note writers never follow a symlink.
-///
-/// `ensure_state_dir` narrows a state directory it finds group- or
-/// world-writable, but it cannot remove what was planted in it before that
-/// first narrowing - and this daemon writes as root. The whole-set writer
-/// renames a temporary into place, and rename does not follow a link, so
-/// the exposed name is the temporary's: it is derived from the file and
-/// this process's id, which is not a secret. The append path opens the
-/// note itself and is exposed directly.
+/// The note writers never follow a symlink: `ensure_state_dir` cannot remove
+/// what was planted before its first narrowing, and this daemon writes as
+/// root. The whole-set writer renames a temporary into place (rename does not
+/// follow a link, and the exposed name is the temporary's, derived from file
+/// and pid); the append path opens the note itself and is exposed directly.
 #[test]
 fn the_note_writers_refuse_a_symlink() {
     let dir = scratch("note-nofollow");
@@ -5432,14 +5381,11 @@ fn a_fast_registration_records_the_port_it_was_learnt_on() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A deletion dates the memory of the uplinks its own bridge serves, and
-/// no others.
-///
-/// The ageing time comes from the bridge that forgot the address, so
-/// handing that answer to every uplink let one bridge's interval date
-/// another's keeps: a dual-homed guest, or the same segment bridged twice,
-/// drags an hour-old entry forward to five minutes old, and the pressure
-/// valve then surrenders a genuinely quieter guest instead.
+/// A deletion dates the memory of the uplinks its own bridge serves, and no
+/// others: the ageing time comes from the bridge that forgot the address, and
+/// handing that answer to every uplink let a dual-homed guest drag an
+/// hour-old entry forward to five minutes, so the valve surrendered a
+/// genuinely quieter guest.
 #[test]
 fn a_deletion_dates_only_the_bridge_it_came_from() {
     let dir = scratch("dating-per-bridge");
@@ -5543,14 +5489,11 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A process that has not read the memory file does not delete it.
-///
-/// "Nothing in `carried_ports`" means two things: nothing to remember, and
-/// nobody has looked yet. `load_ports` runs at one place only - the pass's
-/// pair loop, behind three fail-closed `continue`s - while the reflection
-/// path reaches `save_ports` straight from a batch. Told apart wrongly, the
-/// previous process's keeps are unlinked unread, and the next pass
-/// unregisters every guest that went quiet across the restart.
+/// A process that has not read the memory file does not delete it. "Nothing
+/// in `carried_ports`" means either nothing to remember or nobody has looked
+/// yet - `load_ports` runs only in the pass's pair loop, while the reflection
+/// path reaches `save_ports` from a batch. Told apart wrongly, the previous
+/// process's keeps are unlinked unread.
 #[test]
 fn a_reflection_before_the_first_pass_keeps_the_memory_file() {
     let dir = scratch("reflection-keeps-file");
@@ -5597,15 +5540,11 @@ fn a_reflection_before_the_first_pass_keeps_the_memory_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A note left mid-address by an unfinished write is cut back, not built on.
-///
-/// `append_owned_locked` is the one writer that works in place. A write that
-/// stops halfway - a full /run, or a process that was killed - leaves the
-/// file ending inside an address with no newline. Appending to that glues
-/// two addresses into one unreadable line: the card gets an entry that no
-/// note names any more, and neither a pass nor `--flush` can reach it,
-/// because both work from the notes. That is hard invariant 3, broken by a
-/// full filesystem.
+/// A note left mid-address by an unfinished write is cut back, not built on:
+/// `append_owned_locked` works in place, and a write that stops halfway (a
+/// full /run, a killed process) leaves the file ending inside an address.
+/// Appending glues two addresses into one unreadable line, and the card gets
+/// an entry no note names - invariant 3, broken by a full filesystem.
 #[test]
 fn an_unfinished_note_line_is_cut_back_before_appending() {
     let dir = scratch("note-halfline");
@@ -5651,14 +5590,11 @@ fn an_unfinished_note_line_is_cut_back_before_appending() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The fast path does not make a port memory before the file was read.
-///
-/// `load_ports` bails out when a map is already carried in RAM, so whoever
-/// creates that map first decides whether the previous process's file is
-/// ever read at all. The fast path can get there first: `load_ports` runs
-/// at one place only, in the pass's pair loop behind three fail-closed
-/// `continue`s, while a batch reaches `fast_apply` from the picture alone.
-/// Without the guard the empty map wins and the keeps are lost unread.
+/// The fast path does not make a port memory before the file was read:
+/// `load_ports` bails out when a map is already carried, so whoever creates
+/// the map first decides whether the previous process's file is ever read -
+/// and a batch reaches `fast_apply` before the pass's pair loop. Without the
+/// guard the empty map wins and the keeps are lost unread.
 #[test]
 fn a_batch_before_the_first_pass_does_not_shadow_the_memory_file() {
     let dir = scratch("fastpath-shadow");
@@ -5702,14 +5638,11 @@ fn a_batch_before_the_first_pass_does_not_shadow_the_memory_file() {
 }
 
 /// A rename that happened while nothing was running still carries the keeps.
-///
-/// The warm case - the daemon watched the rename - was covered, and it is
-/// the easy one: the memory is in RAM and the move takes it. The cold case
-/// is the one a rename actually happens in (a udev rule, an `ip link set
-/// name` between boots of the service), and there nothing is carried:
-/// `load_ports` only ever runs for a name that is still a pair, so the old
-/// name's map is empty and `migrate_note` unlinks the file it would have
-/// come from.
+/// The warm case (daemon watched the rename) is the easy one, the memory is
+/// in RAM. The cold case is the one a rename actually happens in (udev, `ip
+/// link set name` between service boots), and there `load_ports` only runs
+/// for a name that is still a pair, so the old name's map is empty and
+/// `migrate_note` unlinks the file it would have come from.
 #[test]
 fn a_rename_while_stopped_carries_the_quiet_memory_too() {
     let dir = scratch("rename-cold");
@@ -5775,15 +5708,12 @@ fn a_rename_while_stopped_carries_the_quiet_memory_too() {
 }
 
 /// A rename whose pass never reaches the pair loop still marks the new name
-/// as read.
-///
-/// Normally `load_ports` does that at the top of the pair loop, which makes
-/// the line in the rename block look redundant. It is not: the pair loop
-/// has three fail-closed exits before it, and a pass that migrates the note
-/// and then bails on one of them leaves a fully carried memory that nothing
-/// counts as read - so the fast path stops stamping it while the valve goes
-/// on judging it against the pass stamp, and a guest that just spoke is
-/// named longest-silent.
+/// as read. Normally `load_ports` does that at the top of the pair loop,
+/// which makes the line in the rename block look redundant - but the loop has
+/// three fail-closed exits before it, and a pass that migrates the note and
+/// bails on one of them leaves a carried memory nothing counts as read: the
+/// fast path stops stamping it while the valve judges it, and a guest that
+/// just spoke is named longest-silent.
 #[test]
 fn a_rename_marks_the_new_name_even_when_the_pass_bails() {
     let dir = scratch("rename-bails");
@@ -5827,14 +5757,11 @@ fn a_rename_marks_the_new_name_even_when_the_pass_bails() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A keep the card never took frees no slot, and the valve says so.
-///
-/// The candidates come from the pass's keeps, which are read off the note -
-/// and the note deliberately holds on to an address whose registration
-/// failed outright, because that is the crash posture. Deleting such an
-/// address frees nothing. Reporting it as freed made the caller believe it
-/// had made room, so the warning that says the card is being written past
-/// its limit stayed silent.
+/// A keep the card never took frees no slot, and the valve says so:
+/// candidates come from the note, which deliberately keeps an address whose
+/// registration failed (the crash posture), and reporting its deletion as
+/// freed made the caller believe it had made room, so the over-limit warning
+/// stayed silent.
 #[test]
 fn a_keep_the_card_never_took_frees_no_slot() {
     let dir = scratch("phantom-keep");
@@ -5931,13 +5858,11 @@ fn the_two_capacity_warnings_do_not_clear_each_other() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The pass records what the card holds, not what it wanted to hold.
-///
-/// `holds` is built from the card's own read-back plus what the
-/// registrations landed, minus what the stale loop took out. Recording the
-/// intent instead - or forgetting the removals - leaves the count high, and
-/// the count is what the next burst measures its room against and what
-/// decides whether an ageing batch is answered at the fast rate.
+/// The pass records what the card holds, not what it wanted: `holds` is the
+/// read-back plus what the registrations landed, minus what the stale loop
+/// took out. Recording intent, or forgetting the removals, leaves the count
+/// high - and the count decides the next burst's room and whether an ageing
+/// batch is answered at the fast rate.
 #[test]
 fn a_pass_records_the_card_not_its_intent() {
     let dir = scratch("holds-observed");
@@ -5998,14 +5923,11 @@ fn a_pass_records_the_card_not_its_intent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The notes never copy a foreign file into the journal.
-///
-/// `noted_devices` lists the state directory, and until now it asked only
-/// what a name ended in. A symlink called `<x>.owned` pointing somewhere
-/// else was therefore read as a note - by a daemon running as root - and
-/// every line it could not parse went into the warning verbatim. Two
-/// answers: such an entry is not an ordinary file and is skipped, and an
-/// unreadable line is reported by number and length, never by content.
+/// The notes never copy a foreign file into the journal: `noted_devices` used
+/// to ask only what a name ended in, so a symlink `<x>.owned` pointing
+/// elsewhere was read as a note by a root daemon and every unparsable line
+/// went into the warning verbatim. Such an entry is skipped, and an
+/// unreadable line is reported by number and length.
 #[test]
 fn a_foreign_file_in_the_state_directory_is_not_read_out_loud() {
     let dir = scratch("state-symlink");
@@ -6032,13 +5954,10 @@ fn a_foreign_file_in_the_state_directory_is_not_read_out_loud() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A note that is gone takes its cached index record with it.
-///
-/// The index record lives beside the note and moves with it: `--flush` from
-/// a second terminal unlinks both. Keeping the cached index then makes
-/// `note_index` short-circuit for the life of the process, so the record is
-/// never written again - and a later rename of that uplink is read as a
-/// disappearance, because `renamed_target` has nothing to match on.
+/// A note that is gone takes its cached index record with it: the record
+/// lives beside the note and a second-terminal `--flush` unlinks both.
+/// Keeping the cached index makes `note_index` short-circuit for life, the
+/// record is never rewritten, and a later rename reads as a disappearance.
 #[test]
 fn a_vanished_note_clears_the_cached_index() {
     let dir = scratch("index-cache");

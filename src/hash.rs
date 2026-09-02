@@ -1,34 +1,21 @@
 //! A fast hash for keys that are already random.
 //!
-//! The standard library hashes with SipHash-1-3, which is a good default
-//! because it makes hash collisions unpredictable to somebody who gets to
-//! choose the keys. What this daemon hashes is MAC addresses, interface
-//! indices and a handful of interface names - and it hashes them constantly:
-//! a pass over a large host puts thousands of addresses through several sets.
-//! SipHash's guarantee costs more than the lookups themselves.
+//! SipHash-1-3 makes collisions unpredictable to somebody who chooses the
+//! keys, and costs more than the lookups themselves: this daemon hashes MAC
+//! addresses and interface indices constantly, thousands per pass. This is
+//! rustc's multiply-rotate hash (FxHash), written out rather than taken as a
+//! dependency - the daemon is one dependency deep on purpose.
 //!
-//! This is the multiply-rotate hash rustc uses internally (FxHash), written
-//! out here rather than taken as a dependency: the whole daemon is one
-//! dependency deep on purpose, which is what makes a static binary for a
-//! foreign host a matter of one build flag.
+//! The attacker is real, though: the keys are addresses the bridges learnt,
+//! and a guest chooses those by sending frames; thousands in one bucket turn
+//! every lookup into a walk. So the state is seeded once per process from the
+//! kernel's random pool: the arrangement is not the same twice, so there is
+//! nothing to aim at. Not SipHash's guarantee - somebody who learns the seed
+//! can still construct collisions - but the difference between an attack
+//! copied from a blog post and one that needs this process's memory.
 //!
-//! What SipHash buys and this does not is collisions an attacker cannot
-//! predict, and here the attacker is real: the keys are MAC addresses the
-//! bridges learnt, and a guest behind the bridge chooses those by sending
-//! frames. Thousands of addresses that all land in one bucket turn every
-//! lookup into a walk, and a pass over a large table is where this daemon
-//! spends what little time it spends.
-//!
-//! So the state is seeded, once per process, from the kernel's random pool.
-//! The multiply-rotate step is unchanged and still costs a multiplication;
-//! what changes is that the arrangement it produces is not the same twice, so
-//! there is nothing to aim at. That is not SipHash's guarantee - somebody who
-//! learns the seed can still construct collisions - but it is the difference
-//! between an attack anybody can copy from a blog post and one that needs the
-//! contents of this process's memory.
-//!
-//! The pool is asked without waiting, and a refusal falls through to weaker
-//! per-start sources rather than to a constant - `fresh_seed` tells why.
+//! The pool is asked without waiting; a refusal falls through to weaker
+//! per-start sources, never to a constant - `fresh_seed` says why.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -64,29 +51,23 @@ const AT_RANDOM: libc::c_ulong = 25;
 
 /// This process's seed, from the first source that answers.
 ///
-/// The seed is chosen once and then never changes, so there is no second
-/// chance at it: whatever this returns is what the daemon hashes with until
-/// it exits. That is why a source that will not answer has to fall through
-/// to another one rather than to a constant. A daemon started by systemd at
-/// boot - which is how this one is started - can easily ask before the
-/// kernel's pool is initialised, and that used to leave every host in the
-/// fleet hashing with the same arrangement: exactly the thing a guest behind
+/// Chosen once and never changed, so a source that will not answer must fall
+/// through to another, not to a constant: a daemon started by systemd at boot
+/// can ask before the pool is initialised, and a constant left every host in
+/// the fleet hashing with the same arrangement - exactly what a guest behind
 /// the bridge gets to aim at.
 fn fresh_seed() -> u64 {
     if let Some(n) = from_getrandom() {
         return n | 1;
     }
-    // The pool is not ready. What is left is not as good - the bytes the
-    // kernel handed this process at exec came from the same pool, and a
-    // clock at boot is a narrow range - but between them they differ from
+    // The pool is not ready. What is left is weaker - the exec bytes came
+    // from the same pool, a boot clock is a narrow range - but differs from
     // one process to the next, which the constant did not.
     (from_auxv() ^ from_the_moment()) | 1
 }
 
-/// Eight bytes from the kernel, if it has any to give without waiting.
-///
-/// `GRND_NONBLOCK` rather than a wait: a daemon that blocks here blocks the
-/// boot it was ordered into. The failure it buys is handled above.
+/// Eight bytes from the kernel, if it has any without waiting: a daemon that
+/// blocks here blocks the boot it was ordered into.
 fn from_getrandom() -> Option<u64> {
     let mut bytes = [0u8; 8];
     let mut got = 0;
@@ -109,11 +90,9 @@ fn from_getrandom() -> Option<u64> {
     Some(u64::from_ne_bytes(bytes))
 }
 
-/// The bytes the kernel put on the stack when it started this process.
-///
-/// Drawn from the same pool `getrandom` refused from, so at early boot they
-/// are no better than it is - but they are drawn per process, so two daemons
-/// on two hosts do not get the same ones.
+/// The bytes the kernel put on the stack at exec - from the same pool
+/// `getrandom` refused from, so no better at early boot, but drawn per
+/// process.
 fn from_auxv() -> u64 {
     let at = unsafe { libc::getauxval(AT_RANDOM) } as *const u8;
     if at.is_null() {
@@ -258,10 +237,10 @@ mod tests {
         assert_eq!(m.get(&8), None);
     }
 
-    /// The arrangement must not be the same in two processes, or a guest that
-    /// chooses the addresses the bridge learns can choose which of them
-    /// collide. Same process, same answer - a set whose hasher changed under
-    /// it would never find anything again.
+    /// The arrangement must differ between two processes, or a guest choosing
+    /// the addresses the bridge learns chooses which collide. Same process,
+    /// same answer - a set whose hasher changed under it would never find
+    /// anything.
     #[test]
     fn the_seed_is_per_process_and_stable_within_it() {
         let a = hash_of(&[0x02u8, 0, 0, 0, 0, 1]);
@@ -285,11 +264,9 @@ mod tests {
         );
     }
 
-    /// The seed is chosen once and never again, so the path taken when the
-    /// kernel's pool is not ready yet - a daemon started at boot - decides
-    /// the arrangement for that whole process's life. It used to be a
-    /// constant, which is to say the same arrangement on every host that
-    /// started early. Whatever it is now, it has to differ between starts.
+    /// The seed is chosen once, so the path taken when the pool is not ready
+    /// (a daemon started at boot) decides the arrangement for the process's
+    /// life. It has to differ between starts.
     #[test]
     fn the_seed_without_the_pool_still_differs_between_starts() {
         let mut seen = std::collections::HashSet::new();

@@ -16,9 +16,9 @@ function and its VFs, which is exactly the experimental figure. The daemon asks
 over devlink at startup — and again when a pair appears at runtime — and both
 warns above what the card says and releases quiet addresses to stay under it; `--max` or
 `MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
-place. `-v` reports the card's answer, or its silence; a written-down `--max`
-settles the number before devlink is ever asked, so nothing is printed for it
-at any verbosity.
+place. The daemon reports the card's answer, or its silence, at start; a
+written-down `--max` settles the number before devlink is ever asked, so
+nothing is printed for it.
 
 devlink is not otherwise used and cannot be: it has no forwarding database, no
 unicast filter and no neighbour notifications. This one number is the whole of

@@ -1,18 +1,17 @@
 //! sriov-mac-sync - make hosts behind a Linux bridge reachable from an SR-IOV
 //! virtual function.
 //!
-//! A NIC with SR-IOV switches internally. Its forwarding table holds the
-//! addresses of its own vports and nothing else, so a frame from a VF to any
-//! other destination misses and is pushed out on the wire. That is right until
-//! the uplink is a bridge port and the bridge carries local guests or a second
-//! NIC: those peers sit behind the uplink, and frames for them leave the host
-//! and are lost. Broadcast still floods, so address resolution succeeds and
-//! the unicast that follows disappears.
+//! A NIC with SR-IOV switches internally: its forwarding table holds its own
+//! vports and nothing else, so a frame from a VF to any other destination
+//! misses and goes out on the wire. Wrong as soon as the uplink is a bridge
+//! port carrying local guests or a second NIC: frames for those peers leave
+//! the host and are lost - broadcast still floods, so address resolution
+//! succeeds and the unicast that follows disappears.
 //!
-//! An address can be put into the uplink's own unicast filter list, which the
-//! driver mirrors into the NIC's vport context; the internal switch then has a
-//! hit and delivers to the uplink, where the bridge takes over. This daemon
-//! keeps that list in step with what the bridges learn.
+//! An address put into the uplink's own unicast filter list is mirrored into
+//! the vport context; the internal switch then hits and delivers to the
+//! uplink, where the bridge takes over. This daemon keeps that list in step
+//! with what the bridges learn.
 
 mod daemon;
 mod devlink;
@@ -43,14 +42,11 @@ const STATE_DIR_FALLBACK: &str = "/var/run/sriov-mac-sync";
 
 /// Where the notes live on THIS system.
 ///
-/// `/run` is the tmpfs on every systemd platform. OpenWrt up to 23.05 has
-/// no `/run` at all, and creating it there puts the state on the overlay:
-/// persistent flash, worn by every note write, and a "reboot starts from
-/// nothing" story that quietly stops being true. `/var/run` is OpenWrt's
-/// spelling of the same tmpfs (a symlink into /tmp); 24.10 symlinks `/run`
-/// to it as well, where this simply takes the first spelling. Decided by
-/// what the system provides, not by a build flag, so one binary is right
-/// on all of them.
+/// `/run` is the tmpfs on every systemd platform; OpenWrt up to 23.05 has no
+/// `/run`, and creating it puts the state on the overlay - persistent flash,
+/// and "reboot starts from nothing" quietly stops being true. `/var/run` is
+/// OpenWrt's spelling of the same tmpfs; 24.10 symlinks `/run` to it. Decided
+/// by what the system provides, so one binary is right on all of them.
 fn state_dir() -> PathBuf {
     if std::path::Path::new("/run").is_dir() {
         PathBuf::from(STATE_DIR)
@@ -61,16 +57,11 @@ fn state_dir() -> PathBuf {
 
 /// Ordinary progress, on stdout.
 ///
-/// Everything this daemon says used to go to stderr, which systemd timestamps
-/// exactly like stdout and nobody ever noticed. procd on OpenWrt does notice:
-/// it files stderr under the error level, so a service whose whole normal life
-/// (started, registered, reconciled) arrives as `daemon.err` teaches the
-/// operator that its log is noise. Trouble still goes to stderr, which is what
-/// makes the distinction worth anything.
-///
-/// Flushed on every line: stdout is block-buffered when it is a pipe, which is
-/// exactly what an init system hands a daemon, and a log that appears in
-/// four-kilobyte lumps hours later is not a log.
+/// procd on OpenWrt files stderr under the error level, so a service whose
+/// whole normal life arrives as `daemon.err` teaches the operator its log is
+/// noise; trouble still goes to stderr. Flushed on every line: stdout is
+/// block-buffered on a pipe, which is what an init system hands a daemon, and
+/// a log that appears in four-kilobyte lumps hours later is not a log.
 #[macro_export]
 macro_rules! note {
     ($($arg:tt)*) => {{
@@ -125,11 +116,11 @@ impl Default for Options {
 /// Set by the signal handler, read by the daemon loop.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
-/// The write end of the stop pipe, or -1 before `catch_signals` made one.
-/// The flag alone leaves a race: a signal that lands between the loop's
-/// `stopping()` check and its poll has already been consumed, and the poll
-/// then sleeps toward the full interval - systemd's stop timeout turns
-/// that into a SIGKILL. The byte in the pipe is what wakes the poll.
+/// The write end of the stop pipe, or -1 before `catch_signals` made one. The
+/// flag alone races: a signal between the loop's `stopping()` check and its
+/// poll is consumed, the poll sleeps toward the full interval, and systemd's
+/// stop timeout turns that into a SIGKILL. The byte in the pipe wakes the
+/// poll.
 static STOP_PIPE_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 /// SIGHUP arrived: the operator wants a pass, now and trusting nothing.
 static RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -156,18 +147,12 @@ fn stopping() -> bool {
 
 /// Ask for SIGTERM and SIGINT rather than being killed by them.
 ///
-/// Nothing is undone on the way out: the registrations stay in the card and
-/// the notes stay in /run, which is what makes restarting the daemon - for an
-/// update, say - invisible to every guest behind the bridge. Taking them out
-/// would put a gap there on every restart, and `--flush` is the way to say
-/// that is what you want.
-///
-/// What this buys is smaller and worth having anyway: the loop finishes what
-/// it is doing, says how it ended and how much is deliberately left behind,
-/// and systemd sees a service that stopped rather than one that was killed.
-/// `sigaction` without SA_RESTART, so the poll the daemon spends its life in
-/// returns instead of being restarted under us - with SA_RESTART a stop would
-/// wait out the full reconciliation interval.
+/// Nothing is undone on the way out: registrations and notes stay, which is
+/// what makes a restart invisible to every guest; `--flush` is the way to say
+/// otherwise. What this buys: the loop finishes what it is doing, says how it
+/// ended, and systemd sees a service that stopped rather than one that was
+/// killed. `sigaction` without SA_RESTART, so the poll returns instead of
+/// being restarted - with it a stop would wait out the full interval.
 fn catch_signals() -> Option<std::os::fd::OwnedFd> {
     // The pipe before the handlers, so no caught signal can find fd -1.
     let stop_rx = unsafe {
@@ -181,13 +166,11 @@ fn catch_signals() -> Option<std::os::fd::OwnedFd> {
         }
     };
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    // `sa_sigaction` is the only name libc has for this field on any Linux
-    // target - the C struct puts the one-argument handler and the
-    // three-argument one in a union, and the flags say which of them the
-    // kernel is looking at. No SA_SIGINFO below, so it is the one-argument
-    // one, which is what `note_signal` is. Setting SA_SIGINFO to match the
-    // field's name is what would be wrong: the kernel would then call a
-    // three-argument handler that is not there.
+    // `sa_sigaction` is the only name libc has for this field: the C struct
+    // puts the one- and three-argument handlers in a union, and the flags say
+    // which the kernel calls. No SA_SIGINFO, so it is the one-argument
+    // `note_signal`; setting SA_SIGINFO to match the field's name would have
+    // the kernel call a three-argument handler that is not there.
     action.sa_sigaction = note_signal as *const () as libc::sighandler_t;
     action.sa_flags = 0;
     unsafe {
@@ -249,15 +232,11 @@ See sriov-mac-sync(8) for the whole of it.
     )
 }
 
-/// The addresses in one `EXTRA`, `EXCLUDE`, `--extra` or `--exclude` value.
-///
-/// Commas or whitespace, in any mixture: somebody who writes
-/// `EXCLUDE=aa:...:ff, 02:...:01` means two addresses, and so does somebody
-/// whose editor put a tab between them. Splitting on the comma and the space
-/// alone made the tab part of the address, and then the whole thing was "not
-/// an address, ignored" - the address they meant never excluded, over a
-/// character they cannot see. `PAIRS` has always taken any whitespace; these
-/// now do too.
+/// The addresses in one `EXTRA`, `EXCLUDE`, `--extra` or `--exclude` value:
+/// commas or whitespace in any mixture. Splitting on comma and space alone
+/// made a tab part of the address, and the address somebody meant was never
+/// excluded - over a character they cannot see. `PAIRS` has always taken any
+/// whitespace.
 fn addresses(value: &str) -> impl Iterator<Item = String> + '_ {
     value
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -266,9 +245,8 @@ fn addresses(value: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// Addresses from the command line or the configuration file. A typo here
-/// used to vanish without a word - and an address that was meant to be pinned
-/// and silently was not is exactly the kind of thing somebody spends an
-/// evening looking for in the wrong place.
+/// must not vanish without a word: an address meant to be pinned and silently
+/// not is an evening spent looking in the wrong place.
 fn macs(what: &str, given: &[String]) -> Set<[u8; 6]> {
     let mut out = crate::hash::set();
     for s in given {
@@ -311,33 +289,26 @@ fn load_conf(opts: &mut Options) {
     read_conf(opts, &text);
 }
 
-/// The file's contents, apart from finding them. Every way a line can be
-/// malformed ends in a warning and the next line; a configuration file is not
-/// a thing to die on, and this runs before the daemon has done anything.
-/// Separate from `load_conf` so a test can hand it the awkward lines rather
-/// than needing a file at a fixed path in /etc.
+/// The file's contents, apart from finding them. Every malformed line ends in
+/// a warning and the next line - a configuration file is not a thing to die
+/// on. Separate from `load_conf` so a test can hand it the awkward lines.
 fn read_conf(opts: &mut Options, text: &str) {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // A line that is not a setting is somebody trying to write one.
-        // Dropping it in silence contradicts the whole point of the warnings
-        // below - the setting they wrote down never takes effect and nothing
-        // says so.
-        //
-        // The split is the test. Asking `contains` first and then unwrapping
-        // the same split was two answers to one question, and the second one
-        // was a panic if they ever stopped agreeing - a daemon that dies on a
-        // line of configuration rather than warning about it.
+        // A line that is not a setting is somebody trying to write one;
+        // dropping it in silence means the setting never takes effect and
+        // nothing says so. The split is the test: asking `contains` first and
+        // unwrapping the same split later was two answers to one question,
+        // and a panic if they disagreed.
         let Some((key, value)) = line.split_once('=') else {
             eprintln!("warning: {CONF}: not a setting, ignored: {line}");
             continue;
         };
-        // "RESYNC=300  # seconds" means 300, not a parse warning - but a hash
-        // inside quotes is part of the value, not the start of a comment.
-        // Nothing this file takes can legitimately contain one today; the
+        // "RESYNC=300  # seconds" means 300, but a hash inside quotes is part
+        // of the value. Nothing this file takes can contain one today; the
         // rule is here so that the day something can, the parser does not
         // quietly eat half of it.
         let value = strip_comment(value);
@@ -378,9 +349,8 @@ fn read_conf(opts: &mut Options, text: &str) {
 
 /// Two modes on one command line are a contradiction, and the last one
 /// winning in silence means somebody ran --flush thinking they ran --status.
-/// Zero would busy-loop - the deadline is always due, poll never sleeps -
-/// and u64::MAX overflows the Instant it is added to, which aborts. Both are
-/// answers to a typo, and neither is a sane one.
+/// Zero would busy-loop (the deadline is always due) and u64::MAX overflows
+/// the Instant it is added to. Both are typos.
 fn clamp_interval(v: u64) -> Result<u64, String> {
     const MAX: u64 = 30 * 24 * 3600;
     if v == 0 || v > MAX {
@@ -391,11 +361,9 @@ fn clamp_interval(v: u64) -> Result<u64, String> {
     Ok(v)
 }
 
-/// A capacity of zero says the filter is always full,
-/// which schedules the fast pass rate for ever - a typo that turns a quiet
-/// host into a busy one. And a threshold near usize::MAX overflows the
-/// arithmetic that asks "are we at nine tenths of it" - an abort in a debug
-/// build, a wrong answer in release. No hardware justifies either end.
+/// A capacity of zero says the filter is always full, which schedules the
+/// fast pass rate for ever; a threshold near usize::MAX overflows the
+/// nine-tenths arithmetic. No hardware justifies either end.
 fn clamp_max_macs(v: usize) -> Result<usize, String> {
     const MAX: usize = 1 << 20;
     if v == 0 || v > MAX {
@@ -418,11 +386,10 @@ fn parse_args(opts: &mut Options) -> Result<(), String> {
 
 fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> Result<(), String> {
     let mut args = args;
-    // Whether a --pair has been seen on this command line. The first one
-    // replaces whatever PAIRS= in the configuration put here - a command
-    // line names the whole pair list or none of it, else the harmless
-    // `--pair nic1:vmbr1` on a host whose conf says the same is refused
-    // as a duplicate and a differing bridge cannot win at all.
+    // Whether a --pair has been seen on this command line: the first replaces
+    // whatever PAIRS= in the configuration put here - a command line names
+    // the whole pair list or none of it, else `--pair nic1:vmbr1` on a host
+    // whose conf says the same is refused as a duplicate.
     let mut pairs_from_cli = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -481,10 +448,10 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
 }
 
 fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
-    // Flush and status must not require a pair to exist: the state they
-    // inspect - notes and filter entries - outlives the pair on purpose,
-    // and "the bridge is gone" is exactly when --flush is reached for. The
-    // daemon may start before its interfaces exist and waits for them.
+    // Flush and status must not require a pair: the state they inspect
+    // outlives the pair on purpose, and "the bridge is gone" is exactly when
+    // --flush is reached for. The daemon may start before its interfaces
+    // exist and waits.
     let allow_empty = matches!(opts.mode, Mode::Daemon | Mode::Flush | Mode::Status);
     // Strict only where a person is at the keyboard to fix the typo.
     let strict = matches!(opts.mode, Mode::Once | Mode::Check);
@@ -509,16 +476,14 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
             if dev == bridge {
                 return Err(format!("{spec}: a bridge cannot be its own uplink"));
             }
-            // A pair whose device does not actually sit under that bridge
-            // disables the one protection that matters: nothing the bridge
-            // learnt counts as wire-side any more, so everything it learnt -
-            // the peers out on the cable included - would be written into
-            // the device's filter. A typo must fail here, not there - but
-            // only where a person is watching. --flush works from the notes
-            // and never reads a pair; --status reports whatever is there;
-            // and a daemon whose named interface is not up yet at boot must
-            // wait for it, not crash-loop until it appears. Those warn and
-            // keep the pair; the reconciler skips missing devices anyway.
+            // A pair whose device does not sit under that bridge disables the
+            // one protection that matters: nothing the bridge learnt counts
+            // as wire-side, and the cable's peers would be written into the
+            // filter. A typo must fail here - but only where a person is
+            // watching: --flush never reads a pair, --status reports whatever
+            // is there, and a daemon whose interface is not up yet at boot
+            // must wait, not crash-loop. Those warn and keep the pair; the
+            // reconciler skips missing devices anyway.
             let topology_says = (|| -> Result<(), String> {
                 let Some(dev_index) = topo.index_of(dev) else {
                     return Err(format!("no such interface: {dev}"));
@@ -588,12 +553,10 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
         probe[5] ^= 0x5a;
         let driver = link.driver.clone().unwrap_or_default();
 
-        // Noted before it is written: a check killed between the write and
-        // the take-back then leaves an OWNED entry, which the daemon's next
-        // pass removes and heals - unnoted it was foreign, and foreign
-        // entries are deliberately never touched. Which is why a probe the
-        // note could not take is not written at all: the healing story
-        // held only when this call happened to succeed, and nothing said so.
+        // Noted before it is written: a check killed between write and
+        // take-back then leaves an OWNED entry the daemon's next pass heals -
+        // unnoted it was foreign, never touched. Hence a probe the note could
+        // not take is not written at all.
         if !syncer.note_check_probe(&pair.dev, link.index, &probe) {
             note!(
                 "{} ({driver}): cannot check - the probe could not be noted in \
@@ -613,11 +576,10 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
                 syncer.forget_check_probe(&pair.dev, &probe);
                 note!(
                     // "the kernel refused", not "the driver refuses": the
-                    // errno does not say which layer said no - EPERM
-                    // arrives for capability problems as well as for
-                    // drivers that reject the operation - and blaming the
-                    // driver sends an operator with a rights problem down
-                    // the wrong road.
+                    // errno does not say which layer said no - EPERM arrives
+                    // for capability problems as well - and blaming the
+                    // driver sends an operator with a rights problem down the
+                    // wrong road.
                     "{} ({driver}): FAILED - the kernel refused the unicast filter entry: {e}",
                     pair.dev
                 );
@@ -670,24 +632,17 @@ fn check(sock: &mut Socket, topo: &Topology, pairs: &[Pair], syncer: &Syncer) ->
     ok
 }
 
-/// A silence, in days, hours, minutes and seconds.
-///
-/// Every unit from the largest non-zero one down to seconds, and no
-/// rounding: the form before this said "2h" for anything between two hours
-/// and three, so two entries fifty minutes apart printed the same thing and
-/// there was no way to tell which of them the pressure valve would take
-/// first. Below a minute it is seconds alone.
-///
-/// No weeks and no months. Days already carry that, and a unit whose length
-/// is a matter of opinion is a unit an operator has to convert back.
+/// A silence in days, hours, minutes and seconds - every unit from the
+/// largest non-zero down, no rounding: "2h" for anything between two and
+/// three hours made two entries fifty minutes apart print the same, with no
+/// way to tell which the valve takes first. No weeks or months: a unit whose
+/// length is a matter of opinion is one an operator has to convert back.
 fn human_duration(ms: u64) -> String {
     let s = ms / 1000;
     let (d, h, m, sec) = (s / 86_400, (s / 3600) % 24, (s / 60) % 60, s % 60);
-    // Every unit but the leading one is two wide, so that the unit letters
-    // land in the same columns whatever the numbers are. The leading unit
-    // is left alone: the caller right-aligns the whole thing against its
-    // longest neighbour, which absorbs its width and lines the columns up
-    // from the seconds end.
+    // Every unit but the leading one is two wide, so the unit letters land in
+    // the same columns; the caller right-aligns the whole thing against its
+    // longest neighbour, which lines the columns up from the seconds end.
     if d > 0 {
         format!("{d}d {h:>2}h {m:>2}m {sec:>2}s")
     } else if h > 0 {
@@ -699,22 +654,19 @@ fn human_duration(ms: u64) -> String {
     }
 }
 
-/// The addresses an uplink wants, one per line, marking the ones held
-/// through a silence with how long each has been silent.
+/// The addresses an uplink wants, one per line, the quiet ones marked with
+/// their silence.
 ///
-/// Returned rather than printed, because the two callers emit it in
-/// different places - under `--status`'s uplink block, and under the report
-/// lines of a `--once` - and the wording must not drift between them. Both
-/// go to stdout: this is normal operation, and `note!` says why.
+/// Returned rather than printed: the two callers (--status's uplink block,
+/// --once's report lines) emit it in different places and the wording must
+/// not drift. Both go to stdout - `note!` says why.
 fn address_lines(detail: &sync::Detail) -> Vec<String> {
     let ages: std::collections::BTreeMap<_, _> = detail.quiet_ages.iter().copied().collect();
     let mut wanted = detail.wanted.clone();
     // By age, longest silence LAST: the list ends where the pressure valve
-    // begins, so the bottom of it is what the filter gives up first - and
-    // on a terminal that is the part still on screen. An address the bridge
-    // still holds has no silence at all and comes first; the address itself
-    // is the tiebreak, so the list does not shuffle between two runs that
-    // saw the same thing.
+    // begins, and on a terminal that is the part still on screen. An address
+    // the bridge still holds comes first; the address is the tiebreak, so two
+    // runs that saw the same thing print the same list.
     wanted.sort_by(|a, b| {
         let (sa, sb) = (
             ages.get(a).copied().unwrap_or(0),
@@ -731,13 +683,11 @@ fn address_lines(detail: &sync::Detail) -> Vec<String> {
         .map(|(_, ms)| human_duration(*ms).len())
         .max()
         .unwrap_or(0);
-    // And one for the port each was learnt behind, which the daemon already
-    // knows: a bare address says nothing about whose it is, and on a
-    // virtualisation host the port name is the guest - `veth106i0` is
-    // container 106. Nothing is looked up for this. The neighbour table
-    // would add an address, but it is emptiest exactly where this list is
-    // most interesting: an address is quiet because nobody has talked to
-    // it, and that is also why it has been reaped from the cache.
+    // And the port each was learnt behind, which the daemon already knows: on
+    // a virtualisation host the port name is the guest (`veth106i0` is
+    // container 106). Nothing is looked up: the neighbour table is emptiest
+    // exactly where this list is interesting - an address is quiet because
+    // nobody talked to it.
     let ports: std::collections::BTreeMap<_, _> = detail
         .learnt_behind
         .iter()
@@ -840,11 +790,9 @@ fn run() -> Result<bool, String> {
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
-    // Subscribed BEFORE the interfaces are read, so that nothing can slip
-    // through between the reading and the listening: every change after
-    // this point is announced, and the reading below is therefore a
-    // picture the daemon may keep. It used to be opened afterwards, which
-    // is why the loop read the interfaces a second time for itself.
+    // Subscribed BEFORE the interfaces are read, so nothing slips through
+    // between reading and listening: every later change is announced, and the
+    // reading below is a picture the daemon may keep.
     let mon = if opts.mode == Mode::Daemon {
         Some(
             Socket::subscribed()
@@ -902,10 +850,9 @@ fn run() -> Result<bool, String> {
                 if r.port != r.dev {
                     note!("  enslaved through  : {}", r.port);
                 }
-                // "wanted", not "behind the bridge": EXTRA-pinned
-                // addresses are in this number precisely because they are
-                // NOT in the bridge's table, and the count must not
-                // disagree with `bridge fdb show` over them.
+                // "wanted", not "behind the bridge": EXTRA-pinned addresses
+                // are in this number precisely because they are NOT in the
+                // bridge's table.
                 note!("  wanted in filter  : {}", r.wanted);
                 note!("  registered by us  : {}", r.owned);
                 // Worth a line only when there are any: the memory this
@@ -923,10 +870,9 @@ fn run() -> Result<bool, String> {
                         r.stacked.join(" ")
                     }
                 );
-                // The per-address half is built only for the two modes
-                // that print it, so the daemon does not copy the whole
-                // desired set and walk every silence once a pass for
-                // numbers nothing prints.
+                // The per-address half only for the two modes that print it,
+                // so the daemon does not copy the whole desired set once a
+                // pass for numbers nothing prints.
                 if let Some(detail) = r.detail.as_ref() {
                     for line in address_lines(detail) {
                         note!("{line}");
@@ -985,17 +931,15 @@ fn run() -> Result<bool, String> {
             }
             let mon = mon.expect("the daemon subscribes before it reads");
             // A device that drops out of one reading is not gone: an
-            // interface reload takes a bridge away for a moment, and taking
-            // its guests' addresses out of a live filter over that is the
-            // outage this daemon exists to prevent. Long enough to outlive
-            // `ifreload -a`, short enough that a bridge genuinely taken apart
-            // is tidied up within the interval.
+            // interface reload takes a bridge away for a moment, and emptying
+            // a live filter over that is the outage this daemon exists to
+            // prevent. Long enough to outlive `ifreload -a`, short enough
+            // that a bridge really taken apart is tidied within the interval.
             syncer.orphan_grace = Duration::from_secs(60);
             let mut world = Live { sock, mon, stop_rx };
-            // The reading this process already did, handed over rather
-            // than paid for twice. It was taken after the subscription was
-            // opened, so anything that changed since is on its way as an
-            // event.
+            // The reading this process already did, handed over rather than
+            // paid for twice; taken after the subscription opened, so
+            // anything changed since is on its way as an event.
             daemon_loop(&mut world, &mut syncer, &opts, Some((topo, topo_load)));
             let _ = std::fs::remove_file(&pid_path);
 
@@ -1015,9 +959,7 @@ fn run() -> Result<bool, String> {
                     .into());
             }
             // The probe bookkeeping wants the same notes the daemon keeps -
-            // that is what makes a killed check healable at all. That the
-            // syncer above also carries exclude/extra is irrelevant to the
-            // note helpers check() uses.
+            // that is what makes a killed check healable.
             Ok(check(&mut sock, &topo, &pairs, &syncer))
         }
     }
@@ -1063,17 +1005,16 @@ mod tests {
         );
     }
 
-    /// The assumed capacity is written out in five places, and four of
-    /// them cannot be interpolated - a manual page, a README, an example
-    /// configuration and the trial harness's own preflight, which measures
-    /// its margin against it. Changing the constant used to leave all four
+    /// The assumed capacity is written out in five places, four of which
+    /// cannot be interpolated (manual page, README, example configuration,
+    /// the trial harness's preflight). Changing the constant left all four
     /// quietly lying.
     #[test]
     fn every_document_names_the_capacity_the_code_assumes() {
-        // Anchored, not a bare substring. `128` occurs in prose, in a
-        // year, in a byte count; the needle has to be the sentence that
-        // states the default, or the test passes against every document
-        // for a DEFAULT_MAX_MACS of 8 - which it did.
+        // Anchored, not a bare substring: `128` occurs in prose, in a year,
+        // in a byte count; the needle has to be the sentence that states the
+        // default, or the test passes for a DEFAULT_MAX_MACS of 8 - which it
+        // did.
         let n = sync::DEFAULT_MAX_MACS.to_string();
         for (what, text, needle) in [
             (
@@ -1173,10 +1114,9 @@ mod tests {
         assert_eq!(o.pairs, vec!["nic0:vmbr0", "nic1:vmbr1"]);
     }
 
-    /// The separator between two addresses is a comma or whitespace of any
-    /// kind. A tab used to end up inside the address, which then parsed as
-    /// nothing and was dropped with a warning about a character nobody can
-    /// see - and the address somebody wrote down was never excluded.
+    /// The separator is a comma or whitespace of any kind: a tab used to end
+    /// up inside the address, which parsed as nothing and was dropped - and
+    /// the address somebody wrote was never excluded.
     #[test]
     fn addresses_are_separated_by_commas_or_any_whitespace() {
         let one = "02:00:00:00:00:01";
@@ -1219,11 +1159,9 @@ mod tests {
         assert!(clamp_max_macs((1 << 20) + 1).is_err());
     }
 
-    /// Every way a line of the configuration file can be malformed, in one
-    /// place. None of them may be a panic: this runs before the daemon has
-    /// done anything, and a daemon that dies on a stray line of /etc leaves a
-    /// host with no filter maintenance at all - over a line it could have
-    /// warned about and stepped over.
+    /// Every way a configuration line can be malformed, in one place. None
+    /// may panic: a daemon that dies on a stray line of /etc leaves the host
+    /// with no filter maintenance at all.
     #[test]
     fn a_malformed_configuration_line_is_stepped_over() {
         let mut o = Options::default();
@@ -1301,10 +1239,9 @@ mod tests {
         assert!(bad.is_empty(), "a malformed address was accepted: {bad:?}");
     }
 
-    /// The README, the unit file and the example configuration all restate
-    /// facts the code owns. Each has drifted at least once - the help text
-    /// claimed a default the code had left behind - and this is the same
-    /// cure applied to the other three documents.
+    /// The README, the unit file and the example configuration restate facts
+    /// the code owns, and each has drifted at least once; same cure as the
+    /// help text.
     #[test]
     fn the_man_page_names_every_option_the_help_offers() {
         // A manual page is the one piece of documentation that is read offline,
@@ -1352,11 +1289,9 @@ mod tests {
         }
     }
 
-    /// A silence is read off, not decoded.
-    ///
-    /// The form this replaced named one unit and truncated, so "2h" meant
-    /// anything from two hours to three - and the whole point of the number
-    /// is to say which of two keeps the valve will take first.
+    /// A silence is read off, not decoded: the form this replaced said "2h"
+    /// for anything from two to three hours, and the point of the number is
+    /// to say which of two keeps the valve takes first.
     #[test]
     fn a_silence_is_spelled_out_to_the_second() {
         for (ms, want) in [
@@ -1378,11 +1313,9 @@ mod tests {
         }
     }
 
-    /// And a column of them lines up, whatever the numbers are.
-    ///
-    /// The unit letters have to land under each other: this list is read
-    /// down, comparing one silence against the next, and a column that
-    /// shifts sideways from line to line cannot be compared at a glance.
+    /// A column of them lines up whatever the numbers: the list is read down,
+    /// one silence against the next, and a column that shifts sideways cannot
+    /// be compared at a glance.
     #[test]
     fn a_column_of_silences_lines_up() {
         let detail = sync::Detail {
@@ -1417,12 +1350,9 @@ mod tests {
         );
     }
 
-    /// The two modes that print addresses say the same thing about them.
-    ///
-    /// Both modes write to stdout (`note!` says why), but in different
-    /// places of their output - so they cannot share a print; they share
-    /// the rendering instead, and this is what keeps a second spelling
-    /// from growing beside the first.
+    /// The two modes that print addresses say the same thing: both write to
+    /// stdout in different places, so they share the rendering rather than
+    /// the print, which keeps a second spelling from growing.
     #[test]
     fn the_address_lines_name_the_quiet_ones() {
         let detail = sync::Detail {
@@ -1475,9 +1405,9 @@ mod tests {
             "without RuntimeDirectoryPreserve the ownership notes die on every stop"
         );
         // 0700, because `ensure_state_dir` narrows a directory it finds
-        // group- or world-writable and says so - and 0755 & 0o022 is zero,
-        // so it would find nothing to say. Dropping this line from the unit
-        // is therefore silent, which is the reason to assert it here.
+        // group- or world-writable and says so, and 0755 & 0o022 is zero -
+        // dropping this line from the unit is silent, which is the reason to
+        // assert it.
         assert!(
             unit.contains("RuntimeDirectoryMode=0700"),
             "the state directory has to be created 0700; nothing complains if it is not"
@@ -1564,10 +1494,9 @@ mod tests {
         assert_eq!(ok[0].dev, "nic1");
     }
 
-    /// --max 0 used to make "the filter is nine tenths full" permanently
-    /// true, which schedules the fast pass rate for ever; a huge value
-    /// overflowed the same arithmetic. Both are typos, and both now get an
-    /// answer instead of a behaviour.
+    /// --max 0 made "nine tenths full" permanently true and scheduled the
+    /// fast pass rate for ever; a huge value overflowed the same arithmetic.
+    /// Both typos now get an answer.
     #[test]
     fn a_threshold_that_would_spin_or_overflow_is_refused() {
         assert!(clamp_max_macs(0).is_err());
@@ -1603,10 +1532,9 @@ mod tests {
         assert!(!o.dry_run);
     }
 
-    /// The daemon asks for SIGTERM instead of being killed by it. If the
-    /// handler were not installed - or installed wrongly - this test would
-    /// not fail, it would take the whole test process down with it, which is
-    /// as clear a signal as a failure.
+    /// The daemon asks for SIGTERM instead of being killed by it: a missing
+    /// or wrong handler would not fail this test, it would take the test
+    /// process down - as clear a signal as a failure.
     #[test]
     fn a_termination_signal_is_caught_and_only_noted() {
         catch_signals();

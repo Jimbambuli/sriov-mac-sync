@@ -1,11 +1,8 @@
 //! The daemon: what happens between events, and when.
 //!
-//! Everything here is a decision about time or about what the world said -
-//! the pass cadence and what a pass calls itself, the picture of the
-//! interfaces and how long it may be believed, the capacity a card
-//! reports. The world arrives as a trait so the tests can hand in a
-//! scripted one and this code cannot tell the difference; `main` keeps the
-//! command line, the configuration file and the one-shot modes.
+//! Everything here is a decision about time or about what the world said; the
+//! world arrives as a trait so the tests can hand in a scripted one. `main`
+//! keeps the command line, the configuration file and the one-shot modes.
 
 use crate::netlink::Socket;
 use crate::sync::{self, Pair, Syncer};
@@ -32,23 +29,17 @@ pub(crate) fn read_topology(sock: &mut Socket) -> Result<Topology, String> {
     Ok(Topology::from_links(links))
 }
 
-/// Everything the daemon loop reaches for outside itself: the clock, the
-/// two sockets and the stop flag.
+/// Everything the daemon loop reaches for outside itself: the clock, the two
+/// sockets and the stop flag.
 ///
-/// The loop is where the scheduling lives - when a pass is due, what a
-/// batch is worth, how a failure is retried - and every one of those
-/// decisions is a function of time and of what the sockets said. Reaching
-/// for `Instant::now()` and the sockets directly put all of it beyond any
-/// test's reach: the loop was the one piece of this daemon whose behaviour
-/// only a live kernel could confirm. This trait is the seam. `Live`
-/// forwards to the real clock and sockets and adds nothing; the tests
-/// stand in a scripted world and watch what the loop decides.
+/// Every scheduling decision is a function of time and of what the sockets
+/// said, and reaching for `Instant::now()` directly put all of it beyond any
+/// test: `Live` forwards to the real clock and sockets, the tests stand in a
+/// scripted world and watch what the loop decides.
 ///
-/// `FdbWriter` as the supertrait, because the pass and the fast path
-/// already take their socket through it - the loop hands itself over.
-/// (A trait object would need trait upcasting, which is newer Rust than
-/// this builds with; the loop is generic instead, and the compiler folds
-/// the one production instantiation flat.)
+/// `FdbWriter` as the supertrait because the pass and the fast path already
+/// take their socket through it. (A trait object would need trait upcasting,
+/// newer Rust than this builds with; the loop is generic instead.)
 pub(crate) trait World: sync::FdbWriter {
     fn now(&self) -> Instant;
     fn stopping(&self) -> bool;
@@ -165,20 +156,15 @@ impl World for Live {
     }
 }
 
-/// When the next pass is due, when the picture is read again regardless of
-/// what anybody says, and what to call the pass that results.
-///
-/// These were three locals, and their coupling was the subtlest thing in this
-/// file: the refresh was once gated on what the pass called itself, every
-/// batch renames the pass, and so on a host whose bridges age entries - which
-/// is every host - the condition stopped being true and the daemon never
-/// refreshed at all. The `[timed]` line the trial looks for went with it.
-/// Holding them together means every rule about them is one of these methods.
+/// When the next pass is due and what to call it. These were separate locals
+/// whose coupling was the subtlest thing in this file - every batch renames
+/// the pass, and a rule gated on the name silently stopped holding. Held
+/// together, every rule about them is one of these methods.
 struct Schedule {
-    /// A deadline, not a sleep. Wake-ups that turn out to be none of our
-    /// business must not push the full pass further away. Every completed
-    /// pass moves it a whole interval out: the timer only ever fires after
-    /// an interval of silence, and then the pass trusts nothing it carried.
+    /// A deadline, not a sleep: wake-ups that are none of our business must
+    /// not push the pass away. Every completed pass moves it a whole interval
+    /// out, so the timer fires only after an interval of silence, and that
+    /// pass trusts nothing it carried.
     next_full: Instant,
     /// When the last full pass ran, so event storms are answered with a
     /// bounded pass rate rather than with waiting. Registrations never wait.
@@ -203,20 +189,17 @@ impl Schedule {
         now >= self.next_full
     }
 
-    /// A pass that could not run - no picture, or reconciliation refused. Come
-    /// back soon rather than sitting out the whole interval: one refused dump
-    /// used to cost five minutes of not looking at the host at all.
-    /// The retried pass keeps the name of the pass that failed - a
-    /// forwarding change whose pass hit a transient rtnl error is still a
-    /// forwarding change five seconds later.
+    /// A pass that could not run comes back soon rather than sitting out the
+    /// interval, and keeps the name of the pass that failed: a forwarding
+    /// change whose pass hit a transient rtnl error is still a forwarding
+    /// change five seconds later.
     fn retry_soon(&mut self, now: Instant) {
         self.next_full = now + RETRY_AFTER;
-        // The attempt counts as a pass for pacing, though not for the
-        // trigger name. What `last_pass` bounds is the 200 ms floor that
-        // `handle_batch` puts under every batch-bought pass - not the five
-        // seconds above, which only govern when an unprompted retry comes.
-        // Left standing during a refusal streak, every notification bought
-        // another attempt, on a host that is already unable to answer one.
+        // The attempt counts as a pass for pacing, not for the trigger name:
+        // `last_pass` bounds the 200 ms floor `handle_batch` puts under every
+        // batch-bought pass. Left standing during a refusal streak, every
+        // notification bought another attempt on a host already unable to
+        // answer one.
         self.last_pass = now;
     }
 
@@ -246,24 +229,22 @@ impl Schedule {
     }
 }
 
-/// The topology carried over from the last pass, and whether it can still be
-/// believed. A forwarding entry appearing or going says nothing about which
-/// interfaces exist or what they are enslaved to, so a pass woken by one works
-/// from the picture it already has. Anything that touches interfaces marks it
-/// stale, as does losing notifications and the timed refresh, whose whole
-/// purpose is to find what the events missed.
+/// The topology carried from the last pass, and whether it can still be
+/// believed. A forwarding entry says nothing about which interfaces exist, so
+/// a pass woken by one works from the picture it has; anything touching
+/// interfaces marks it stale, as do lost notifications, a contradicting
+/// witness and the timed pass.
 struct Picture {
     held: Option<Topology>,
     stale: bool,
-    /// Whether a read replaced the picture since the last pass consumed one.
-    /// The pass needs this to know that autodetection's answer may have
-    /// changed: a batch reads the fresh picture *before* the pass it buys,
-    /// so by the time that pass runs, needs_reading() is already false.
+    /// Whether a read replaced the picture since the last pass consumed one -
+    /// autodetection may have changed. A batch reads the fresh picture
+    /// *before* the pass it buys, so needs_reading() is already false by
+    /// then.
     replaced_since_pass: bool,
-    /// What reading the picture cost when an event read it, so the pass that
-    /// uses it can account for it. Without this a pass whose topology was read
-    /// moments earlier reports "0.000 ms" for it, which reads as "not read at
-    /// all" - it misled the author of this line for an hour.
+    /// What reading the picture cost when an event read it, so the pass can
+    /// account for it: otherwise it reports "0.000 ms", which reads as "not
+    /// read at all".
     carried_load: Duration,
 }
 
@@ -277,16 +258,10 @@ impl Picture {
         }
     }
 
-    /// A picture the caller already read, and read after it was listening
-    /// for changes. Not marked replaced: the first pass has not missed an
-    /// autodetection it needs to redo, because there was no picture before
-    /// this one.
-    ///
-    /// The cost comes with it. Dropping it made the first pass report
-    /// `topology 0.000 ms` for a reading it really did - which is the very
-    /// thing `carried_load` exists to prevent, and on a host with hundreds
-    /// of interfaces it is the pass's largest phase missing from its own
-    /// total.
+    /// A picture the caller already read after it started listening. Not
+    /// marked replaced: there was no picture before it. The cost comes with
+    /// it, or the first pass reports `topology 0.000 ms` for its largest
+    /// phase.
     fn seeded(topo: Topology, cost: Duration) -> Self {
         Self {
             held: Some(topo),
@@ -310,11 +285,9 @@ impl Picture {
         let fresh = world.read_topology()?;
         self.stale = false;
         self.replaced_since_pass = true;
-        // Measured at the World seam like everything else in the loop. It
-        // was the one place that read the real clock directly, so under any
-        // scripted world the topology figure saturated to zero - which made
-        // the one number the comment on `carried_load` records as having
-        // misled its author the single figure no loop test could assert.
+        // Measured at the World seam like everything else: read from the real
+        // clock, the topology figure saturated to zero under every scripted
+        // world, and no loop test could assert it.
         Ok((
             world.now().saturating_duration_since(started),
             self.held.replace(fresh),
@@ -322,9 +295,9 @@ impl Picture {
     }
 
     /// Before a pass, which **fails closed**: a pass on a picture that may be
-    /// wrong is worse than no pass at all, so a refused read throws away what
-    /// was held and the caller schedules the retry. The cost reported is the
-    /// fresh read's, superseding anything an event carried.
+    /// wrong is worse than none, so a refused read throws away what was held
+    /// and the caller schedules the retry. The cost reported is the fresh
+    /// read's.
     fn for_pass<W: World>(&mut self, world: &mut W) -> Duration {
         let carried = std::mem::take(&mut self.carried_load);
         let cost = if !self.needs_reading() {
@@ -340,18 +313,17 @@ impl Picture {
             }
         };
         // Cleared after the read, not before: read() marks the picture
-        // replaced, and a pass that read for itself has consumed that
-        // replacement in the same breath. Cleared first, the flag came
-        // back up and bought every fresh-read pass a redundant
-        // autodetect on its next event.
+        // replaced, and a pass that read for itself has consumed that in the
+        // same breath. Cleared first, the flag came back up and every
+        // fresh-read pass bought a redundant autodetect on its next event.
         self.replaced_since_pass = false;
         cost
     }
 
     /// Before the fast path, which **keeps what it had**: answering a batch
-    /// from a picture one link message out of date still beats not answering
-    /// it. The cost is carried to the pass a few milliseconds later, which
-    /// works from this same reading rather than paying for its own.
+    /// from a picture one link message out of date beats not answering. The
+    /// cost is carried to the pass a few milliseconds later, which works from
+    /// the same reading.
     fn for_batch<W: World>(&mut self, world: &mut W) -> Look {
         if !self.needs_reading() {
             return Look::Current;
@@ -369,12 +341,9 @@ impl Picture {
     }
 }
 
-/// What a fast-path look at the topology yielded.
-///
-/// Three answers, because a caller that has to fail closed cannot do it on
-/// two: "nothing was replaced" and "nothing could be read" are the same
-/// `None` and opposite facts. The picture the fast path holds after a
-/// refusal is the very one whose staleness asked for the read.
+/// What a fast-path look at the topology yielded. Three answers, because a
+/// caller that fails closed cannot do it on two: "nothing was replaced" and
+/// "nothing could be read" are opposite facts.
 enum Look {
     /// The picture was already current. Nothing was replaced, and what is
     /// held answers for both sides of the comparison.
@@ -394,10 +363,8 @@ fn distrust_carried(picture: &mut Picture, syncer: &mut Syncer) {
 }
 
 /// The daemon: answer batches through the fast path, keep the pass rate
-/// bounded, and never trust a picture longer than the interval. Everything
-/// here is a decision about time or about what the world said, which is why
-/// the world arrives as a parameter - the tests hand in a scripted one and
-/// this function cannot tell.
+/// bounded, never trust a picture longer than the interval. The world arrives
+/// as a parameter so the tests can hand in a scripted one.
 pub(crate) fn daemon_loop<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
@@ -451,11 +418,10 @@ pub(crate) fn daemon_loop<W: World>(
         }
 
         let due = schedule.wait_for(world.now());
-        // Rounded up, not truncated: poll sleeps at most what it is told,
-        // so a truncated wait woke just before the deadline and the loop
-        // then spun through poll(0) for the last millisecond. Oversleeping
-        // by under a millisecond is harmless - the deadline is re-checked
-        // at the top.
+        // Rounded up, not truncated: poll sleeps at most what it is told, so
+        // a truncated wait woke just before the deadline and spun through
+        // poll(0) for the last millisecond. The deadline is re-checked at the
+        // top.
         let millis = due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
         let woken = match world.wait(millis) {
             Ok(w) => {
@@ -464,11 +430,10 @@ pub(crate) fn daemon_loop<W: World>(
             }
             Err(e) => {
                 eprintln!("warning: waiting for events failed: {e}");
-                // The first failure buys a prompt recovery pass. A wait
-                // that KEEPS failing (sustained ENOMEM) must not turn the
-                // daemon into a hot loop of full-table dumps, each paying
-                // a dump to learn nothing - so from the second failure on,
-                // the retry pace applies before the pass.
+                // The first failure buys a prompt recovery pass. A wait that
+                // KEEPS failing (sustained ENOMEM) must not turn the daemon
+                // into a hot loop of whole-table dumps, so from the second
+                // failure on the retry pace applies before the pass.
                 if wait_failures > 0 {
                     world.pause(RETRY_AFTER);
                 }
@@ -484,11 +449,10 @@ pub(crate) fn daemon_loop<W: World>(
 
         let events = match world.recv_events() {
             Ok(events) => events,
-            // ENOBUFS means the kernel dropped notifications because we could
-            // not keep up. Losing them is survivable - a full pass reads the
-            // real state - but exiting over it would not be. What was in the
-            // messages that never arrived is not knowable, so nothing carried
-            // over may be believed.
+            // ENOBUFS: the kernel dropped notifications because we could not
+            // keep up. Survivable - a full pass reads the real state - but
+            // what was in them is unknowable, so nothing carried may be
+            // believed.
             Err(e) => {
                 eprintln!("warning: lost neighbour notifications: {e}");
                 schedule.at_once(world.now(), "lost events");
@@ -513,10 +477,9 @@ enum Pass {
 }
 
 /// One full pass: read the picture if it can no longer be believed, work out
-/// which pairs there are, and reconcile every one of them against the kernel.
-/// The daemon loop's accumulated say-once and adoption state, threaded
-/// through the passes as one thing because it lives exactly as long as the
-/// loop does.
+/// the pairs, reconcile every one against the kernel.
+/// The loop's say-once and adoption state, threaded through the passes as one
+/// thing because it lives exactly as long as the loop.
 struct LoopState {
     said_empty: bool,
     /// Whether a configured pair's card still owes its capacity answer.
@@ -531,21 +494,19 @@ fn run_pass<W: World>(
     trigger: &'static str,
     state: &mut LoopState,
 ) -> Pass {
-    // One reading serves both the autodetection and the reconciliation: they
-    // ask about the same moment, and reading it twice was work nobody asked
-    // for. "Reloaded" includes a picture the batch read moments ago: the
-    // batch reads *before* the pass it buys, so needs_reading() alone would
-    // say false here and a bridge built at runtime waited for the timer.
+    // One reading serves autodetection and reconciliation: they ask about the
+    // same moment. "Reloaded" includes a picture the batch read moments ago -
+    // the batch reads *before* the pass it buys, so needs_reading() alone
+    // would say false and a bridge built at runtime waited for the timer.
     let reloaded = picture.needs_reading() || picture.replaced_since_pass;
     let topo_load = picture.for_pass(world);
 
-    // Autodetection is redone every pass. A NIC that gets its VFs later, or a
-    // bridge built after boot, must not need a restart to be noticed - and
-    // starting before the network is up must not turn into a crash loop. But
-    // it is a pure function of the picture, so on a pass that carried the
-    // picture unchanged its answer cannot have changed either: a new NIC or
-    // bridge arrives as a link message, whose batch replaces the picture -
-    // which is exactly what sets `reloaded`.
+    // Autodetection is redone every pass: a NIC that gets its VFs later or a
+    // bridge built after boot must not need a restart, and starting before
+    // the network is up must not crash-loop. It is a pure function of the
+    // picture, so a pass that carried the picture unchanged has the same
+    // answer - a new NIC or bridge arrives as a link message, whose batch
+    // replaces the picture and sets `reloaded`.
     let auto = opts.pairs.is_empty();
     if let (true, true, Some(topo)) = (auto, reloaded, picture.held.as_ref()) {
         let found: Vec<Pair> = topo
@@ -562,16 +523,14 @@ fn run_pass<W: World>(
             syncer.pairs = found;
             // A pair adopted at runtime brings its card's capacity with it:
             // the start-time question never saw this uplink, and a daemon
-            // that started before its bridges - the "waiting for an SR-IOV
-            // interface" flow - would otherwise warn against the assumed
-            // number for the rest of its life. The operator's --max still
-            // wins; the gate is the same one.
+            // that started before its bridges would otherwise warn against
+            // the assumed number for life. The operator's --max still wins.
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
                 if let Some(v) = ask_the_cards(world, syncer, picture) {
                     // One number, one home: the warning threshold and the
-                    // quiet-keep's pressure valve read the same field. The
-                    // operator's --max never moves - the max_macs_set gate
-                    // above is what enforces that, not a second copy.
+                    // pressure valve read the same field. The operator's
+                    // --max never moves - the max_macs_set gate above
+                    // enforces that.
                     syncer.max_macs = v;
                 }
             }
@@ -579,14 +538,10 @@ fn run_pass<W: World>(
     }
     // The same cure for pairs the operator wrote down: a daemon started
     // before its configured uplink exists gets no devlink answer at start,
-    // and pairs that never change never re-asked - the warning threshold
-    // and the quiet-keep's pressure valve then measured against the
-    // assumed number for the rest of the process. Asked again on every
-    // reloaded picture until a card answers; the operator's --max still
-    // wins, the gate is the same one.
-    // `capacity_pending` already implies configured pairs and no operator
-    // --max (it is initialised from exactly those two and only ever
-    // cleared), so it carries the gate alone.
+    // and pairs that never change were never re-asked. Asked again on every
+    // reloaded picture until a card answers; --max still wins.
+    // `capacity_pending` already implies configured pairs and no --max, so it
+    // carries the gate alone.
     if reloaded && state.capacity_pending {
         // Non-empty by construction: capacity_pending is only set when the
         // operator wrote pairs down, and resolve_pairs keeps every one of
@@ -622,13 +577,12 @@ fn run_pass<W: World>(
     }
 }
 
-/// One batch of notifications: register what just appeared, before anything
-/// else, so the first reply to it is not sent into the void. Says when a full
-/// pass has to follow and what to call it.
+/// One batch: register what just appeared, before anything else, so the first
+/// reply to it is not sent into the void. Says whether a full pass has to
+/// follow and what to call it.
 ///
-/// `None` means the batch bought nothing - and buys no name either: a pass that
-/// runs on the timer has to say "timed", or the one line that tells whether the
-/// timer ever catches anything stops meaning it.
+/// `None` buys nothing and no name: a pass on the timer has to say "timed",
+/// or the canary line stops meaning it.
 fn handle_batch<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
@@ -675,21 +629,17 @@ fn handle_batch<W: World>(
         }
     }
 
-    // Whether the batch left anything for a pass to do. A pass dumps the
-    // host's whole forwarding table, so a batch that was entirely somebody
-    // else's - learning on the wire that was never ours, entries on unrelated
-    // bridges - must not buy one. Link changes always do.
+    // Whether the batch left anything for a pass. A pass dumps the whole
+    // forwarding table, so a batch that was entirely somebody else's must not
+    // buy one. Link changes always do.
     let mut urgency = if events.links_changed {
         sync::Urgency::Now
     } else {
         sync::Urgency::Nothing
     };
     match picture.held.as_ref() {
-        // The whole batch, both kinds. What each means is the fast path's
-        // business: an address learnt behind the bridge is registered, one
-        // learnt on the uplink's own port is taken back out if it was ours,
-        // and a deletion is left to the pass that follows - one entry going
-        // does not mean the address is gone.
+        // The whole batch, both kinds; what each means is the fast path's
+        // business (see `fast_apply`).
         Some(topo) => match syncer.fast_apply(world, topo, &events.fdb) {
             Ok(u) => urgency = urgency.max(u),
             // It could not do its work, so the pass has to.
@@ -711,23 +661,17 @@ fn handle_batch<W: World>(
         return None;
     }
 
-    // The full pass still has to follow - it is what removes stale entries and
-    // reconciles the notes - but nothing waits for it any more. Its
-    // predecessor waited for a 200 ms lull, which held every second address of
-    // a burst back by exactly that, and unrelated neighbour chatter stretched
-    // the wait towards its two-second bound. A pass rate bound does the same
-    // job without making anything later than it has to be.
+    // The full pass still follows - it removes stale entries and reconciles
+    // the notes - but nothing waits for it: a rate bound does what a
+    // lull-wait did without making anything later than it has to be.
     //
-    // Registrations and interface changes get the ordinary bound; a batch that
-    // only reported deletions waits longer, because an ageing table produces
-    // those by the hundred and each would otherwise buy a dump of the whole
-    // table - unless the filter is filling up, when entries that should be
-    // gone are taking room from entries that should be there. Asked of the
-    // occupancy the last pass measured against the card, not of the notes:
-    // the notes are our own registrations only, so they miss every foreign
-    // entry taking a real slot, and finding out meant listing the state
-    // directory and reading every note - on the path an ageing table walks
-    // hundreds of times.
+    // Registrations and interface changes get the ordinary bound; a
+    // deletions-only batch waits longer, because an ageing table produces
+    // those by the hundred and each would buy a whole-table dump - unless the
+    // filter is filling up, when entries that should be gone take room from
+    // entries that should be there. Asked of the occupancy the last pass
+    // measured against the card, not of the notes, which miss every foreign
+    // entry.
     let filling = syncer.fullest_filter() * 10 >= syncer.max_macs * 9;
     let wait = if urgency == sync::Urgency::Now || filling {
         Duration::from_millis(200)
@@ -759,20 +703,16 @@ pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAn
         .collect()
 }
 
-/// Take the smallest capacity the uplinks report as the threshold to warn
-/// at. The smallest, because one number governs every uplink and the
-/// filter that fills first is the one that drops addresses. A card that
-/// says nothing changes nothing; so does a number this program would
-/// refuse from a person, because a driver is not more trustworthy than an
-/// operator - and it must not veto another card's good answer either.
-///
-/// `None` means the assumed threshold stands. The `--max`/`MAX_MACS` gate
-/// lives at the call sites: an operator's instruction is never moved.
-/// Ask the cards behind the pairs what their filters hold: fills the
-/// per-card table, returns the assumed number for everything that reported
-/// none, and records on the syncer whether every configured device was
-/// there to be asked and answered - "the card says nothing" being an
-/// answer. Two call sites used to spell this out side by side.
+/// The smallest capacity the cards report, as the threshold to warn at: one
+/// number governs every uplink, and the filter that fills first drops
+/// addresses. A card that says nothing changes nothing, nor does a number
+/// this program would refuse from a person - a driver is not more trustworthy
+/// than an operator. `None` means the assumed threshold stands; the `--max`
+/// gate lives at the call sites.
+/// Ask the cards behind the pairs what their filters hold: fills the per-card
+/// table, returns the assumed number for everything that reported none, and
+/// records whether every configured device was there to be asked - "the card
+/// says nothing" being an answer.
 fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, picture: &Picture) -> Option<usize> {
     let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
     let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
@@ -787,10 +727,9 @@ fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, picture: &Picture
     adopt_reported_capacity(answers, syncer.max_macs)
 }
 
-/// Die Namen der Interfaces, die die Filter der Uplinks wirklich halten.
-/// Fuer alles Ungestapelte ist das der Uplink selbst; ein VLAN-Interface
-/// reicht an das Interface darunter weiter, und nur dieses hat eine
-/// Kapazitaet, nach der devlink ueberhaupt gefragt werden kann.
+/// The interfaces that really hold the uplinks' filters: the uplink itself,
+/// or for a VLAN the interface below - the only one with a capacity devlink
+/// can be asked about.
 pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<String> {
     let Some(topo) = topo else {
         return devs.to_vec();
@@ -810,10 +749,9 @@ pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<S
     aus
 }
 
-/// Was die Karten gemeldet haben, brauchbar gemacht: je Karte ein Wert,
-/// und dazu das Minimum als Vorgabe fuer alles, was nichts gemeldet hat.
-/// Beides wird gebraucht - die Einzelwerte, damit eine grosse Karte nicht
-/// nach dem Mass der kleinsten arbeitet, das Minimum als sichere Annahme.
+/// What the cards reported, per card, plus the minimum as the default for
+/// everything that reported nothing - so a large card does not work to the
+/// smallest one's measure.
 pub(crate) fn reported_capacities(
     answers: Vec<(String, CapacityAnswer)>,
     assumed: usize,
@@ -881,10 +819,10 @@ mod tests {
     use super::*;
     use crate::Mode;
 
-    /// The trigger labels are what bench/trial.py's quiescence check and
-    /// the [timed] canary read; internals.md promises recovery passes name
-    /// themselves. Nothing pinned the renaming rules before, and a refresh
-    /// or retry that stole a batch's label made the canary cry wolf.
+    /// The trigger labels are what bench/trial.py's quiescence check and the
+    /// [timed] canary read, and internals.md promises recovery passes name
+    /// themselves; a retry that stole a batch's label made the canary cry
+    /// wolf.
     #[test]
     fn the_trigger_labels_survive_what_the_schedule_does() {
         let now = Instant::now();
@@ -968,9 +906,8 @@ mod tests {
         use std::collections::VecDeque;
 
         /// A world made of script: time passes only when the loop waits,
-        /// events arrive when the script says, and the clock cannot drift.
-        /// Everything the loop decides is then a pure function of the
-        /// script, which is what makes the schedule assertable at all.
+        /// events arrive when the script says. Everything the loop decides is
+        /// then a pure function of the script.
         struct FakeWorld {
             base: Instant,
             offset: Duration,
@@ -1156,10 +1093,9 @@ mod tests {
         }
 
         /// nic1:vmbr1 named on the command line, so the loop does not
-        /// autodetect and the pair set stays put.
-        /// The guard comes back with the syncer and MUST be bound at the
-        /// call site: dropped early, the directory vanishes while the
-        /// daemon is still writing into it.
+        /// autodetect.
+        /// The guard MUST be bound at the call site: dropped early, the
+        /// directory vanishes while the daemon still writes into it.
         fn setup(name: &str, interval: u64) -> (Syncer, Options, Scratch) {
             let mut opts = Options {
                 interval,
@@ -1197,14 +1133,11 @@ mod tests {
             );
         }
 
-        /// A bridge built at runtime - the hotplug flow the "waiting for an
-        /// SR-IOV interface" note promises - is adopted by the prompt pass
-        /// its own link event buys, not by the next timed refresh. The batch
-        /// reads the fresh picture *before* the pass it buys, so the pass
-        /// cannot tell by needs_reading() alone; replaced_since_pass is what
-        /// carries the news. Without it, a pair appearing at runtime waited
-        /// out the whole interval - here 300 s - while the loop had already
-        /// run a pass for exactly that event.
+        /// A bridge built at runtime is adopted by the prompt pass its own
+        /// link event buys, not by the next timed pass. The batch reads the
+        /// fresh picture *before* the pass, so needs_reading() cannot tell;
+        /// replaced_since_pass carries the news. Without it a runtime pair
+        /// waited out the whole interval.
         #[test]
         fn a_pair_appearing_at_runtime_is_adopted_by_the_prompt_pass() {
             let mut opts = Options {
@@ -1241,10 +1174,9 @@ mod tests {
             );
         }
 
-        /// The timed refresh's documented job is "it believes nothing it
-        /// was told" - and until now nothing asserted that it actually
-        /// distrusts both carried things. Deleting the distrust left every
-        /// loop test green.
+        /// The timed pass believes nothing it was told, and until now nothing
+        /// asserted that it distrusts both carried things: deleting the
+        /// distrust left every loop test green.
         #[test]
         fn the_timed_refresh_rereads_the_picture_and_reasks_the_driver() {
             let (mut syncer, opts, _dir) = setup("refresh-distrust", 10);
@@ -1284,10 +1216,9 @@ mod tests {
             );
         }
 
-        /// A pair adopted at runtime brings its card's capacity with it.
-        /// The start-time devlink question never saw this uplink; without
-        /// the re-ask, a daemon started before its bridges warned against
-        /// the assumed 128 for the rest of its life.
+        /// A pair adopted at runtime brings its card's capacity with it:
+        /// without the re-ask a daemon started before its bridges warned
+        /// against the assumed 128 for life.
         #[test]
         fn a_runtime_pair_brings_its_capacity_along() {
             let mut opts = Options {
@@ -1486,12 +1417,10 @@ mod tests {
             );
         }
 
-        /// A refused pass keeps its rate bound, not just its deadline.
-        ///
-        /// `last_pass` is what `handle_batch` puts its 200 ms floor under.
-        /// Left standing while passes are being refused, every notification
-        /// bought another attempt at once - the failing host answering more
-        /// often the less it can answer.
+        /// A refused pass keeps its rate bound, not just its deadline:
+        /// `last_pass` is what `handle_batch` puts its 200 ms floor under,
+        /// and left standing every notification bought another attempt at
+        /// once.
         #[test]
         fn a_refused_pass_still_paces_the_batches_behind_it() {
             let (mut syncer, opts, _dir) = setup("retry-brake", 300);
@@ -1513,10 +1442,9 @@ mod tests {
                 ));
             }
             daemon_loop(&mut world, &mut syncer, &opts, None);
-            // Each batch reads the picture for itself (the failed read
-            // leaves nothing to carry), so ten of these are the batches;
-            // the rest are the pass attempts behind them. Measured: 16 with
-            // the bound, 21 without.
+            // Each batch reads the picture for itself (a failed read leaves
+            // nothing to carry), so ten of these are the batches; the rest
+            // are pass attempts. Measured: 16 with the bound, 21 without.
             assert!(
                 world.topo_calls <= 18,
                 "a refusal streak was answered {} times in three seconds",
@@ -1524,13 +1452,9 @@ mod tests {
             );
         }
 
-        /// A wait that keeps failing does not become a hot loop.
-        ///
-        /// The first failure buys a prompt recovery pass. From the second
-        /// on, the retry pace applies before the pass, or a sustained
-        /// ENOMEM turns the daemon into a stream of whole-table dumps -
-        /// each paying a dump to learn nothing, on a host that is already
-        /// out of memory.
+        /// A wait that keeps failing does not become a hot loop: the first
+        /// failure buys a prompt recovery pass, from the second on the retry
+        /// pace applies before the pass.
         #[test]
         fn a_wait_that_keeps_failing_is_paced() {
             let (mut syncer, opts, _dir) = setup("wait-brake", 300);
@@ -1552,12 +1476,9 @@ mod tests {
             );
         }
 
-        /// A start that brings its own reading does not read again.
-        ///
-        /// The process has already dumped the interfaces to resolve its
-        /// pairs, and it does that after subscribing, so the reading is one
-        /// every later change is announced against. Reading it a second
-        /// time within a millisecond of the first bought nothing.
+        /// A start that brings its own reading does not read again: the
+        /// process dumped the interfaces after subscribing, so every later
+        /// change is announced against that reading.
         #[test]
         fn a_seeded_start_does_not_read_the_interfaces_twice() {
             let (mut syncer, opts, _dir) = setup("seeded-start", 300);
@@ -1583,14 +1504,9 @@ mod tests {
             );
         }
 
-        /// A pass that read for itself does not also buy an autodetect.
-        ///
-        /// `replaced_since_pass` is cleared AFTER the read, not before: the
-        /// read marks the picture replaced, and a pass that read for itself
-        /// has consumed that replacement in the same breath. Cleared first,
-        /// the flag came straight back up and every fresh-read pass bought
-        /// a redundant autodetection on its next event - a regression this
-        /// code has actually had.
+        /// A pass that read for itself does not also buy an autodetect:
+        /// `replaced_since_pass` is cleared AFTER the read, or the flag came
+        /// straight back up - a regression this code has had.
         #[test]
         fn a_pass_that_read_for_itself_consumes_the_replacement() {
             let (_syncer, _opts, _dir) = setup("replaced-flag", 300);
@@ -1611,13 +1527,9 @@ mod tests {
             );
         }
 
-        /// Both deadline rules only ever pull a pass earlier.
-        ///
-        /// `refresh_due` and `bring_forward` take a `min` against what is
-        /// already scheduled. Assigning instead would let a timed refresh,
-        /// or a batch asking for a pass "soon", push a pass that was due
-        /// now into the future - a guest waits for its entry while the
-        /// daemon has already decided to act.
+        /// Deadline rules only ever pull a pass earlier: `bring_forward`
+        /// takes a `min` against what is scheduled. Assigning would push a
+        /// pass due now into the future while a guest waits for its entry.
         #[test]
         fn a_deadline_is_only_ever_pulled_earlier() {
             let start = Instant::now();
@@ -1636,12 +1548,9 @@ mod tests {
             );
         }
 
-        /// And the brake lets go once a wait works again.
-        ///
-        /// The first failure after a healthy stretch is the one that buys a
-        /// prompt recovery pass; a counter that never reset would make
-        /// every later failure - hours apart, on a host that recovered long
-        /// ago - wait out the retry pace before looking.
+        /// The brake lets go once a wait works again: a counter that never
+        /// reset would make every later failure - hours apart, on a recovered
+        /// host - wait out the retry pace.
         #[test]
         fn a_wait_that_recovers_gets_its_prompt_pass_back() {
             // A short interval, so the loop really gets to its third wait.
@@ -1661,12 +1570,10 @@ mod tests {
             );
         }
 
-        /// A refused re-read throws the picture away.
-        ///
-        /// Keeping it means the next pass acts on a reading up to a whole
-        /// interval old, on a host that has just told us the interfaces
-        /// changed - which is what the comment calls worse than no pass at
-        /// all: entries would be removed for guests that merely moved.
+        /// A refused re-read throws the picture away: keeping it means the
+        /// next pass acts on a reading up to an interval old, on a host that
+        /// just said the interfaces changed - entries removed for guests that
+        /// merely moved.
         #[test]
         fn a_refused_re_read_leaves_no_picture_behind() {
             let (mut syncer, _opts, _dir) = setup("picture-fail-closed", 300);
@@ -1683,11 +1590,8 @@ mod tests {
             let _ = &mut syncer;
         }
 
-        /// The topology figure is measured, not guessed.
-        ///
-        /// `--timings` reports what reading the interfaces cost, and a pass
-        /// whose picture an event already read has to report that event's
-        /// cost rather than zero - reading zero says "not read at all".
+        /// The topology figure is measured, not guessed: a pass whose picture
+        /// an event already read reports that event's cost rather than zero.
         #[test]
         fn the_topology_cost_is_measured_at_the_world_seam() {
             let (mut syncer, _opts, _dir) = setup("topo-cost", 300);
@@ -1714,15 +1618,11 @@ mod tests {
             let _ = &mut syncer;
         }
 
-        /// A card that structurally cannot report a capacity is asked
-        /// once, not for ever.
-        ///
-        /// Three of the four driver families this daemon is verified on -
-        /// ixgbe, i40e, mlx4 - have no devlink `max_macs` parameter at
-        /// all, so the answer is "nothing" every time. Waiting for a
-        /// number meant a full devlink parameter dump on every reloaded
-        /// pass, which is every timed refresh and every batch carrying a
-        /// link message: a tap appearing when a VM starts bought one.
+        /// A card that structurally cannot report a capacity is asked once,
+        /// not for ever: ixgbe, i40e and mlx4 have no devlink `max_macs`
+        /// parameter, and waiting for a number meant a full devlink parameter
+        /// dump on every reloaded pass - a tap appearing when a VM starts
+        /// bought one.
         #[test]
         fn a_card_that_reports_no_capacity_is_asked_only_once() {
             let (mut syncer, opts, _dir) = setup("capacity-silent-card", 300);
@@ -1747,12 +1647,9 @@ mod tests {
             );
         }
 
-        /// One card answering does not settle the question for another.
-        ///
-        /// Two written-down uplinks, and the second one's devlink question
-        /// fails. Taking the first answer would measure the second card -
-        /// possibly the smaller filter - against the first one's limit for
-        /// the life of the process.
+        /// One card answering does not settle the question for another:
+        /// taking the first answer would measure the second card - possibly
+        /// the smaller filter - against the first one's limit for life.
         #[test]
         fn one_card_s_answer_does_not_settle_another_s() {
             let dir = scratch("capacity-two-cards");
@@ -1795,10 +1692,9 @@ mod tests {
             );
         }
 
-        /// But an uplink that is not there yet has not been asked at all,
-        /// and that is what the pending state exists for: the daemon that
-        /// starts before its bridges must pick the capacity up when the
-        /// interface finally appears.
+        /// An uplink that is not there yet has not been asked at all - the
+        /// pending state exists so a daemon started before its bridges picks
+        /// the capacity up when the interface appears.
         #[test]
         fn an_uplink_that_appears_later_is_still_asked() {
             let (mut syncer, opts, _dir) = setup("capacity-late-uplink", 300);
@@ -1827,12 +1723,10 @@ mod tests {
             );
         }
 
-        /// A configured pair is not second class: a daemon started before
-        /// its written-down uplink exists gets no devlink answer at start,
-        /// and without a re-ask the warning threshold and the quiet-keep's
-        /// pressure valve would measure against the assumed number for the
-        /// life of the process. Autodetection had this cure first; --pair
-        /// was left out.
+        /// A configured pair is not second class: without a re-ask a daemon
+        /// started before its written-down uplink measured threshold and
+        /// valve against the assumed number for life. Autodetection had the
+        /// cure first; --pair was left out.
         #[test]
         fn a_configured_pair_brings_its_capacity_when_it_appears() {
             let (mut syncer, opts, _dir) = setup("conf-capacity", 300);
@@ -1858,11 +1752,10 @@ mod tests {
             );
         }
 
-        /// A link message arrived and the topology could not be read. The
-        /// held picture is then the very one whose staleness asked for the
-        /// read, and answering "does this interface have virtual functions"
-        /// out of it is answering out of the past - the carried driver
-        /// answer has to be spent instead.
+        /// A link message arrived and the topology could not be read: the
+        /// held picture is the one whose staleness asked for the read, so
+        /// "does this interface have VFs" cannot be answered from it - the
+        /// carried driver answer has to be spent.
         #[test]
         fn an_unreadable_picture_spends_the_carried_driver_answer() {
             let (mut syncer, _opts, _dir) = setup("blind-link-change", 300);
@@ -1931,11 +1824,9 @@ mod tests {
             );
         }
 
-        /// A stop is a stop: the loop ends without unregistering anything.
-        /// The registrations and the notes outliving the process is what
-        /// makes a daemon restart invisible to the guests. There has to BE
-        /// a registration for the claim to mean anything - stopping an
-        /// empty world proved only that nothing removes nothing.
+        /// A stop is a stop: the loop ends without unregistering anything,
+        /// which is what makes a restart invisible to the guests. There has
+        /// to BE a registration for the claim to mean anything.
         #[test]
         fn stopping_leaves_every_registration_in_place() {
             let (mut syncer, opts, _dir) = setup("stop", 300);
