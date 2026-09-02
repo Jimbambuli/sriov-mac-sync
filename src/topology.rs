@@ -163,6 +163,28 @@ fn link_target_name(path: impl AsRef<Path>) -> Option<String> {
         .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
 }
 
+/// What sysfs says about a device-backed interface and cannot change while
+/// its index lives: the driver, and the PF netdevs behind a VF. A rebound
+/// driver comes with a new netdev, and an index is never re-used within a
+/// boot, so these are read once per index - three file operations per card
+/// that every batch would otherwise pay again. What can change (`numvfs`,
+/// the VF netdevs) is read every time.
+#[derive(Clone, Default)]
+struct DeviceFacts {
+    driver: Option<String>,
+    pf_netdevs: Vec<String>,
+}
+
+fn device_facts(index: u32, read: impl FnOnce() -> DeviceFacts) -> DeviceFacts {
+    use std::sync::{Mutex, OnceLock};
+    static FACTS: OnceLock<Mutex<Map<u32, DeviceFacts>>> = OnceLock::new();
+    let mut facts = FACTS
+        .get_or_init(|| Mutex::new(crate::hash::map()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    facts.entry(index).or_insert_with(read).clone()
+}
+
 impl Topology {
     /// The same picture, walked out of `/sys/class/net`.
     ///
@@ -383,24 +405,30 @@ impl Topology {
                 } else {
                     0
                 },
-                driver: if has_device {
-                    link_target_name(base.join("device/driver"))
-                } else {
-                    None
-                },
                 ..Default::default()
             };
 
             if has_device {
-                if let Ok(rd) = fs::read_dir(base.join("device/physfn/net")) {
-                    for e in rd.flatten() {
-                        if let Some(i) = e.file_name().to_str().and_then(|n| by_name.get(n)) {
-                            link.pf_netdevs.push(*i);
-                        }
-                    }
-                    link.pf_netdevs.sort_unstable();
-                    link.physfn = link.pf_netdevs.first().copied();
-                }
+                let facts = device_facts(l.index, || DeviceFacts {
+                    driver: link_target_name(base.join("device/driver")),
+                    pf_netdevs: fs::read_dir(base.join("device/physfn/net"))
+                        .map(|rd| {
+                            rd.flatten()
+                                .filter_map(|e| e.file_name().to_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+                link.driver = facts.driver;
+                // Resolved per reading: names are stable, indices are the
+                // reading's business.
+                link.pf_netdevs = facts
+                    .pf_netdevs
+                    .iter()
+                    .filter_map(|n| by_name.get(n).copied())
+                    .collect();
+                link.pf_netdevs.sort_unstable();
+                link.physfn = link.pf_netdevs.first().copied();
                 if link.numvfs > 0 {
                     if let Ok(rd) = fs::read_dir(base.join("device")) {
                         for e in rd.flatten() {
@@ -1500,6 +1528,53 @@ mod tests {
             .build();
         assert!(!leads(&t, "a", "zz"));
         assert_eq!(below(&t, "a").len(), 0);
+    }
+
+    /// How long one reading costs in-process, uncached and cached: the
+    /// first reading pays the sysfs facts, the rest have them. Needs a
+    /// netlink socket; run by hand with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn reading_cost() {
+        let Ok(mut sock) = crate::netlink::Socket::new() else {
+            return;
+        };
+        let mut costs = Vec::new();
+        for _ in 0..100 {
+            let t = std::time::Instant::now();
+            let links = sock.dump_links().expect("link dump");
+            let topo = Topology::from_links(links);
+            costs.push((t.elapsed(), topo.links.len()));
+        }
+        let n = costs[0].1;
+        let mut rest: Vec<_> = costs[1..].iter().map(|c| c.0).collect();
+        rest.sort();
+        println!(
+            "{n} links: first reading {:.3} ms, then median {:.3} ms, min {:.3} ms",
+            costs[0].0.as_secs_f64() * 1e3,
+            rest[rest.len() / 2].as_secs_f64() * 1e3,
+            rest[0].as_secs_f64() * 1e3
+        );
+    }
+
+    /// The facts sysfs cannot change for a living index are read once: a
+    /// second reading for the same index asks nothing.
+    #[test]
+    fn device_facts_are_read_once_per_index() {
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            super::DeviceFacts {
+                driver: Some("t".into()),
+                pf_netdevs: vec!["p".into()],
+            }
+        };
+        let index = 0xfeed_0000 + std::process::id() % 1000;
+        let a = super::device_facts(index, read);
+        let b = super::device_facts(index, read);
+        assert_eq!(reads.get(), 1, "the second reading came from the cache");
+        assert_eq!(a.driver, b.driver);
+        assert_eq!(b.pf_netdevs, vec!["p".to_string()]);
     }
 
     /// Of the stacked kinds only a VLAN writes into the filter below it - a
