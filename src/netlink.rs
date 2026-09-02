@@ -761,21 +761,7 @@ impl Socket {
     /// IFLA_NUM_VF - and the addresses are asked separately for the few
     /// interfaces that matter.
     pub fn dump_links(&mut self) -> io::Result<Vec<LinkInfo>> {
-        let len = NLMSG_HDR + IFINFOMSG_LEN;
-        let mut req = Vec::with_capacity(len);
-        put_nlmsghdr(
-            &mut req,
-            len as u32,
-            RTM_GETLINK,
-            NLM_F_REQUEST | NLM_F_DUMP,
-            0, // dump() assigns a fresh sequence number per attempt
-        );
-        req.push(libc::AF_UNSPEC as u8);
-        req.push(0);
-        req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-        req.extend_from_slice(&0i32.to_ne_bytes()); // ifi_index: all of them
-        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-        req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+        let req = link_dump_request();
         self.dump(&req, RTM_NEWLINK, "link", |payload, out| {
             if let Some(l) = parse_link(payload) {
                 out.push(l);
@@ -990,6 +976,31 @@ impl Socket {
 /// also collects each VF's traffic counters out of the hardware: on a
 /// ConnectX-4 with two functions of two VFs that was two thirds of the call
 /// (2.17 ms against 0.73) for numbers nothing reads.
+/// The request behind `dump_links`: every interface, without statistics.
+/// Without RTEXT_FILTER_SKIP_STATS the kernel calls every driver's
+/// `ndo_get_stats64` and serialises ~200 bytes of counters per link that
+/// nothing here reads - measured on pve1 as a quarter of the whole
+/// topology read (0.535 -> 0.398 ms cold).
+fn link_dump_request() -> Vec<u8> {
+    let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
+    let mut req = Vec::with_capacity(len);
+    put_nlmsghdr(
+        &mut req,
+        len as u32,
+        RTM_GETLINK,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        0, // dump() assigns a fresh sequence number per attempt
+    );
+    req.push(libc::AF_UNSPEC as u8);
+    req.push(0);
+    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    req.extend_from_slice(&0i32.to_ne_bytes()); // ifi_index: all of them
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_SKIP_STATS);
+    req
+}
+
 fn vf_request(index: u32, seq: u32) -> Vec<u8> {
     let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
     let mut req = Vec::with_capacity(len);
@@ -2168,6 +2179,25 @@ mod tests {
     /// of the hardware and were two thirds of the call. A regression here is
     /// invisible in behaviour and shows only as the daemon costing three
     /// times as much.
+    /// The link dump skips the statistics too, and must keep skipping the
+    /// VF details: the flag mask is the difference between one request and
+    /// a firmware question per PF.
+    #[test]
+    fn the_link_dump_asks_for_no_statistics_and_no_vf_details() {
+        let req = link_dump_request();
+        let mask = attrs(&req[NLMSG_HDR + IFINFOMSG_LEN..])
+            .find(|(kind, _)| *kind == IFLA_EXT_MASK)
+            .map(|(_, v)| u32::from_ne_bytes(v[..4].try_into().unwrap()))
+            .expect("the dump carries an extended filter mask");
+        assert_eq!(mask & RTEXT_FILTER_SKIP_STATS, RTEXT_FILTER_SKIP_STATS);
+        assert_eq!(mask & RTEXT_FILTER_VF, 0, "VF details cost 1.35 ms per PF");
+        assert_eq!(
+            u32::from_ne_bytes(req[0..4].try_into().unwrap()) as usize,
+            req.len(),
+            "nlmsg_len covers the attribute"
+        );
+    }
+
     #[test]
     fn the_virtual_function_request_asks_for_no_statistics() {
         let req = vf_request(7, 3);
