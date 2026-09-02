@@ -89,6 +89,7 @@ enum Mode {
     Status,
     Check,
     Flush,
+    Resync,
 }
 
 struct Options {
@@ -102,7 +103,6 @@ struct Options {
     exclude: Vec<String>,
     extra: Vec<String>,
     dry_run: bool,
-    verbose: bool,
     timings: bool,
 }
 
@@ -111,13 +111,12 @@ impl Default for Options {
         Options {
             mode: Mode::Daemon,
             pairs: Vec::new(),
-            interval: 300,
+            interval: 3600,
             max_macs: sync::DEFAULT_MAX_MACS,
             max_macs_set: false,
             exclude: Vec::new(),
             extra: Vec::new(),
             dry_run: false,
-            verbose: false,
             timings: false,
         }
     }
@@ -132,11 +131,19 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 /// then sleeps toward the full interval - systemd's stop timeout turns
 /// that into a SIGKILL. The byte in the pipe is what wakes the poll.
 static STOP_PIPE_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// SIGHUP arrived: the operator wants a pass, now and trusting nothing.
+static RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-extern "C" fn note_signal(_sig: libc::c_int) {
-    // A store and a write(2) - the whole async-signal-safe vocabulary
-    // this handler needs.
-    STOPPING.store(true, Ordering::Relaxed);
+pub(crate) fn resync_wanted() -> bool {
+    RESYNC.swap(false, Ordering::Relaxed)
+}
+
+extern "C" fn note_signal(sig: libc::c_int) {
+    if sig == libc::SIGHUP {
+        RESYNC.store(true, Ordering::Relaxed);
+    } else {
+        STOPPING.store(true, Ordering::Relaxed);
+    }
     let fd = STOP_PIPE_W.load(Ordering::Relaxed);
     if fd >= 0 {
         unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
@@ -185,7 +192,7 @@ fn catch_signals() -> Option<std::os::fd::OwnedFd> {
     action.sa_flags = 0;
     unsafe {
         libc::sigemptyset(&mut action.sa_mask);
-        for sig in [libc::SIGTERM, libc::SIGINT] {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
                 eprintln!(
                     "warning: cannot catch signal {sig}: {} - a stop will be abrupt",
@@ -217,17 +224,18 @@ usage: sriov-mac-sync [options]
   --status        show what is detected, wanted and registered
   --check         test whether the uplink accepts unicast filter entries
   --flush         remove every address this daemon registered
+  --resync        ask the running daemon for a full pass, trusting nothing
+                  it carried (it leaves its pid in the state directory)
   --dry-run       report changes without applying them
   --timings       with the daemon or --once: after every pass, say what
                   each phase cost and what it
                   found, and name anything that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
-  --interval SEC  full reconciliation interval (default 300)
+  --interval SEC  timed pass after this many seconds of silence (default 3600)
   --max NUM       the filter capacity to respect: warn above it, and shed
                   quiet keeps as the list nears it (default 128)
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
-  -v, --verbose   explain what is skipped and why; with --status or --once,
                   list every wanted address with the port it was learnt
                   behind, longest silence last
   -h, --help      this text
@@ -422,9 +430,9 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
             "--status" => set_mode(opts, Mode::Status, &arg)?,
             "--check" => set_mode(opts, Mode::Check, &arg)?,
             "--flush" => set_mode(opts, Mode::Flush, &arg)?,
+            "--resync" => set_mode(opts, Mode::Resync, &arg)?,
             "--dry-run" => opts.dry_run = true,
             "--timings" => opts.timings = true,
-            "-v" | "--verbose" => opts.verbose = true,
             "--pair" => {
                 if !pairs_from_cli {
                     opts.pairs.clear();
@@ -483,10 +491,8 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
     let mut pairs = Vec::new();
     if opts.pairs.is_empty() {
         let (found, skipped) = topo.autodetect();
-        if opts.verbose {
-            for s in skipped {
-                note!("{s}");
-            }
+        for s in skipped {
+            note!("{s}");
         }
         if found.is_empty() && !allow_empty {
             return Err("no SR-IOV interface found that ends up in a bridge \
@@ -760,9 +766,9 @@ fn address_lines(detail: &sync::Detail) -> Vec<String> {
         .collect()
 }
 
-fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigger: &str) {
+fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: &str) {
     for r in reports {
-        if verbose && r.foreign > 0 {
+        if r.foreign > 0 {
             note!(
                 "{}: {} address(es) already present, left alone",
                 r.dev,
@@ -770,8 +776,16 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigge
             );
         }
         if r.added > 0 || r.removed > 0 {
-            // Composed, not branched four ways: the words stay byte for
-            // byte what the journal greps in bench/ expect.
+            // The timer only fires after an interval of silence. Work found
+            // then is work an event should have brought - say so, because
+            // that is the one thing the timer is still for.
+            if trigger == "timed" {
+                eprintln!(
+                    "warning: {}: the timed pass found +{} -{} - an event should \
+                     have brought this",
+                    r.dev, r.added, r.removed
+                );
+            }
             let quiet = if r.quiet > 0 {
                 format!(", {} held quiet", r.quiet)
             } else {
@@ -798,10 +812,31 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, verbose: bool, trigge
     }
 }
 
+/// Ask the running daemon for a pass. It leaves its pid in the state
+/// directory; SIGHUP is "now, and believe nothing".
+fn resync() -> Result<bool, String> {
+    let path = state_dir().join("pid");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("no running daemon: cannot read {}: {e}", path.display()))?;
+    let pid: libc::pid_t = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("{}: not a pid: {text:?}", path.display()))?;
+    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!("cannot signal pid {pid}: {e}"));
+    }
+    note!("asked pid {pid} for a full pass");
+    Ok(true)
+}
+
 fn run() -> Result<bool, String> {
     let mut opts = Options::default();
     load_conf(&mut opts);
     parse_args(&mut opts)?;
+    if opts.mode == Mode::Resync {
+        return resync();
+    }
 
     let mut sock = Socket::new().map_err(|e| format!("cannot open netlink socket: {e}"))?;
 
@@ -833,9 +868,7 @@ fn run() -> Result<bool, String> {
         // uplink is not in a bridge yet, and a devlink dump for an empty
         // list is a syscall round trip for a guaranteed empty answer.
         if !devs.is_empty() {
-            if let Some(v) =
-                adopt_reported_capacity(capacities_via_devlink(&devs), opts.verbose, opts.max_macs)
-            {
+            if let Some(v) = adopt_reported_capacity(capacities_via_devlink(&devs), opts.max_macs) {
                 opts.max_macs = v;
             }
         }
@@ -859,6 +892,7 @@ fn run() -> Result<bool, String> {
 
     match opts.mode {
         Mode::Flush => syncer.flush(&mut sock).map_err(|e| e.to_string()),
+        Mode::Resync => unreachable!("answered before any socket is opened"),
         Mode::Status => {
             let reports = syncer
                 .reconcile(&mut sock, false, &topo, topo_load)
@@ -893,7 +927,7 @@ fn run() -> Result<bool, String> {
                 // that print it, so the daemon does not copy the whole
                 // desired set and walk every silence once a pass for
                 // numbers nothing prints.
-                if let (true, Some(detail)) = (opts.verbose, r.detail.as_ref()) {
+                if let Some(detail) = r.detail.as_ref() {
                     for line in address_lines(detail) {
                         note!("{line}");
                     }
@@ -905,15 +939,8 @@ fn run() -> Result<bool, String> {
             let reports = syncer
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, opts.verbose, "once");
-            // On the same stream as the report lines: a single pass by
-            // hand is exactly when somebody wants to see WHICH addresses,
-            // and it is the one mode where the list cannot scroll a
-            // journal away. Each list gets its own heading rather than
-            // sitting under the report line above it - that line appears
-            // only when something changed, so on a quiet host two uplinks'
-            // lists would have run into each other unlabelled.
-            if opts.verbose {
+            report_changes(&reports, opts.dry_run, "once");
+            {
                 for r in &reports {
                     let Some(detail) = r.detail.as_ref() else {
                         continue;
@@ -946,8 +973,16 @@ fn run() -> Result<bool, String> {
                 opts.interval
             );
             let stop_rx = catch_signals();
-            // Opened before the reading above; `mon` is Some in this mode
-            // by construction.
+            // The pid, so --resync can find us. Best effort: a daemon that
+            // cannot write it still works, it just cannot be knocked on.
+            let pid_path = state_dir().join("pid");
+            let _ = syncer.ensure_state_dir();
+            if let Err(e) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
+                eprintln!(
+                    "warning: cannot write {}: {e} (--resync will not work)",
+                    pid_path.display()
+                );
+            }
             let mon = mon.expect("the daemon subscribes before it reads");
             // A device that drops out of one reading is not gone: an
             // interface reload takes a bridge away for a moment, and taking
@@ -962,6 +997,7 @@ fn run() -> Result<bool, String> {
             // opened, so anything that changed since is on its way as an
             // event.
             daemon_loop(&mut world, &mut syncer, &opts, Some((topo, topo_load)));
+            let _ = std::fs::remove_file(&pid_path);
 
             // Deliberately without a flush - catch_signals says why. Say how
             // much is left behind, so nobody has to wonder.
@@ -1168,10 +1204,9 @@ mod tests {
     #[test]
     fn the_bare_flags_reach_their_options() {
         let mut o = Options::default();
-        parse_args_from(&mut o, args(&["--timings", "--dry-run", "-v"]).into_iter()).unwrap();
+        parse_args_from(&mut o, args(&["--timings", "--dry-run"]).into_iter()).unwrap();
         assert!(o.timings);
         assert!(o.dry_run);
-        assert!(o.verbose);
     }
 
     /// The clamps accept their own boundaries and refuse one past them.
@@ -1428,21 +1463,6 @@ mod tests {
     /// And both are offered by the help text, or an operator has no way to
     /// know the list exists.
     #[test]
-    fn the_help_says_which_modes_list_addresses() {
-        let help = usage_text();
-        let line = help
-            .lines()
-            .skip_while(|l| !l.contains("--verbose"))
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            line.contains("--status") && line.contains("--once"),
-            "the help does not say which modes list addresses: {line}"
-        );
-    }
-
-    #[test]
     fn the_unit_file_matches_the_paths_the_code_uses() {
         let unit = include_str!("../dist/sriov-mac-sync.service");
         let dir = STATE_DIR.strip_prefix("/run/").unwrap();
@@ -1580,7 +1600,7 @@ mod tests {
         let mut o = Options::default();
         parse_args_from(&mut o, args(&[]).into_iter()).unwrap();
         assert!(matches!(o.mode, Mode::Daemon));
-        assert!(!o.dry_run && !o.verbose);
+        assert!(!o.dry_run);
     }
 
     /// The daemon asks for SIGTERM instead of being killed by it. If the

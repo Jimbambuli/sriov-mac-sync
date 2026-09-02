@@ -450,6 +450,10 @@ pub struct Syncer {
     /// larger one for nothing. Empty until devlink answers, which on ixgbe,
     /// i40e and mlx4 is never - hence the fallback above.
     pub max_macs_je_karte: Map<String, usize>,
+    /// Set by the event path when a learn named a port or a bridge the
+    /// picture does not know: the picture is old, and the daemon reads it
+    /// afresh before the next pass. A Cell because fast_add works on &self.
+    pub disputed: std::cell::Cell<bool>,
     /// Whether the last capacity question reached every configured device
     /// and got an answer - read by the daemon to stop asking.
     pub capacity_settled: bool,
@@ -609,6 +613,7 @@ impl Syncer {
             karte_von: crate::hash::map(),
             max_macs_je_karte: crate::hash::map(),
             capacity_settled: false,
+            disputed: std::cell::Cell::new(false),
             last_pass_at: 0,
             carried: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -2949,8 +2954,18 @@ impl Syncer {
         let Some(master) = entry.master else {
             return false;
         };
-        if topo.at(entry.ifindex).is_none() {
-            return false; // an interface this reading does not have
+        // The learn is a witness: it names a port and the bridge that
+        // recorded it, now. A port the picture does not know, or one it
+        // knows under another master, says the picture is old.
+        match topo.at(entry.ifindex) {
+            None => {
+                self.disputed.set(true);
+                return false;
+            }
+            Some(l) if l.master != Some(master) => {
+                self.disputed.set(true);
+            }
+            _ => {}
         }
         let mut ours = false;
         for fp in pairs {

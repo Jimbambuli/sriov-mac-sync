@@ -89,8 +89,18 @@ that failed along the way.
 Uplink and bridge to manage. Repeatable, and skips autodetection entirely.
 .TP
 .BI \-\-interval " SEC"
-Seconds between full reconciliations (default 300). This is a safety net, not
-the mechanism: addresses are registered the moment the kernel reports them.
+After this many seconds of silence \(em no event, no pass \(em run one full pass
+that trusts nothing it carried (default 3600). This is a safety net, not the
+mechanism: addresses are registered the moment the kernel reports them, and a
+learn that names a port or a bridge the daemon's picture does not know makes
+it read the picture afresh on its own. A timed pass that finds work logs a
+warning: an event should have brought it.
+.TP
+.B \-\-resync
+Ask the running daemon for such a pass now. The daemon leaves its pid in the
+state directory and answers
+.B SIGHUP
+the same way.
 .TP
 .BI \-\-max " NUM"
 The filter capacity to respect (default 128): warn above it, and surrender
@@ -109,12 +119,8 @@ Addresses never to register, separated by commas or whitespace.
 Addresses to register unconditionally, for a device that never speaks first. The
 wire\-side and own\-address rules still override this.
 .TP
-.BR \-v ", " \-\-verbose
-Explain what is skipped and why. With
-.B \-\-status
-or
-.BR \-\-once ,
-it also lists every wanted address with the bridge port it was last learnt
+.BR \-\-status " and " \-\-once
+Both list every wanted address with the bridge port it was last learnt
 behind, longest silence last \(em the list ends where the pressure valve
 begins, so the bottom of it is what the filter gives up first \(em marking the
 ones held through a silence with how long each has been silent, in days,
@@ -174,7 +180,8 @@ from this list keeps its filter entries until
 takes them out or autodetection is allowed to conclude the device is gone.
 .TP
 .B RESYNC
-Seconds between full reconciliations.
+Seconds of silence before a timed pass, as
+.BR \-\-interval .
 .TP
 .B MAX_MACS
 The filter capacity to respect, as
@@ -244,7 +251,10 @@ be found, a filter the kernel refused, a configuration that named nothing.
 .B SIGTERM
 and
 .B SIGINT
-stop the daemon and leave the registrations in the card. Use
+stop the daemon and leave the registrations in the card.
+.B SIGHUP
+asks for a full pass that trusts nothing carried, as
+.BR \-\-resync . Use
 .B \-\-flush
 to take them back.
 .SH EXAMPLES

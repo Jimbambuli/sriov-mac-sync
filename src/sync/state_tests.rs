@@ -3521,6 +3521,44 @@ fn renaming_a_device_carries_every_mark() {
     assert_eq!(said, erwartet);
 }
 
+/// A learn is a witness for the topology: it names a port and the bridge
+/// that recorded it, now. A port the picture does not know, or one it
+/// knows under another master, proves the picture old - the event path
+/// says so, and the daemon reads afresh before the next pass.
+#[test]
+fn a_learn_that_contradicts_the_picture_disputes_it() {
+    let dir = scratch("witness");
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+
+    // A port the picture knows, in the bridge it knows: no dispute.
+    let ok = vec![(RTM_NEWNEIGH, learned(4, 10, [0x02, 0xe0, 0, 0, 0, 1]))];
+    s.fast_apply(&mut sock, &topo, &ok).unwrap();
+    assert!(
+        !s.disputed.get(),
+        "a learn that matches the picture disputes nothing"
+    );
+
+    // A port the picture has never heard of.
+    let unknown = vec![(RTM_NEWNEIGH, learned(77, 10, [0x02, 0xe0, 0, 0, 0, 2]))];
+    s.fast_apply(&mut sock, &topo, &unknown).unwrap();
+    assert!(
+        s.disputed.replace(false),
+        "an unknown port is proof the picture is old"
+    );
+
+    // A known port, but the bridge that recorded it is not its master.
+    let moved = vec![(RTM_NEWNEIGH, learned(4, 99, [0x02, 0xe0, 0, 0, 0, 3]))];
+    s.fast_apply(&mut sock, &topo, &moved).unwrap();
+    assert!(
+        s.disputed.replace(false),
+        "a port under another master is proof too"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A host whose virtual function reaches two bridges through two VLAN
 /// interfaces. Both uplinks write into ONE filter - the one of nic1 below
 /// them - so whoever counts how full the card is has to ask nic1.

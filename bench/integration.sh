@@ -238,10 +238,10 @@ check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
 say "S3: --dry-run touches nothing"
 $NS bridge fdb add $M2 dev veth-g1 master dynamic
 NOTE_BEFORE=$(cat $STATE/veth-up.owned)
-$NS "$BIN" --once --dry-run -v --pair veth-up:br0 >/tmp/sms-it-s3.log 2>&1
+$NS "$BIN" --once --dry-run --pair veth-up:br0 >/tmp/sms-it-s3.log 2>&1
 check "M2 NOT in the filter" "! has_self $M2"
 check "note unchanged" "[ \"$NOTE_BEFORE\" = \"$(cat $STATE/veth-up.owned)\" ]"
-# -v on a single pass lists the addresses themselves, under a heading that
+# A single pass lists the addresses themselves, under a heading that
 # names the uplink - the report line above it appears only when something
 # changed, so on a quiet host it is not there to name anything.
 # Anchored at the front and on a word boundary, not on the end of the line:
@@ -511,6 +511,18 @@ check "the whole shared list is counted, not just this uplink's share" \
   "grep -q '4 unicast entries against the 3' /tmp/sms-it-s10b.log"
 $NS "$BIN" --flush >/dev/null 2>&1
 for i in vg1 vg2 vbr1 vbr2 vshare.11 vshare.12 vshare; do $NS ip link del $i 2>/dev/null; done
+
+say "S11: --resync knocks on the running daemon"
+start_daemon /tmp/sms-it-s11.log
+check_soon "the pass ran" "grep -q 'registered\|pass \[start\]\|watching' /tmp/sms-it-s11.log"
+check "the daemon left its pid" "[ -f $STATE/pid ] && [ \"\$(cat $STATE/pid)\" = \"$DPID\" ]"
+$NS "$BIN" --resync >/tmp/sms-it-s11b.log 2>&1
+check "--resync exits 0" "[ $? -eq 0 ]"
+check_soon "the daemon answered with an operator pass" "grep -q '\[operator\]' /tmp/sms-it-s11.log"
+stop_daemon
+check "the pid file went with the daemon" "! [ -f $STATE/pid ]"
+$NS "$BIN" --resync >/tmp/sms-it-s11c.log 2>&1
+check "--resync without a daemon fails and says so" "[ $? -ne 0 ] && grep -q 'no running daemon' /tmp/sms-it-s11c.log"
 
 say "S9: the host outside the namespace is untouched"
 DIFF=$(diff "$SNAP" <(ip -br link | awk '{print $1}' | sort))

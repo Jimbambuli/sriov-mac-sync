@@ -52,6 +52,10 @@ pub(crate) fn read_topology(sock: &mut Socket) -> Result<Topology, String> {
 pub(crate) trait World: sync::FdbWriter {
     fn now(&self) -> Instant;
     fn stopping(&self) -> bool;
+    /// Whether the operator asked for a pass (SIGHUP). Consumed on read.
+    fn resync_wanted(&mut self) -> bool {
+        false
+    }
     /// Wait on the subscription for at most this many milliseconds; whether
     /// something arrived. An interrupted wait reads as "nothing", so a stop
     /// is noticed at the loop's top rather than after the full interval.
@@ -97,6 +101,9 @@ impl World for Live {
     }
     fn stopping(&self) -> bool {
         stopping()
+    }
+    fn resync_wanted(&mut self) -> bool {
+        crate::resync_wanted()
     }
     fn wait(&mut self, millis: i32) -> std::io::Result<bool> {
         let Some(stop_rx) = &self.stop_rx else {
@@ -169,9 +176,10 @@ impl World for Live {
 /// Holding them together means every rule about them is one of these methods.
 struct Schedule {
     /// A deadline, not a sleep. Wake-ups that turn out to be none of our
-    /// business must not push the full pass further away.
+    /// business must not push the full pass further away. Every completed
+    /// pass moves it a whole interval out: the timer only ever fires after
+    /// an interval of silence, and then the pass trusts nothing it carried.
     next_full: Instant,
-    next_refresh: Instant,
     /// When the last full pass ran, so event storms are answered with a
     /// bounded pass rate rather than with waiting. Registrations never wait.
     last_pass: Instant,
@@ -185,38 +193,10 @@ impl Schedule {
     fn new(now: Instant, interval: Duration) -> Self {
         Self {
             next_full: now,
-            // A whole interval out, not now: the first pass is the catch-up
-            // after a restart and calls itself "start" - a refresh firing on
-            // the first iteration used to rename it "timed", and the
-            // canary's one job is that "timed" means the timer caught
-            // something.
-            next_refresh: now + interval,
             last_pass: now - interval,
             trigger: "start",
             interval,
         }
-    }
-
-    /// The refresh exists to catch what the events missed, an interface change
-    /// whose notification never arrived included. It believes nothing it was
-    /// told, and brings the pass forward so that what it reads is acted on.
-    /// The caller invalidates what it holds; saying so is not this type's job.
-    /// The trigger name is left alone: after a quiet interval it already
-    /// says "timed" (completed() set the default), and a pending batch
-    /// label must not be stolen - the pass does that batch's work too, and
-    /// a correction reported as `[timed]` is the canary's false alarm.
-    fn refresh_due(&mut self, now: Instant) -> bool {
-        if now < self.next_refresh {
-            return false;
-        }
-        // The `min` and a plain assignment cannot be told apart from
-        // outside: this only ever runs when `now` has arrived, so both
-        // leave the pass due, and `wait_for` is not consulted when it is.
-        // Kept as the narrowing form because every other deadline rule
-        // here is one, not because a test could hold it in place.
-        self.next_full = self.next_full.min(now);
-        self.next_refresh = now + self.interval;
-        true
     }
 
     fn pass_due(&self, now: Instant) -> bool {
@@ -262,9 +242,7 @@ impl Schedule {
     }
 
     fn wait_for(&self, now: Instant) -> Duration {
-        self.next_full
-            .min(self.next_refresh)
-            .saturating_duration_since(now)
+        self.next_full.saturating_duration_since(now)
     }
 }
 
@@ -445,7 +423,14 @@ pub(crate) fn daemon_loop<W: World>(
         if world.stopping() {
             break;
         }
-        if schedule.refresh_due(world.now()) {
+        // The operator knocked: now, and believe nothing.
+        if world.resync_wanted() {
+            distrust_carried(&mut picture, syncer);
+            schedule.at_once(world.now(), "operator");
+        }
+        // The timer fired, which means an interval of silence: whatever
+        // was carried through it is old enough to be asked afresh.
+        if schedule.pass_due(world.now()) && schedule.trigger == "timed" {
             distrust_carried(&mut picture, syncer);
         }
         if schedule.pass_due(world.now()) {
@@ -582,7 +567,7 @@ fn run_pass<W: World>(
             // number for the rest of its life. The operator's --max still
             // wins; the gate is the same one.
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
-                if let Some(v) = ask_the_cards(world, syncer, picture, opts.verbose) {
+                if let Some(v) = ask_the_cards(world, syncer, picture) {
                     // One number, one home: the warning threshold and the
                     // quiet-keep's pressure valve read the same field. The
                     // operator's --max never moves - the max_macs_set gate
@@ -606,7 +591,7 @@ fn run_pass<W: World>(
         // Non-empty by construction: capacity_pending is only set when the
         // operator wrote pairs down, and resolve_pairs keeps every one of
         // them even before its interface exists.
-        if let Some(v) = ask_the_cards(world, syncer, picture, opts.verbose) {
+        if let Some(v) = ask_the_cards(world, syncer, picture) {
             syncer.max_macs = v;
         }
         if syncer.capacity_settled {
@@ -624,7 +609,7 @@ fn run_pass<W: World>(
     };
     match syncer.reconcile(world, true, topo, topo_load) {
         Ok(reports) => {
-            report_changes(&reports, opts.dry_run, opts.verbose, trigger);
+            report_changes(&reports, opts.dry_run, trigger);
             if opts.timings {
                 note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
             }
@@ -715,6 +700,13 @@ fn handle_batch<W: World>(
         },
         None => urgency = sync::Urgency::Now, // no picture to judge it by
     }
+    // A learn that named a port or a bridge the picture does not know is
+    // proof the picture is old - not a guess, a witness. The next pass
+    // reads afresh; this batch worked on what it had.
+    if syncer.disputed.replace(false) {
+        picture.invalidate();
+        urgency = sync::Urgency::Now;
+    }
     if urgency == sync::Urgency::Nothing {
         return None;
     }
@@ -781,12 +773,7 @@ pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAn
 /// none, and records on the syncer whether every configured device was
 /// there to be asked and answered - "the card says nothing" being an
 /// answer. Two call sites used to spell this out side by side.
-fn ask_the_cards<W: World>(
-    world: &mut W,
-    syncer: &mut Syncer,
-    picture: &Picture,
-    verbose: bool,
-) -> Option<usize> {
+fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, picture: &Picture) -> Option<usize> {
     let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
     let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
     let all_present = picture
@@ -794,10 +781,10 @@ fn ask_the_cards<W: World>(
         .as_ref()
         .is_some_and(|t| devs.iter().all(|d| t.index_of(d).is_some()));
     syncer.capacity_settled = all_present && answers.iter().all(|(_, a)| a.is_ok());
-    for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
+    for (karte, wert) in reported_capacities(answers.clone(), syncer.max_macs) {
         syncer.max_macs_je_karte.insert(karte, wert);
     }
-    adopt_reported_capacity(answers, verbose, syncer.max_macs)
+    adopt_reported_capacity(answers, syncer.max_macs)
 }
 
 /// Die Namen der Interfaces, die die Filter der Uplinks wirklich halten.
@@ -829,7 +816,6 @@ pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<S
 /// nach dem Mass der kleinsten arbeitet, das Minimum als sichere Annahme.
 pub(crate) fn reported_capacities(
     answers: Vec<(String, CapacityAnswer)>,
-    verbose: bool,
     assumed: usize,
 ) -> Vec<(String, usize)> {
     let mut usable: Vec<(String, usize)> = Vec::new();
@@ -838,20 +824,14 @@ pub(crate) fn reported_capacities(
             Ok(Some(v)) => match clamp_max_macs(v as usize) {
                 Ok(v) => usable.push((dev, v)),
                 Err(_) => {
-                    if verbose {
-                        note!("{dev}: reported capacity {v} is unusable, ignored");
-                    }
+                    note!("{dev}: reported capacity {v} is unusable, ignored");
                 }
             },
             Ok(None) => {
-                if verbose {
-                    note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
-                }
+                note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
             }
             Err(e) => {
-                if verbose {
-                    note!("{dev}: could not ask for the filter capacity: {e}");
-                }
+                note!("{dev}: could not ask for the filter capacity: {e}");
             }
         }
     }
@@ -860,7 +840,6 @@ pub(crate) fn reported_capacities(
 
 pub(crate) fn adopt_reported_capacity(
     answers: Vec<(String, CapacityAnswer)>,
-    verbose: bool,
     assumed: usize,
 ) -> Option<usize> {
     let mut usable: Vec<(String, usize)> = Vec::new();
@@ -869,20 +848,14 @@ pub(crate) fn adopt_reported_capacity(
             Ok(Some(v)) => match clamp_max_macs(v as usize) {
                 Ok(v) => usable.push((dev, v)),
                 Err(_) => {
-                    if verbose {
-                        note!("{dev}: reported capacity {v} is unusable, ignored");
-                    }
+                    note!("{dev}: reported capacity {v} is unusable, ignored");
                 }
             },
             Ok(None) => {
-                if verbose {
-                    note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
-                }
+                note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
             }
             Err(e) => {
-                if verbose {
-                    note!("{dev}: could not ask for the filter capacity: {e}");
-                }
+                note!("{dev}: could not ask for the filter capacity: {e}");
             }
         }
     }
@@ -891,9 +864,8 @@ pub(crate) fn adopt_reported_capacity(
         // Worth saying only to somebody who asked what was skipped: the
         // number moved nowhere, but that it was *asked for* is the
         // difference between a card that agrees and a card that is silent.
-        if verbose {
-            note!("{dev} says its filter holds {value} addresses, which is what was assumed");
-        }
+        note!("{dev} says its filter holds {value} addresses, which is what was assumed");
+
         return None;
     }
     note!(
@@ -919,17 +891,20 @@ mod tests {
         let interval = Duration::from_secs(300);
         let mut s = Schedule::new(now, interval);
         assert_eq!(s.trigger, "start", "the first pass is the restart catch-up");
-        assert!(
-            !s.refresh_due(now),
-            "a refresh on the very first iteration would rename [start]"
-        );
         s.completed(now);
         assert_eq!(s.trigger, "timed", "the default between events");
+        assert!(
+            !s.pass_due(now + interval / 2),
+            "a completed pass pushes the timer a whole interval out"
+        );
+        assert!(
+            s.pass_due(now + interval),
+            "and after an interval of silence it fires"
+        );
         s.bring_forward(now, "forwarding change");
-        assert!(s.refresh_due(now + interval));
         assert_eq!(
             s.trigger, "forwarding change",
-            "the refresh stole the batch's label"
+            "an event keeps its own label"
         );
         s.retry_soon(now);
         assert_eq!(
@@ -952,7 +927,6 @@ mod tests {
         assert_eq!(
             adopt_reported_capacity(
                 vec![dev("nic0", Ok(Some(256))), dev("nic1", Ok(Some(64)))],
-                false,
                 128
             ),
             Some(64)
@@ -961,26 +935,24 @@ mod tests {
         assert_eq!(
             adopt_reported_capacity(
                 vec![dev("nic0", Ok(Some(0))), dev("nic1", Ok(Some(64)))],
-                false,
                 128
             ),
             Some(64)
         );
         // Nothing usable at all leaves the default standing.
         assert_eq!(
-            adopt_reported_capacity(vec![dev("nic0", Ok(Some(0)))], false, 128),
+            adopt_reported_capacity(vec![dev("nic0", Ok(Some(0)))], 128),
             None
         );
         // Agreement is not a change.
         assert_eq!(
-            adopt_reported_capacity(vec![dev("nic0", Ok(Some(128)))], false, 128),
+            adopt_reported_capacity(vec![dev("nic0", Ok(Some(128)))], 128),
             None
         );
         // Silence and failure leave the default standing.
         assert_eq!(
             adopt_reported_capacity(
                 vec![dev("nic0", Ok(None)), dev("nic1", Err("no".into()))],
-                false,
                 128
             ),
             None
@@ -1655,12 +1627,7 @@ mod tests {
             assert!(sched.pass_due(start));
             // The timer comes round: it may not push that pass away.
             let later = start + Duration::from_secs(600);
-            sched.next_refresh = start;
-            assert!(sched.refresh_due(later));
-            assert!(
-                sched.pass_due(later),
-                "a timed refresh pushed a pass that was already due"
-            );
+            assert!(sched.pass_due(later), "a due pass stays due");
             // Neither may a batch that only wants one soon.
             sched.bring_forward(later + Duration::from_secs(60), "forwarding change");
             assert!(

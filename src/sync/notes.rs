@@ -254,7 +254,7 @@ impl Syncer {
     /// changed it back on every start would be a warning a day and an
     /// argument it cannot win. The notes themselves are 0600 either way, so
     /// there is nothing to read through it.
-    pub(super) fn ensure_state_dir(&self) -> io::Result<()> {
+    pub fn ensure_state_dir(&self) -> io::Result<()> {
         // `recursive` returns Ok for a directory that was already there, and
         // leaves its mode alone - hence the check that follows.
         fs::DirBuilder::new()
