@@ -980,6 +980,120 @@ fn a_renamed_uplink_keeps_its_note() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A name re-used within one boot wears another interface's note. The
+/// recorded index says whose it is: the flush reaches the old interface
+/// under its new name and leaves the new one alone - and where the old one
+/// is gone, its entries went with it and only the note is settled.
+#[test]
+fn a_flush_does_not_reach_into_a_reused_name() {
+    let dir = scratch("flush-reused");
+    let mut s = Syncer::new(Vec::new(), dir.clone());
+    s.save_owned("nic1", &[mac(0x61)].into_iter().collect::<Set<_>>());
+    s.note_index("nic1", 5);
+    let link = |index, name: &str| crate::netlink::LinkInfo {
+        index,
+        name: name.into(),
+        mac: Some(mac(1)),
+        kind: Some("veth".into()),
+        ..Default::default()
+    };
+    let mut sock = FakeSock {
+        links: vec![link(9, "nic1"), link(5, "nicX")],
+        ..Default::default()
+    };
+    assert!(s.flush(&mut sock).unwrap());
+    assert_eq!(
+        sock.removed,
+        vec![(5, mac(0x61))],
+        "the entries had to be removed from the interface the note is about"
+    );
+
+    s.save_owned("nic1", &[mac(0x62)].into_iter().collect::<Set<_>>());
+    s.note_index("nic1", 5);
+    let mut sock = FakeSock {
+        links: vec![link(9, "nic1")],
+        ..Default::default()
+    };
+    assert!(s.flush(&mut sock).unwrap());
+    assert!(
+        sock.removed.is_empty(),
+        "a new interface wearing the name had the old note's entry removed: {:?}",
+        sock.removed
+    );
+    assert!(
+        !dir.join("nic1.owned").exists(),
+        "the note of a gone interface lingers"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The pass, too: the note of the interface that wore the name before
+/// follows that interface to its new name, and the new interface starts
+/// with a note of its own. Nothing the old note named is removed from the
+/// new interface.
+#[test]
+fn a_pass_does_not_apply_a_departed_interfaces_note_to_a_new_one() {
+    let dir = scratch("pass-reused");
+    let topo = host(mac(1));
+    let mut s = ready_syncer(&dir);
+    let mut sock = kernel(vec![learned(3, 10, BEHIND_NIC)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert_eq!(s.noted_index("nic1"), Some(2));
+
+    // nic1 is now a new interface at index 12; the old one lives on as
+    // nicX at index 2, still in the bridge, still holding its entry.
+    let swapped = Builder::new()
+        .add("nic1", 12, Some(mac(7)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nicX", 2, Some(mac(1)))
+        .master("vmbr1")
+        .vfs(1)
+        .add("nic2", 3, Some(mac(2)))
+        .master("vmbr1")
+        .add("vmbr1", 10, Some(mac(1)))
+        .bridge()
+        .lower("nic1")
+        .lower("nicX")
+        .lower("nic2")
+        .build();
+    let mut sock = FakeSock {
+        fdb: vec![
+            learned(3, 10, BEHIND_NIC),
+            FdbEntry {
+                ifindex: 2,
+                master: None,
+                mac: BEHIND_NIC,
+                state: 0x80,
+                flags: 0x02,
+            },
+        ],
+        vf: vec![(2, VF_ADMIN), (12, VF_ADMIN)],
+        ..Default::default()
+    };
+    s.reconcile(&mut sock, true, &swapped, Dur::ZERO).unwrap();
+    assert!(
+        !sock.removed.iter().any(|(i, _)| *i == 12 || *i == 2),
+        "something was removed on the strength of the old note: {:?}",
+        sock.removed
+    );
+    assert!(
+        s.load_owned("nicX").contains(&BEHIND_NIC),
+        "the old note did not follow the old interface"
+    );
+    assert_eq!(
+        s.noted_index("nic1"),
+        Some(12),
+        "the new interface got no record of its own"
+    );
+    assert!(
+        sock.added.contains(&(12, BEHIND_NIC)),
+        "the new uplink was not served: {:?}",
+        sock.added
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// --flush finds notes by name but removes entries by index, and a rename
 /// moves only the name: the recorded index has to reach the entries under
 /// whatever the interface is called now.

@@ -208,7 +208,12 @@ interface instead of being unlinked with every entry it names still in the
 card. Within one boot an index identifies an interface outright — the kernel
 hands them out from a counter that does not re-use one — and `/run` does not
 outlive a boot either. `--flush` resolves through the same record, so it
-reaches the entries under whatever name the interface wears now.
+reaches the entries under whatever name the interface wears now. The record
+cuts the other way too: a name re-used within one boot — udev churn, an
+`ifrename` — wears the departed interface's note, and every path that acts on
+a note found by name first holds the recorded index against the interface's.
+On a mismatch the note follows the old interface where that lives on under a
+new name, is settled where it is gone, and is never applied to the newcomer.
 
 ## What a pass costs
 

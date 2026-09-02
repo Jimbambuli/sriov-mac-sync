@@ -76,6 +76,9 @@ pub(super) struct Said {
     /// the interface record could not be written, or is missing where it
     /// would tell a rename from a departure
     pub index: Set<String>,
+    /// the note belongs to another interface that wore the name, and the
+    /// pass that cannot write leaves the filter alone
+    pub reused: Set<String>,
 }
 
 impl Said {
@@ -90,6 +93,7 @@ impl Said {
             lock,
             ports,
             index,
+            reused,
         } = self;
         unknown_vf.remove(dev);
         extra.remove(dev);
@@ -99,6 +103,7 @@ impl Said {
         lock.remove(dev);
         ports.remove(dev);
         index.remove(dev);
+        reused.remove(dev);
     }
 
     /// A device that stopped being an uplink but whose note is still on
@@ -131,8 +136,11 @@ impl Said {
             lock,
             ports,
             index,
+            reused,
         } = self;
-        for set in [unknown_vf, over, tight, unreadable, lock, ports, index] {
+        for set in [
+            unknown_vf, over, tight, unreadable, lock, ports, index, reused,
+        ] {
             if set.remove(old) {
                 set.insert(new.to_string());
             }
@@ -666,7 +674,7 @@ impl Syncer {
             // nobody. Identity is the recorded index, which a boot never
             // re-uses; two interfaces swapping names in one breath is the
             // residual case.
-            if topo.get(&dev).is_none() {
+            if self.noted_link(&dev, topo).is_none() {
                 // Gone, or renamed? Only the interface record can tell, and
                 // without one "gone" is a guess that would unlink the note of
                 // a live interface - the permanent orphan. Left alone, said
@@ -693,64 +701,7 @@ impl Syncer {
                         // while the daemon was stopped - the usual kind -
                         // lost the keeps. The lines land in `carried_ports`
                         // under the old name and move below.
-                        self.load_ports(&dev, topo, false);
-                        let moved = self.migrate_note(&dev, &new_name, index);
-                        if moved {
-                            note!("{dev}: now called {new_name}, its note follows the interface");
-                            // Deliberately field by field, not a struct move.
-                            // Three reviews proposed one UplinkState so a
-                            // rename becomes remove+insert, refuted each
-                            // time: these collections carry three lifecycles
-                            // (file caches follow the note, absent_since
-                            // measures the missing, the rest is uplink state)
-                            // and several must NOT move uniformly -
-                            // ports_written is discarded for both names,
-                            // ports_loaded only set when the memory really
-                            // migrated. A struct move would turn "forgot to
-                            // move one" (cold start, benign) into "moved one
-                            // that must not" (stale state under the new
-                            // name). Each line below is a policy. The port
-                            // memory follows the note, or a rename would
-                            // forget exactly the quiet guests.
-                            if let Some(ports) = self.carried_ports.remove(&dev) {
-                                self.carried_ports.insert(new_name.clone(), ports);
-                                // And the new name counts as read, or the
-                                // fast path stops stamping a map it owns
-                                // while the valve judges it. Inside this
-                                // block on purpose: marking a name whose
-                                // memory was NOT migrated would suppress the
-                                // real read.
-                                self.ports_loaded.insert(new_name.clone());
-                            }
-                            // The written-down copy went with the old note;
-                            // the new name has nothing on file yet, so the
-                            // next pass puts the carried map down under it.
-                            self.ports_loaded.remove(&dev);
-                            self.ports_written.remove(&dev);
-                            self.ports_written.remove(&new_name);
-                            // Every said-once mark in one call - see Said.
-                            self.said.borrow_mut().rename(&dev, &new_name);
-                            // The pass's leavings follow - the wire set, or
-                            // the fast path would judge the renamed uplink
-                            // against an empty one; the keeps and occupancy,
-                            // moot when the migrating pass also reconciles
-                            // the new name, not when it skips the pair while
-                            // the event path keeps registering for it.
-                            if let Some(c) = self.carried.remove(&dev) {
-                                self.carried.insert(new_name.clone(), c);
-                            }
-                            // The say-once marks follow too, or a rename
-                            // repeats both warnings for a device that did not
-                            // change. Onto disk under the new name at once:
-                            // the old file went with the old note, and a
-                            // crash before the next pass would forget the
-                            // keeps just carried over. The pass stamp like
-                            // every other caller: a fresh clock reading is
-                            // later than every stamp, so the memo would
-                            // record each line as quiet and the next pass
-                            // rewrite the file for nothing.
-                            self.save_ports(&new_name, topo, self.last_pass_at);
-                        }
+                        self.follow_rename(&dev, &new_name, index, topo);
                     }
                     // Worked, or waits (an unreadable or unwritable note,
                     // said where it happened, looked at again next sweep).
@@ -784,7 +735,7 @@ impl Syncer {
                     }
                     return false;
                 }
-                let (gone, kept) = match topo.get(&dev) {
+                let (gone, kept) = match self.noted_link(&dev, topo) {
                     Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
                     // The device itself is gone - a rename was told apart
                     // above - and a unicast filter does not outlive its
@@ -853,6 +804,86 @@ impl Syncer {
             return None;
         }
         Some((index, link.name.clone()))
+    }
+
+    /// The interface a note is about, found by name and held against the
+    /// recorded index: a name re-used within one boot - udev churn, an
+    /// ifrename - would otherwise wear the departed interface's note, and
+    /// what the new one legitimately holds be removed by us. Nothing for a
+    /// name that is gone or re-used; `renamed_target` then follows the
+    /// recorded index instead.
+    fn noted_link<'a>(&self, dev: &str, topo: &'a Topology) -> Option<&'a crate::topology::Link> {
+        let link = topo.get(dev)?;
+        match self.recorded_index(dev) {
+            Some(i) if i != link.index => None,
+            _ => Some(link),
+        }
+    }
+
+    /// A note's interface lives on under a new name: the note, the port
+    /// memory, the say-once marks and the pass's leavings follow it. Whether
+    /// the note moved; if not, it waits (an unreadable or unwritable note,
+    /// said where it happened, looked at again next time).
+    fn follow_rename(&mut self, dev: &str, new_name: &str, index: u32, topo: &Topology) -> bool {
+        self.load_ports(dev, topo, false);
+        let moved = self.migrate_note(dev, new_name, index);
+        if moved {
+            note!("{dev}: now called {new_name}, its note follows the interface");
+            // Deliberately field by field, not a struct move.
+            // Three reviews proposed one UplinkState so a
+            // rename becomes remove+insert, refuted each
+            // time: these collections carry three lifecycles
+            // (file caches follow the note, absent_since
+            // measures the missing, the rest is uplink state)
+            // and several must NOT move uniformly -
+            // ports_written is discarded for both names,
+            // ports_loaded only set when the memory really
+            // migrated. A struct move would turn "forgot to
+            // move one" (cold start, benign) into "moved one
+            // that must not" (stale state under the new
+            // name). Each line below is a policy. The port
+            // memory follows the note, or a rename would
+            // forget exactly the quiet guests.
+            if let Some(ports) = self.carried_ports.remove(dev) {
+                self.carried_ports.insert(new_name.to_string(), ports);
+                // And the new name counts as read, or the
+                // fast path stops stamping a map it owns
+                // while the valve judges it. Inside this
+                // block on purpose: marking a name whose
+                // memory was NOT migrated would suppress the
+                // real read.
+                self.ports_loaded.insert(new_name.to_string());
+            }
+            // The written-down copy went with the old note;
+            // the new name has nothing on file yet, so the
+            // next pass puts the carried map down under it.
+            self.ports_loaded.remove(dev);
+            self.ports_written.remove(dev);
+            self.ports_written.remove(new_name);
+            // Every said-once mark in one call - see Said.
+            self.said.borrow_mut().rename(dev, new_name);
+            // The pass's leavings follow - the wire set, or
+            // the fast path would judge the renamed uplink
+            // against an empty one; the keeps and occupancy,
+            // moot when the migrating pass also reconciles
+            // the new name, not when it skips the pair while
+            // the event path keeps registering for it.
+            if let Some(c) = self.carried.remove(dev) {
+                self.carried.insert(new_name.to_string(), c);
+            }
+            // The say-once marks follow too, or a rename
+            // repeats both warnings for a device that did not
+            // change. Onto disk under the new name at once:
+            // the old file went with the old note, and a
+            // crash before the next pass would forget the
+            // keeps just carried over. The pass stamp like
+            // every other caller: a fresh clock reading is
+            // later than every stamp, so the memo would
+            // record each line as quiet and the next pass
+            // rewrite the file for nothing.
+            self.save_ports(new_name, topo, self.last_pass_at);
+        }
+        moved
     }
 
     /// Takes every one of `owned` back out of the filter. Returns how many
@@ -1439,6 +1470,52 @@ impl Syncer {
         out
     }
 
+    /// The pass's arm of the pressure valve: with `occupied` slots on the
+    /// card - `want` plus the present entries that are neither wanted nor
+    /// ours - surrender kept addresses out of `want` and `kept`, longest
+    /// silent first, until the card's limit less its headroom holds. What is
+    /// shed leaves `want`, and the stale loop takes it off the card in the
+    /// same pass, so the slot really frees. Returns how many were shed.
+    ///
+    /// Ordered by the RAW stamp, as `shed_keeps` orders - one spelling for
+    /// both valves, side by side. Not by `silence_of`: that view clamps a
+    /// stamp ahead of the pass mark to "just now" for display, so two keeps
+    /// a millisecond apart could tie and the address decide.
+    fn press_at_pass(
+        &self,
+        dev: &str,
+        card: &str,
+        occupied: usize,
+        want: &mut Set<Mac>,
+        kept: &mut Set<Mac>,
+    ) -> usize {
+        let limit = self.limit_of(card);
+        let reserve = headroom(limit);
+        let mut occupied = occupied;
+        if kept.is_empty() || occupied + reserve <= limit {
+            return 0;
+        }
+        let ports = self.carried_ports.get(dev);
+        let mut order: Vec<(u64, Mac)> = kept
+            .iter()
+            .map(|m| (ports.and_then(|ps| ps.get(m)).map_or(0, |&(_, t)| t), *m))
+            .collect();
+        // Smallest stamp = longest since it last spoke; the address is the
+        // tiebreak.
+        order.sort_unstable();
+        let mut shed = 0usize;
+        for (_, m) in order {
+            if occupied + reserve <= limit {
+                break;
+            }
+            want.remove(&m);
+            kept.remove(&m);
+            occupied -= 1;
+            shed += 1;
+        }
+        shed
+    }
+
     /// Surrender up to `need` kept addresses, longest-silent first - card, note
     /// and memory together, under the note's lock. The fast path's arm of the
     /// valve: a burst that would overflow the card cannot wait for a pass,
@@ -1863,6 +1940,50 @@ impl Syncer {
             // the filter is a growth, and growing on a carried VF answer is
             // the bug class the refresh exists for. The previous run's memory
             // is what makes an update invisible to a quiet guest.
+            // A note found by name has to be about THIS interface. A name
+            // re-used within one boot - udev churn, an ifrename - would
+            // otherwise wear the departed interface's note, and the stale
+            // loop remove what the new one legitimately holds. The recorded
+            // index tells: the note follows the old interface where that
+            // lives on, and goes where it does not.
+            if self
+                .recorded_index(&pair.dev)
+                .is_some_and(|i| i != dev_index)
+            {
+                if !apply || self.dry_run {
+                    if self.said.borrow_mut().reused.insert(pair.dev.clone()) {
+                        eprintln!(
+                            "warning: {}: its note belongs to another interface that wore \
+                             the name - leaving the filter alone",
+                            pair.dev
+                        );
+                    }
+                    continue;
+                }
+                match self.renamed_target(&pair.dev, topo) {
+                    Some((index, new_name)) => {
+                        if !self.follow_rename(&pair.dev, &new_name, index, topo) {
+                            continue; // waits, said where it happened
+                        }
+                    }
+                    None => {
+                        // The interface the note was about is gone, and its
+                        // entries with it; what this process carried for the
+                        // name was the old interface's too.
+                        note!(
+                            "{}: a new interface wearing the name; the old note went with \
+                             the old one",
+                            pair.dev
+                        );
+                        self.locked(&pair.dev, || self.remove_note(&pair.dev));
+                        self.carried.remove(&pair.dev);
+                        self.carried_ports.remove(&pair.dev);
+                        self.ports_loaded.remove(&pair.dev);
+                        self.ports_written.remove(&pair.dev);
+                        self.said.borrow_mut().forget(&pair.dev);
+                    }
+                }
+            }
             self.load_ports(&pair.dev, topo, apply);
             let owned_before = self.load_owned(&pair.dev);
             // Readability as of THIS read: a note that turns readable
@@ -1962,45 +2083,19 @@ impl Syncer {
                 .iter()
                 .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
                 .count();
-            let mut occupied = want.len() + foreign_extra;
+            let occupied = want.len() + foreign_extra;
             let card = topo.name_of(carrier).unwrap_or(&pair.dev).to_string();
             let limit = self.limit_of(&card);
             let reserve = headroom(limit);
-            if !kept.is_empty() && occupied + reserve > limit {
-                // Ordered by the RAW stamp, as shed_keeps orders - one
-                // spelling for both valves. Not by `silence_of`: that view
-                // clamps a stamp ahead of the pass mark to "just now" for
-                // display, so two keeps a millisecond apart could tie and the
-                // address decide.
-                let ports = self.carried_ports.get(&pair.dev);
-                let mut order: Vec<(u64, Mac)> = kept
-                    .iter()
-                    .map(|m| (ports.and_then(|ps| ps.get(m)).map_or(0, |&(_, t)| t), *m))
-                    .collect();
-                // Smallest stamp = longest since it last spoke; the
-                // address is the tiebreak.
-                order.sort_unstable();
-                let mut shed = 0usize;
-                for (_, m) in order {
-                    if occupied + reserve <= limit {
-                        break;
-                    }
-                    // A shed keep leaves `want`; the stale loop below takes
-                    // it out of the card in this same pass, so the slot
-                    // really frees.
-                    want.remove(&m);
-                    kept.remove(&m);
-                    occupied -= 1;
-                    shed += 1;
-                }
-                if apply && shed > 0 {
-                    note!(
-                        "{}: filter nearing its {} limit, released {shed} quiet \
-                         address(es) [pressure]",
-                        pair.dev,
-                        limit
-                    );
-                }
+            let shed = self.press_at_pass(&pair.dev, &card, occupied, &mut want, &mut kept);
+            let occupied = occupied - shed;
+            if apply && shed > 0 {
+                note!(
+                    "{}: filter nearing its {} limit, released {shed} quiet \
+                     address(es) [pressure]",
+                    pair.dev,
+                    limit
+                );
             }
 
             // Said once per entry into the quiet state: ageing comes in
@@ -2762,7 +2857,7 @@ impl Syncer {
                 // The name is how a note is found, the index is what the
                 // entries are attached to - and a rename moves only the
                 // name. The recorded index reaches the entries anyway.
-                let index = topo.get(&dev).map(|l| l.index).or_else(|| {
+                let index = self.noted_link(&dev, &topo).map(|l| l.index).or_else(|| {
                     let (index, new_name) = self.renamed_target(&dev, &topo)?;
                     note!("{dev}: now called {new_name}, removing through it");
                     Some(index)
@@ -2775,6 +2870,13 @@ impl Syncer {
                     self.remove_note(&dev);
                     note!("{dev}: removed {gone} address(es)");
                     true
+                } else if !self.note_is_readable(&dev) {
+                    // Nothing was read, so nothing was removed: the line
+                    // has to say so, as the dry run's does, rather than
+                    // "removed 0" with the reason only in write_owned's
+                    // warning.
+                    note!("{dev}: note unreadable, nothing removed; its entries stay");
+                    false
                 } else {
                     // write_owned, not save_owned: the lock is already held,
                     // and taking it again on a second descriptor would wait

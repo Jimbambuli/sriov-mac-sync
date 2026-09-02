@@ -819,115 +819,9 @@ fn run() -> Result<bool, String> {
     match opts.mode {
         Mode::Flush => syncer.flush(&mut sock).map_err(|e| e.to_string()),
         Mode::Resync => unreachable!("answered before any socket is opened"),
-        Mode::Status => {
-            let reports = syncer
-                .reconcile(&mut sock, false, &topo, topo_load)
-                .map_err(|e| e.to_string())?;
-            for r in &reports {
-                note!("{} on {} ({})", r.dev, r.bridge, r.driver);
-                if r.port != r.dev {
-                    note!("  enslaved through  : {}", r.port);
-                }
-                // "wanted", not "behind the bridge": EXTRA-pinned addresses
-                // are in this number precisely because they are NOT in the
-                // bridge's table.
-                note!("  wanted in filter  : {}", r.wanted);
-                note!("  registered by us  : {}", r.owned);
-                // Worth a line only when there are any: the memory this
-                // reads is the running daemon's, taken from the file it
-                // writes, so a fresh --status can now answer for it.
-                if r.quiet > 0 {
-                    note!("  held quiet        : {}", r.quiet);
-                }
-                note!("  unicast list      : {}", r.present);
-                note!(
-                    "  stacked bridges   : {}",
-                    if r.stacked.is_empty() {
-                        "none".to_string()
-                    } else {
-                        r.stacked.join(" ")
-                    }
-                );
-                // The per-address half only for the two modes that print it,
-                // so the daemon does not copy the whole desired set once a
-                // pass for numbers nothing prints.
-                if let Some(detail) = r.detail.as_ref() {
-                    for line in address_lines(detail) {
-                        note!("{line}");
-                    }
-                }
-            }
-            Ok(true)
-        }
-        Mode::Once => {
-            let reports = syncer
-                .reconcile(&mut sock, true, &topo, topo_load)
-                .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, Trigger::Once);
-            // The per-address listing, for the one mode besides --status
-            // that is run by hand and read on a screen.
-            {
-                for r in &reports {
-                    let Some(detail) = r.detail.as_ref() else {
-                        continue;
-                    };
-                    if detail.wanted.is_empty() {
-                        continue;
-                    }
-                    note!("{}: {} address(es) wanted", r.dev, r.wanted);
-                    for line in address_lines(detail) {
-                        note!("{line}");
-                    }
-                }
-            }
-            if opts.timings {
-                note!("{}", syncer.timings.report().trim_end());
-            }
-            // A oneshot that could not do what it was asked has to say so in
-            // its exit code - the warnings above scroll away, the code stays.
-            Ok(syncer.timings.failures.is_empty())
-        }
-        Mode::Daemon => {
-            let listed = pair_names(&pairs);
-            note!(
-                "sriov-mac-sync {VERSION}: watching {}; passes come from events and --resync",
-                if listed.is_empty() {
-                    "nothing yet".to_string()
-                } else {
-                    listed.join(" ")
-                }
-            );
-            let stop_rx = catch_signals();
-            // The pid, so --resync can find us. Best effort: a daemon that
-            // cannot write it still works, it just cannot be knocked on.
-            let pid_path = state_dir().join("pid");
-            let _ = syncer.ensure_state_dir();
-            if let Err(e) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
-                eprintln!(
-                    "warning: cannot write {}: {e} (--resync will not work)",
-                    pid_path.display()
-                );
-            }
-            let mon = mon.expect("the daemon subscribes before it reads");
-            // A device that drops out of one reading is not gone: an
-            // interface reload takes a bridge away for a moment, and emptying
-            // a live filter over that is the outage this daemon exists to
-            // prevent. Long enough to outlive `ifreload -a`, short enough
-            // that a bridge really taken apart is tidied within a minute.
-            syncer.orphan_grace = Duration::from_secs(60);
-            let mut world = Live { sock, mon, stop_rx };
-            daemon_loop(&mut world, &mut syncer, &opts);
-            let _ = std::fs::remove_file(&pid_path);
-
-            // Deliberately without a flush - catch_signals says why. Say how
-            // much is left behind, so nobody has to wonder.
-            let held: usize = syncer.registered();
-            note!(
-                "sriov-mac-sync: stopping; {held} address(es) left registered on purpose \
-                 (--flush removes them)"
-            );
-            Ok(true)
-        }
+        Mode::Status => print_status(&mut syncer, &mut sock, &topo, topo_load),
+        Mode::Once => run_once(&mut syncer, &mut sock, &topo, topo_load, &opts),
+        Mode::Daemon => run_daemon(syncer, sock, mon, &pairs, &opts),
         Mode::Check => {
             if opts.dry_run {
                 return Err("--check works by writing a probe entry, which --dry-run \
@@ -939,6 +833,138 @@ fn run() -> Result<bool, String> {
             Ok(check(&mut sock, &topo, &pairs, &syncer))
         }
     }
+}
+
+/// `--status`: one pass without writing, and what it found, per pair.
+fn print_status(
+    syncer: &mut Syncer,
+    sock: &mut Socket,
+    topo: &Topology,
+    topo_load: Duration,
+) -> Result<bool, String> {
+    let reports = syncer
+        .reconcile(sock, false, topo, topo_load)
+        .map_err(|e| e.to_string())?;
+    for r in &reports {
+        note!("{} on {} ({})", r.dev, r.bridge, r.driver);
+        if r.port != r.dev {
+            note!("  enslaved through  : {}", r.port);
+        }
+        // "wanted", not "behind the bridge": EXTRA-pinned addresses
+        // are in this number precisely because they are NOT in the
+        // bridge's table.
+        note!("  wanted in filter  : {}", r.wanted);
+        note!("  registered by us  : {}", r.owned);
+        // Worth a line only when there are any: the memory this
+        // reads is the running daemon's, taken from the file it
+        // writes, so a fresh --status can now answer for it.
+        if r.quiet > 0 {
+            note!("  held quiet        : {}", r.quiet);
+        }
+        note!("  unicast list      : {}", r.present);
+        note!(
+            "  stacked bridges   : {}",
+            if r.stacked.is_empty() {
+                "none".to_string()
+            } else {
+                r.stacked.join(" ")
+            }
+        );
+        // The per-address half only for the two modes that print it,
+        // so the daemon does not copy the whole desired set once a
+        // pass for numbers nothing prints.
+        if let Some(detail) = r.detail.as_ref() {
+            for line in address_lines(detail) {
+                note!("{line}");
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `--once`: one pass that writes, its changes, the per-address listing,
+/// and an exit code that says whether every change went through.
+fn run_once(
+    syncer: &mut Syncer,
+    sock: &mut Socket,
+    topo: &Topology,
+    topo_load: Duration,
+    opts: &Options,
+) -> Result<bool, String> {
+    let reports = syncer
+        .reconcile(sock, true, topo, topo_load)
+        .map_err(|e| e.to_string())?;
+    report_changes(&reports, opts.dry_run, Trigger::Once);
+    // The per-address listing, for the one mode besides --status that is
+    // run by hand and read on a screen.
+    for r in &reports {
+        let Some(detail) = r.detail.as_ref() else {
+            continue;
+        };
+        if detail.wanted.is_empty() {
+            continue;
+        }
+        note!("{}: {} address(es) wanted", r.dev, r.wanted);
+        for line in address_lines(detail) {
+            note!("{line}");
+        }
+    }
+    if opts.timings {
+        note!("{}", syncer.timings.report().trim_end());
+    }
+    // A oneshot that could not do what it was asked has to say so in its
+    // exit code - the warnings above scroll away, the code stays.
+    Ok(syncer.timings.failures.is_empty())
+}
+
+/// The daemon: the banner, the pid for --resync, the loop, and what is left
+/// behind on the way out.
+fn run_daemon(
+    mut syncer: Syncer,
+    sock: Socket,
+    mon: Option<Socket>,
+    pairs: &[Pair],
+    opts: &Options,
+) -> Result<bool, String> {
+    let listed = pair_names(pairs);
+    note!(
+        "sriov-mac-sync {VERSION}: watching {}; passes come from events and --resync",
+        if listed.is_empty() {
+            "nothing yet".to_string()
+        } else {
+            listed.join(" ")
+        }
+    );
+    let stop_rx = catch_signals();
+    // The pid, so --resync can find us. Best effort: a daemon that cannot
+    // write it still works, it just cannot be knocked on.
+    let pid_path = state_dir().join("pid");
+    let _ = syncer.ensure_state_dir();
+    if let Err(e) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
+        eprintln!(
+            "warning: cannot write {}: {e} (--resync will not work)",
+            pid_path.display()
+        );
+    }
+    let mon = mon.expect("the daemon subscribes before it reads");
+    // A device that drops out of one reading is not gone: an interface
+    // reload takes a bridge away for a moment, and emptying a live filter
+    // over that is the outage this daemon exists to prevent. Long enough to
+    // outlive `ifreload -a`, short enough that a bridge really taken apart
+    // is tidied within a minute.
+    syncer.orphan_grace = Duration::from_secs(60);
+    let mut world = Live { sock, mon, stop_rx };
+    daemon_loop(&mut world, &mut syncer, opts);
+    let _ = std::fs::remove_file(&pid_path);
+
+    // Deliberately without a flush - catch_signals says why. Say how much is
+    // left behind, so nobody has to wonder.
+    let held: usize = syncer.registered();
+    note!(
+        "sriov-mac-sync: stopping; {held} address(es) left registered on purpose \
+         (--flush removes them)"
+    );
+    Ok(true)
 }
 
 fn main() -> ExitCode {

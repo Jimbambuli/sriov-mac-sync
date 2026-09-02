@@ -184,6 +184,17 @@ impl Syncer {
         }
     }
 
+    /// The recorded index as this process knows it: what it stamped, else
+    /// the file - for the pass, which asks per pair and has usually stamped
+    /// the answer itself.
+    pub(super) fn recorded_index(&self, dev: &str) -> Option<u32> {
+        self.indices
+            .borrow()
+            .get(dev)
+            .copied()
+            .or_else(|| self.noted_index(dev))
+    }
+
     /// The index recorded for a device's note, if any run recorded one. Read
     /// from the file, not the cache: the rename paths mostly run in a process
     /// that never stamped it.
