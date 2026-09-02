@@ -6,6 +6,13 @@
 //! for X. The kernel accepts any number; what the card then holds is the
 //! driver's business, and the list read back from the kernel cannot tell.
 //! This table is the one source, beside the operator's --max.
+//!
+//! For a virtual function the PF has a say: several drivers hold a
+//! different number, or go promiscuous rather than drop, once the PF trusts
+//! the function (`ip link set PF vf N trust on`), and some refuse every
+//! address on a function whose address the PF set without trusting it. The
+//! daemon reads both off the PF's VF list (IFLA_VF_TRUST, IFLA_VF_MAC) for
+//! the drivers where it matters, and judges an unknown trust as none.
 
 /// What happens to addresses past the number the card holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +45,18 @@ pub struct Filter {
 enum Role {
     Any,
     Pf,
+    /// a virtual function the PF does not trust - or whose trust is
+    /// unknown, which is read the same way
     Vf,
+    /// a virtual function with `ip link set PF vf N trust on`, where the
+    /// driver then does something else; only beside a `Vf` row
+    TrustedVf,
 }
+
+/// VF drivers whose PF refuses every address beyond the one it set, for a
+/// function it does not trust: a VF with an administratively set address
+/// and trust off has no unicast list at all, whatever the row says.
+const LOCKED_UNTRUSTED: &[&str] = &["igbvf", "ixgbevf", "iavf", "bnxt_en", "hinic"];
 
 use Past::*;
 use Role::*;
@@ -58,6 +75,7 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     ("ixgbevf", Vf, Some(96), Drops), // pool of 112 - num_vfs for all VFs
     ("i40e", Pf, None, Promisc),    // firmware table
     ("iavf", Vf, Some(12), Drops),  // 18 filters incl. own, bcast, mcast (untrusted)
+    ("iavf", TrustedVf, None, Drops), // (3072/ports - 18*vfs)/vfs + 18 on i40e; firmware on ice
     ("ice", Pf, None, Drops),       // the "forcing promisc" log line does not
     ("idpf", Any, None, Drops),
     ("fm10k", Pf, None, Drops),
@@ -66,13 +84,15 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     ("mlx5_core", Any, Some(128), Drops), // 1 << log_max_current_uc_list, 128 on every ConnectX seen
     ("mlx4_core", Any, Some(128), Promisc), // one MAC table per port, PF and VFs
     // Broadcom
-    ("bnxt_en", Pf, Some(4), Promisc), // BNXT_MAX_UC_ADDRS
-    ("bnxt_en", Vf, Some(4), Drops),   // promisc vetoed for an untrusted VF
-    ("bnx2x", Pf, None, Promisc),      // CAM credit pool
+    ("bnxt_en", Pf, Some(4), Promisc),        // BNXT_MAX_UC_ADDRS
+    ("bnxt_en", Vf, Some(4), Drops),          // promisc vetoed for an untrusted VF
+    ("bnxt_en", TrustedVf, Some(4), Promisc), // the veto lifted
+    ("bnx2x", Pf, None, Promisc),             // CAM credit pool
     ("bnx2x", Vf, None, Ignored),
     // QLogic
     ("qede", Pf, None, Promisc),
     ("qede", Vf, None, Ignored), // one MAC per VF; promisc only when trusted
+    ("qede", TrustedVf, None, PromiscFromFirst), // any second address makes the vport promiscuous
     ("qlcnic", Pf, None, Promisc),
     ("qlcnic", Vf, Some(2), Drops),
     // Chelsio
@@ -91,6 +111,7 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     // Marvell / Cavium
     ("rvu_nicpf", Pf, Some(4), Promisc), // devlink unicast_filter_count
     ("rvu_nicvf", Vf, None, Ignored),    // untrusted VF
+    ("rvu_nicvf", TrustedVf, None, PromiscFromFirst), // on silicon with nix_rx_multicast
     ("octeon_ep", Any, None, Ignored),
     ("octeon_ep_vf", Any, None, Ignored),
     ("LiquidIO", Pf, None, PromiscFromFirst),
@@ -98,7 +119,8 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     ("nicvf", Any, None, PromiscFromFirst), // ThunderX: the whole LMAC, every VF on it
     // HiSilicon / Huawei
     ("hns3", Pf, None, Promisc),
-    ("hns3", Vf, None, Drops), // untrusted VF
+    ("hns3", Vf, None, Drops),          // untrusted VF
+    ("hns3", TrustedVf, None, Promisc), // the PF's promisc fallback, for a trusted VF
     ("hinic", Pf, None, PromiscFromFirst),
     ("hinic", Vf, None, Drops),
     ("hinic3", Any, None, Promisc),
@@ -118,18 +140,39 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
 ];
 
 /// What the driver named in sysfs does with the list of an interface that is
-/// (`vf`) or is not a virtual function. `None` for a driver this table does
-/// not know.
-pub fn filter_of(driver: &str, vf: bool) -> Option<Filter> {
-    TABLE
-        .iter()
-        .find(|(name, role, _, _)| {
-            *name == driver && matches!((role, vf), (Any, _) | (Pf, false) | (Vf, true))
-        })
-        .map(|(_, _, holds, past)| Filter {
-            holds: *holds,
-            past: *past,
-        })
+/// (`vf`) or is not a virtual function, and for a VF whether the PF trusts
+/// it - unknown trust reads as no trust, the conservative row. `None` for a
+/// driver this table does not know.
+pub fn filter_of(driver: &str, vf: bool, trusted: bool) -> Option<Filter> {
+    let row = |wanted: Role| {
+        TABLE
+            .iter()
+            .find(|(name, role, _, _)| *name == driver && (*role == Any || *role == wanted))
+    };
+    let found = match (vf, trusted) {
+        (false, _) => row(Pf),
+        (true, false) => row(Vf),
+        (true, true) => row(TrustedVf).or_else(|| row(Vf)),
+    };
+    found.map(|(_, _, holds, past)| Filter {
+        holds: *holds,
+        past: *past,
+    })
+}
+
+/// Whether the PF's view of a VF - trust, and the address it set - changes
+/// what this driver does. Only such cards pay the question.
+pub fn trust_matters(driver: &str) -> bool {
+    locks_untrusted(driver)
+        || TABLE
+            .iter()
+            .any(|(n, r, _, _)| *n == driver && *r == TrustedVf)
+}
+
+/// Whether this VF driver's PF refuses every further address on a function
+/// whose address it set without trusting it.
+pub fn locks_untrusted(driver: &str) -> bool {
+    LOCKED_UNTRUSTED.contains(&driver)
 }
 
 #[cfg(test)]
@@ -138,15 +181,30 @@ mod tests {
 
     #[test]
     fn the_role_tells_a_pf_from_a_vf_of_the_same_driver() {
-        assert_eq!(filter_of("bnxt_en", false).unwrap().past, Promisc);
-        assert_eq!(filter_of("bnxt_en", true).unwrap().past, Drops);
-        assert_eq!(filter_of("mlx5_core", true), filter_of("mlx5_core", false));
-        assert!(filter_of("virtio_net", false).is_none());
+        assert_eq!(filter_of("bnxt_en", false, false).unwrap().past, Promisc);
+        assert_eq!(filter_of("bnxt_en", true, false).unwrap().past, Drops);
         assert_eq!(
-            filter_of("ixgbevf", false),
+            filter_of("bnxt_en", true, true).unwrap().past,
+            Promisc,
+            "trust lifts the promisc veto"
+        );
+        assert_eq!(
+            filter_of("mlx5_core", true, false),
+            filter_of("mlx5_core", false, false)
+        );
+        assert_eq!(
+            filter_of("ixgbevf", true, true),
+            filter_of("ixgbevf", true, false),
+            "a driver without a trusted row answers with its VF row"
+        );
+        assert!(filter_of("virtio_net", false, false).is_none());
+        assert_eq!(
+            filter_of("ixgbevf", false, false),
             None,
             "a VF driver has no PF role"
         );
+        assert!(trust_matters("ixgbevf") && trust_matters("qede") && !trust_matters("mlx5_core"));
+        assert!(locks_untrusted("iavf") && !locks_untrusted("mlx4_core"));
     }
 
     /// One row per (driver, role), every number usable as a limit, and the
@@ -171,6 +229,18 @@ mod tests {
                     );
                 }
             }
+            if *role == TrustedVf {
+                assert!(
+                    TABLE.iter().any(|(n, r, _, _)| n == name && *r == Vf),
+                    "{name}: a trusted row refines a VF row that is not there"
+                );
+            }
+        }
+        for name in LOCKED_UNTRUSTED {
+            assert!(
+                TABLE.iter().any(|(n, r, _, _)| n == name && *r == Vf),
+                "{name}: locked, but no VF row"
+            );
         }
     }
 }

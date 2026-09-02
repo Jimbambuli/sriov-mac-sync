@@ -29,6 +29,11 @@ pub(crate) const MCAST: Mac = [0x01, 0x00, 0x5e, 0, 0, 1];
 pub(crate) struct FakeSock {
     pub(crate) fdb: Vec<FdbEntry>,
     pub(crate) vf: Vec<(u32, Mac)>,
+    /// What each PF says about its functions, for the trust question.
+    pub(crate) vf_facts: Vec<crate::netlink::VfInfo>,
+    /// How often that question was asked - a card whose driver does not
+    /// care about trust must never pay it.
+    pub(crate) vf_info_asked: usize,
     pub(crate) added: Vec<(u32, Mac)>,
     pub(crate) removed: Vec<(u32, Mac)>,
     /// raw OS error to answer an add of this address with
@@ -125,6 +130,15 @@ impl FdbWriter for FakeSock {
             .iter()
             .filter(|(pf, _)| indices.contains(pf))
             .cloned()
+            .collect())
+    }
+    fn vf_info_of(&mut self, pf: u32) -> io::Result<Vec<crate::netlink::VfInfo>> {
+        self.vf_info_asked += 1;
+        Ok(self
+            .vf_facts
+            .iter()
+            .filter(|v| v.pf == pf)
+            .copied()
             .collect())
     }
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {

@@ -67,6 +67,10 @@ const IFLA_EXT_MASK: u16 = 29;
 const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_VF_INFO: u16 = 1;
 const IFLA_VF_MAC: u16 = 1;
+/// `struct ifla_vf_trust { __u32 vf; __u32 setting; }` - whether the PF
+/// trusts the function, which is what several VF drivers make their
+/// unicast list depend on (drivers.rs).
+const IFLA_VF_TRUST: u16 = 12;
 const RTEXT_FILTER_VF: u32 = 1;
 /// Asking for virtual function details also fetches their traffic counters,
 /// which come out of the hardware. This says not to.
@@ -807,16 +811,25 @@ impl Socket {
     pub fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, [u8; 6])>> {
         let mut out = Vec::new();
         for &index in indices {
-            self.seq = self.seq.wrapping_add(1);
-            let req = vf_request(index, self.seq);
-
-            match self.request_one(&req, RTM_NEWLINK, &mut |payload| {
-                collect_vf_macs(payload, &mut out)
-            }) {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => continue,
-                Err(e) => return Err(e),
+            for vf in self.vf_info_of(index)? {
+                out.push((vf.pf, vf.mac));
             }
+        }
+        Ok(out)
+    }
+
+    /// Everything the named physical function says about its virtual
+    /// functions. A gone interface answers ENODEV, which is an empty answer.
+    pub fn vf_info_of(&mut self, index: u32) -> io::Result<Vec<VfInfo>> {
+        let mut out = Vec::new();
+        self.seq = self.seq.wrapping_add(1);
+        let req = vf_request(index, self.seq);
+        match self.request_one(&req, RTM_NEWLINK, &mut |payload| {
+            collect_vf_info(payload, &mut out)
+        }) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {}
+            Err(e) => return Err(e),
         }
         Ok(out)
     }
@@ -1292,11 +1305,25 @@ fn parse_fdb(payload: &[u8]) -> Option<FdbEntry> {
     })
 }
 
+/// What a physical function says about one of its virtual functions: the
+/// address it set - all zero when it never did - and whether it trusts the
+/// function. Together they decide what several VF drivers let a VF filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfInfo {
+    /// the PF's interface index
+    pub pf: u32,
+    /// the function's number, as `ip link set PF vf N` counts
+    pub vf: u32,
+    pub mac: [u8; 6],
+    /// `None` from a kernel that does not report trust
+    pub trusted: Option<bool>,
+}
+
 /// Known limit: rtattr lengths are u16 on the wire. A VFINFO list beyond 64
 /// KiB (roughly three hundred VFs on one PF) arrives with its length wrapped
 /// by the kernel, and no parser can tell. Such hosts need the kernel's own
 /// fix; no driver family this has run on hands out that many per PF.
-fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
+fn collect_vf_info(payload: &[u8], out: &mut Vec<VfInfo>) {
     if payload.len() < IFINFOMSG_LEN {
         return;
     }
@@ -1304,7 +1331,7 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
     if index <= 0 {
         return;
     }
-    let ifindex = index as u32;
+    let pf = index as u32;
     for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
         if kind != IFLA_VFINFO_LIST {
             continue;
@@ -1313,20 +1340,52 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
             if vf_kind != IFLA_VF_INFO {
                 continue;
             }
-            for (mac_kind, mac_value) in attrs(vf_info) {
+            let mut found: Option<VfInfo> = None;
+            let mut trusted = None;
+            for (attr_kind, attr) in attrs(vf_info) {
                 // struct ifla_vf_mac { __u32 vf; __u8 mac[32]; }: number
                 // first, then the address, of which six bytes carry meaning.
                 // Shorter than number-plus-six cannot be that struct.
                 const VF_MAC_OFF: usize = 4;
                 const VF_MAC_LEN: usize = 6;
-                if mac_kind == IFLA_VF_MAC && mac_value.len() >= VF_MAC_OFF + VF_MAC_LEN {
-                    let mut m = [0u8; 6];
-                    m.copy_from_slice(&mac_value[VF_MAC_OFF..VF_MAC_OFF + VF_MAC_LEN]);
-                    out.push((ifindex, m));
+                if attr_kind == IFLA_VF_MAC && attr.len() >= VF_MAC_OFF + VF_MAC_LEN {
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&attr[VF_MAC_OFF..VF_MAC_OFF + VF_MAC_LEN]);
+                    found = Some(VfInfo {
+                        pf,
+                        vf: attr_u32(attr).unwrap_or(0),
+                        mac,
+                        trusted: None,
+                    });
                 }
+                // struct ifla_vf_trust { __u32 vf; __u32 setting; }
+                if attr_kind == IFLA_VF_TRUST && attr.len() >= 8 {
+                    trusted = attr_u32(&attr[4..]).map(|v| v != 0);
+                }
+            }
+            // The kernel writes the address first and always; a nest
+            // without one is not a function.
+            if let Some(mut vf) = found {
+                vf.trusted = trusted;
+                out.push(vf);
             }
         }
     }
+}
+
+#[cfg(test)]
+fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
+    let mut info = Vec::new();
+    collect_vf_info(payload, &mut info);
+    out.extend(info.into_iter().map(|v| (v.pf, v.mac)));
+}
+
+/// The first four bytes of an attribute as the kernel's native u32, or
+/// nothing for an attribute too short to hold one - a bad attribute costs
+/// only that attribute, never the message.
+fn attr_u32(v: &[u8]) -> Option<u32> {
+    v.get(..4)
+        .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 pub fn format_mac(mac: &[u8; 6]) -> String {
@@ -1860,6 +1919,75 @@ mod tests {
         assert!(
             none.is_empty(),
             "an attribute claiming more than the buffer holds must be refused"
+        );
+    }
+
+    /// Trust comes out beside the address, by function number, and a nest
+    /// without the trust attribute - a kernel that does not report it -
+    /// reads as unknown rather than as untrusted.
+    #[test]
+    fn a_function_s_trust_comes_out_beside_its_address() {
+        let vf_mac = |n: u32, mac: [u8; 6]| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&n.to_ne_bytes());
+            v.extend_from_slice(&mac);
+            v.extend_from_slice(&[0u8; 26]);
+            v
+        };
+        let vf_trust = |n: u32, setting: u32| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&n.to_ne_bytes());
+            v.extend_from_slice(&setting.to_ne_bytes());
+            v
+        };
+        let mut list = Vec::new();
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac(0, [2, 0, 0, 0, 0, 1]));
+        put_attr(&mut info, IFLA_VF_TRUST, &vf_trust(0, 1));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac(1, [0; 6]));
+        put_attr(&mut info, IFLA_VF_TRUST, &vf_trust(1, 0));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_MAC, &vf_mac(2, [2, 0, 0, 0, 0, 3]));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+        // A nest without an address is not a function.
+        let mut info = Vec::new();
+        put_attr(&mut info, IFLA_VF_TRUST, &vf_trust(3, 1));
+        put_attr(&mut list, IFLA_VF_INFO, &info);
+
+        let mut body = ifinfomsg(7);
+        put_attr(&mut body, IFLA_VFINFO_LIST, &list);
+        let mut out = Vec::new();
+        collect_vf_info(&body, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                VfInfo {
+                    pf: 7,
+                    vf: 0,
+                    mac: [2, 0, 0, 0, 0, 1],
+                    trusted: Some(true)
+                },
+                VfInfo {
+                    pf: 7,
+                    vf: 1,
+                    mac: [0; 6],
+                    trusted: Some(false)
+                },
+                VfInfo {
+                    pf: 7,
+                    vf: 2,
+                    mac: [2, 0, 0, 0, 0, 3],
+                    trusted: None
+                },
+            ]
+        );
+        assert_eq!(
+            attr_u32(&[1, 0, 0]),
+            None,
+            "a short attribute costs only itself"
         );
     }
 

@@ -162,7 +162,9 @@ hardware are welcome; those four steps are the whole test.
   silently.** The daemon takes the number from the kernel driver's own source
   ([docs/driver-limits.md](docs/driver-limits.md), one row per driver and
   role, with what happens past it: some cards go promiscuous instead, some
-  never program the list at all); where the source names none, it assumes 128,
+  never program the list at all, and for a VF several depend on whether the
+  PF trusts it, which the daemon reads off the PF); where the source names
+  none, it assumes 128,
   which is what a ConnectX-4 Lx holds. The number is what the daemon warns
   above and what it releases quiet addresses to stay under, four slots early
   as an allowance for counting drift (one slot on a card holding four or

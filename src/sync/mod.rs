@@ -338,6 +338,9 @@ pub trait FdbWriter {
     fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>>;
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>>;
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>>;
+    /// What one physical function says about each of its virtual functions
+    /// - the address it set and whether it trusts the function.
+    fn vf_info_of(&mut self, pf: u32) -> io::Result<Vec<crate::netlink::VfInfo>>;
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()>;
 }
 
@@ -353,6 +356,9 @@ impl FdbWriter for Socket {
     }
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
         Socket::vf_macs_of(self, indices)
+    }
+    fn vf_info_of(&mut self, pf: u32) -> io::Result<Vec<crate::netlink::VfInfo>> {
+        Socket::vf_info_of(self, pf)
     }
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()> {
         Socket::set_self_fdb(self, ifindex, mac, add)

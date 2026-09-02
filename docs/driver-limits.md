@@ -16,6 +16,16 @@ promiscuous mode by the kernel itself as soon as its list is non-empty, before
 the driver sees anything. And `__hw_addr_sync_dev` stops at the first address
 a driver refuses; every driver here ignores that return value.
 
+A third decides the VF rows: what the PF thinks of the function. `ip link set
+PF vf N trust on` lifts bnxt's promisc veto, turns qede's and rvu's dropped
+promisc request into a working one, opens hns3's promisc fallback and the
+i40e/ice formula for iavf; and on the Intel VF drivers, bnxt and hinic a PF
+that set the function's address without trusting it refuses every other
+address outright. The daemon reads trust and the PF-set address off the PF's
+VF list (`IFLA_VF_TRUST`, `IFLA_VF_MAC`) for exactly these drivers - the table
+in `src/drivers.rs` carries a `TrustedVf` row where the answer changes, and a
+list of the drivers that lock - and treats unknown trust as none.
+
 
 ---
 

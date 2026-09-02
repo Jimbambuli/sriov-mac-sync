@@ -82,6 +82,9 @@ impl sync::FdbWriter for Live {
     fn vf_macs_of(&mut self, indices: &[u32]) -> std::io::Result<Vec<(u32, [u8; 6])>> {
         self.sock.vf_macs_of(indices)
     }
+    fn vf_info_of(&mut self, pf: u32) -> std::io::Result<Vec<netlink::VfInfo>> {
+        self.sock.vf_info_of(pf)
+    }
     fn set_self_fdb(&mut self, ifindex: u32, mac: &[u8; 6], add: bool) -> std::io::Result<()> {
         self.sock.set_self_fdb(ifindex, mac, add)
     }
@@ -435,7 +438,13 @@ fn run_pass<W: World>(
     }
     // Every pass, because it is map lookups: a card that appears later
     // gets its number when it does.
-    apply_card_limits(syncer, &topo, opts.max_macs_set, &mut state.said_cards);
+    apply_card_limits(
+        syncer,
+        &topo,
+        opts.max_macs_set,
+        &mut state.said_cards,
+        world,
+    );
     if syncer.pairs.is_empty() && !state.said_empty {
         note!("waiting for an SR-IOV interface to appear in a bridge");
         state.said_empty = true;
@@ -585,23 +594,81 @@ pub(crate) fn filter_carriers(devs: &[String], topo: &Topology) -> Vec<String> {
     out
 }
 
-/// The driver behind an interface, and what the table says about it. A
-/// bond has no driver: its list is copied to every member, so the members
-/// answer, and the smallest of them binds.
+/// What the physical function says about a VF card, where the driver's
+/// answer depends on it: trust, and whether the PF set the address without
+/// trusting the function - the lock some PFs put on the list. `lift` is
+/// the command that changes it, for the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Standing {
+    trusted: Option<bool>,
+    locked: bool,
+    lift: Option<String>,
+}
+
+/// One driver's filter for one interface, with the PF asked only where the
+/// driver cares (`drivers::trust_matters`): mlx5 and mlx4 never pay the
+/// question, and a VF without a visible PF is judged as untrusted.
+fn judge(
+    topo: &Topology,
+    l: &crate::topology::Link,
+    driver: &str,
+    sock: &mut impl sync::FdbWriter,
+) -> (Option<drivers::Filter>, Option<Standing>) {
+    let vf = l.is_vf || l.physfn.is_some();
+    if !vf || !drivers::trust_matters(driver) {
+        return (drivers::filter_of(driver, vf, false), None);
+    }
+    let unknown = Standing {
+        trusted: None,
+        locked: false,
+        lift: None,
+    };
+    let standing = match (l.physfn, l.vf_number) {
+        (Some(pf), Some(n)) => {
+            let pf_name = topo
+                .at(pf)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| pf.to_string());
+            match sock
+                .vf_info_of(pf)
+                .ok()
+                .and_then(|v| v.into_iter().find(|i| i.vf == n))
+            {
+                Some(i) => Standing {
+                    trusted: i.trusted,
+                    locked: i.trusted == Some(false)
+                        && i.mac != [0u8; 6]
+                        && drivers::locks_untrusted(driver),
+                    lift: Some(format!("ip link set {pf_name} vf {n} trust on")),
+                },
+                None => unknown,
+            }
+        }
+        _ => unknown,
+    };
+    let f = drivers::filter_of(driver, true, standing.trusted == Some(true));
+    (f, Some(standing))
+}
+
+/// The driver and filter behind an interface: its own, or - for a bond or
+/// a VLAN, which have none - the smallest among what carries it, named as
+/// "driver behind bond". Nothing for a bridge or an interface nothing
+/// carries.
 fn card_filter(
     topo: &Topology,
     link: &crate::topology::Link,
-) -> (Option<String>, Option<drivers::Filter>) {
-    let vf = link.is_vf || link.physfn.is_some();
+    sock: &mut impl sync::FdbWriter,
+) -> (Option<String>, Option<drivers::Filter>, Option<Standing>) {
     if let Some(d) = link.driver.as_deref() {
-        return (Some(d.to_string()), drivers::filter_of(d, vf));
+        let (f, standing) = judge(topo, link, d, sock);
+        return (Some(d.to_string()), f, standing);
     }
     if link.is_bridge || link.slaves.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
     let mut stack: Vec<u32> = link.slaves.clone();
     let mut seen = crate::hash::set();
-    let mut best: Option<(String, drivers::Filter)> = None;
+    let mut best: Option<(String, drivers::Filter, Option<Standing>)> = None;
     while let Some(i) = stack.pop() {
         if !seen.insert(i) {
             continue;
@@ -609,15 +676,16 @@ fn card_filter(
         let Some(l) = topo.at(i) else { continue };
         match l.driver.as_deref() {
             Some(d) => {
-                if let Some(f) = drivers::filter_of(d, l.is_vf || l.physfn.is_some()) {
+                let (f, standing) = judge(topo, l, d, sock);
+                if let Some(f) = f {
                     let smaller = match &best {
                         None => true,
-                        Some((_, b)) => {
+                        Some((_, b, _)) => {
                             f.holds.unwrap_or(usize::MAX) < b.holds.unwrap_or(usize::MAX)
                         }
                     };
                     if smaller {
-                        best = Some((format!("{d} behind {}", link.name), f));
+                        best = Some((format!("{d} behind {}", link.name), f, standing));
                     }
                 }
             }
@@ -628,8 +696,8 @@ fn card_filter(
         }
     }
     match best {
-        Some((d, f)) => (Some(d), Some(f)),
-        None => (None, None),
+        Some((d, f, standing)) => (Some(d), Some(f), standing),
+        None => (None, None, None),
     }
 }
 
@@ -646,6 +714,7 @@ pub(crate) fn apply_card_limits(
     topo: &Topology,
     max_set: bool,
     said: &mut crate::hash::Set<String>,
+    sock: &mut impl sync::FdbWriter,
 ) {
     let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
     let assumed = sync::DEFAULT_MAX_MACS;
@@ -657,9 +726,45 @@ pub(crate) fn apply_card_limits(
             }
             continue;
         };
-        let (driver, filter) = card_filter(topo, link);
+        let (driver, filter, standing) = card_filter(topo, link, sock);
         let first = driver.is_some() && said.insert(card.clone());
         let mut holds = assumed;
+        // What the PF said, for the message: nothing where the driver does
+        // not care, else whom the number is for and what would change it.
+        let (whom, lift) = match &standing {
+            None => (String::new(), String::new()),
+            Some(s) => {
+                let whom = match s.trusted {
+                    Some(true) => " for a trusted VF",
+                    Some(false) => " for an untrusted VF",
+                    None => " for a VF of unknown trust",
+                };
+                let changes = driver.as_deref().is_some_and(|d| {
+                    drivers::filter_of(d, true, true) != drivers::filter_of(d, true, false)
+                });
+                let lift = match (&s.lift, s.trusted, changes) {
+                    (Some(cmd), Some(false), true) => format!("; `{cmd}` changes that"),
+                    _ => String::new(),
+                };
+                (whom.to_string(), lift)
+            }
+        };
+        if standing.as_ref().is_some_and(|s| s.locked) {
+            if first {
+                eprintln!(
+                    "warning: {card}: the {} driver's PF set this function's address \
+                     without trusting it and refuses every other - nothing registered \
+                     here takes effect; `{}` lifts that",
+                    driver.as_deref().unwrap_or("?"),
+                    standing
+                        .as_ref()
+                        .and_then(|s| s.lift.as_deref())
+                        .unwrap_or("?")
+                );
+            }
+            limits.insert(card, holds);
+            continue;
+        }
         match (driver, filter) {
             (Some(d), Some(f)) => match f.past {
                 drivers::Past::Ignored => {
@@ -691,14 +796,14 @@ pub(crate) fn apply_card_limits(
                             holds = n;
                             if first {
                                 note!(
-                                    "{card}: the {d} driver holds {n} addresses by the kernel \
-                                     source and {past} past that"
+                                    "{card}: the {d} driver holds {n} addresses{whom} by the \
+                                     kernel source and {past} past that{lift}"
                                 );
                             }
                         }
                         None if first => note!(
-                            "{card}: the {d} driver's limit lives in firmware; assuming \
-                             {assumed}, and it {past} past its real one"
+                            "{card}: the {d} driver's limit{whom} lives in firmware; assuming \
+                             {assumed}, and it {past} past its real one{lift}"
                         ),
                         None => {}
                     }
@@ -817,7 +922,8 @@ mod tests {
             dir.clone(),
         );
         let mut said = crate::hash::set();
-        apply_card_limits(&mut syncer, &topo, false, &mut said);
+        let mut sock = crate::sync::tests::FakeSock::default();
+        apply_card_limits(&mut syncer, &topo, false, &mut said, &mut sock);
         assert_eq!(
             syncer.max_macs, 128,
             "firmware-limited, ignored and unknown cards set no number"
@@ -835,7 +941,7 @@ mod tests {
 
         // Roles: the PF and the VF of one driver hold different numbers.
         syncer.pairs = vec![pair("be"), pair("bev"), pair("i40")];
-        apply_card_limits(&mut syncer, &topo, false, &mut said);
+        apply_card_limits(&mut syncer, &topo, false, &mut said, &mut sock);
         assert_eq!(syncer.max_macs_per_card.get("be"), Some(&30));
         assert_eq!(
             syncer.max_macs_per_card.get("bev"),
@@ -851,7 +957,7 @@ mod tests {
 
         // A bond of VFs answers with its smallest member.
         syncer.pairs = vec![pair("bond0")];
-        apply_card_limits(&mut syncer, &topo, false, &mut said);
+        apply_card_limits(&mut syncer, &topo, false, &mut said, &mut sock);
         assert_eq!(
             syncer.max_macs_per_card.get("bond0"),
             Some(&12),
@@ -860,17 +966,84 @@ mod tests {
 
         // A card that drops out of one reading keeps its number.
         let bare = Builder::new().add("lo", 1, None).build();
-        apply_card_limits(&mut syncer, &bare, false, &mut said);
+        apply_card_limits(&mut syncer, &bare, false, &mut said, &mut sock);
         assert_eq!(
             syncer.max_macs_per_card.get("bond0"),
             Some(&12),
             "kept while absent"
         );
 
+        // Trust: the PF is asked only for drivers whose answer depends on
+        // it, and its answer picks the row. mlx5 never pays the question.
+        let topo = Builder::new()
+            .add("bn", 10, Some(mac(10)))
+            .driver("bnxt_en")
+            .add("bnv", 11, Some(mac(11)))
+            .driver("bnxt_en")
+            .physfn("bn")
+            .vf_number(0)
+            .add("bnv1", 12, Some(mac(12)))
+            .driver("bnxt_en")
+            .physfn("bn")
+            .vf_number(1)
+            .add("ix", 13, Some(mac(13)))
+            .driver("ixgbe")
+            .add("ixv", 14, Some(mac(14)))
+            .driver("ixgbevf")
+            .physfn("ix")
+            .vf_number(0)
+            .add("mx", 15, Some(mac(15)))
+            .driver("mlx5_core")
+            .add("mxv", 16, Some(mac(16)))
+            .driver("mlx5_core")
+            .physfn("mx")
+            .vf_number(0)
+            .build();
+        let vf = |pf: u32, n: u32, set: bool, trusted: Option<bool>| crate::netlink::VfInfo {
+            pf,
+            vf: n,
+            mac: if set { mac(n as u8 + 40) } else { [0; 6] },
+            trusted,
+        };
+        let mut sock = crate::sync::tests::FakeSock {
+            vf_facts: vec![
+                vf(10, 0, true, Some(true)),
+                vf(10, 1, true, Some(false)),
+                vf(13, 0, false, Some(false)),
+            ],
+            ..Default::default()
+        };
+        let mut syncer = Syncer::new(
+            vec![pair("bnv"), pair("bnv1"), pair("ixv"), pair("mxv")],
+            dir.clone(),
+        );
+        let mut said = crate::hash::set();
+        apply_card_limits(&mut syncer, &topo, false, &mut said, &mut sock);
+        assert_eq!(
+            sock.vf_info_asked, 3,
+            "the PF is asked once per card that cares, and not for mlx5"
+        );
+        assert_eq!(
+            syncer.max_macs_per_card.get("bnv"),
+            Some(&4),
+            "a trusted bnxt VF holds 4 and goes promiscuous past that"
+        );
+        assert_eq!(
+            syncer.max_macs_per_card.get("bnv1"),
+            Some(&128),
+            "a locked VF has no list; the assumed number, as for an ignored card"
+        );
+        assert_eq!(
+            syncer.max_macs_per_card.get("ixv"),
+            Some(&96),
+            "untrusted, but no PF-set address: not locked"
+        );
+        assert_eq!(syncer.max_macs_per_card.get("mxv"), Some(&128));
+
         // --max: the numbers are the operator's, the table only warns.
         let mut fixed = Syncer::new(vec![pair("bev")], dir.clone());
         fixed.max_macs = 200;
-        apply_card_limits(&mut fixed, &topo, true, &mut crate::hash::set());
+        apply_card_limits(&mut fixed, &topo, true, &mut crate::hash::set(), &mut sock);
         assert_eq!(fixed.max_macs, 200);
         assert!(fixed.max_macs_per_card.is_empty());
         assert_eq!(fixed.limit_of("bev"), 200);
@@ -967,6 +1140,9 @@ mod tests {
             }
             fn vf_macs_of(&mut self, indices: &[u32]) -> std::io::Result<Vec<(u32, [u8; 6])>> {
                 self.fdb.vf_macs_of(indices)
+            }
+            fn vf_info_of(&mut self, pf: u32) -> std::io::Result<Vec<crate::netlink::VfInfo>> {
+                self.fdb.vf_info_of(pf)
             }
             fn set_self_fdb(
                 &mut self,

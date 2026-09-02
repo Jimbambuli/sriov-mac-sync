@@ -807,6 +807,7 @@ fn run() -> Result<bool, String> {
             &topo,
             opts.max_macs_set,
             &mut crate::hash::set(),
+            &mut sock,
         );
     }
     // The lists merge CLI values and conf-file values, so the label names

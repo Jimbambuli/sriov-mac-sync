@@ -11,7 +11,10 @@ async runtime — and real error codes, which is what makes `EEXIST` and
 `ENOSPC` distinguishable instead of guessed at. Outside rtnetlink only a few
 `/sys` reads per card (driver, VF count, the PF behind a VF); what a card
 holds comes from a table read off the kernel driver sources
-(`src/drivers.rs`, evidence in driver-limits.md), not from the card.
+(`src/drivers.rs`, evidence in driver-limits.md), not from the card. Where a
+VF driver's answer depends on the PF - trust, or an address the PF set on a
+function it does not trust, which locks the list on the Intel and Broadcom VF
+drivers - the PF's VF list is asked, for those drivers only.
 
 Topology comes from one `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
 the interface kind for stacking (a veth reports a peer there and a tunnel its

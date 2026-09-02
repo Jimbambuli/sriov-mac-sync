@@ -20,8 +20,12 @@ seen, and truncates silently past it - the experimental figure. bnxt holds 4,
 an untrusted iavf about 12, igbvf 3; many cards go unicast-promiscuous past
 their limit instead of dropping; and several VF drivers never program the list
 at all (ena, mana, bnx2x, qede untrusted, fm10k), which the daemon says at
-start because nothing registered there takes effect. Where the limit lives in
-firmware the assumed 128 stays. `--max` or `MAX_MACS` overrides all of it.
+start because nothing registered there takes effect. Where trust decides -
+bnxt, qede, hns3, rvu and the Intel VF drivers - the daemon reads the PF's
+answer and says whom its number is for; a VF whose address the PF set without
+trusting it gets a warning, because those PFs then refuse every other address.
+Where the limit lives in firmware the assumed 128 stays. `--max` or `MAX_MACS`
+overrides all of it.
 
 mlx4 and mlx5 also report the number through the devlink parameter
 `max_macs`, and an earlier version asked it over generic netlink. The table

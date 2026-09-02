@@ -59,6 +59,9 @@ pub struct Link {
     /// whether a PCI `physfn` stands behind this interface - a VF, whether
     /// or not its PF has a netdev in this namespace
     pub is_vf: bool,
+    /// which of its PF's functions this is, as `ip link set PF vf N` counts
+    /// - the number the PF's answer about trust goes by
+    pub vf_number: Option<u32>,
     /// every PF netdev of this VF's PCI function - several on a multiport
     /// card sharing one function, where each port's netdev reports only its
     /// own VF addresses. The exclusion set must take them all, or a sibling
@@ -183,6 +186,34 @@ struct DeviceFacts {
     /// entry is checked against the reading before it is believed
     pf_netdevs: Vec<String>,
     is_vf: bool,
+    vf_number: Option<u32>,
+}
+
+/// Which of its physical function's virtual functions the interface at
+/// `base` is: the `virtfnN` link under the PF's PCI directory that points
+/// at this interface's own PCI function. Nothing for a PF, or for a VF whose
+/// PF is not visible.
+fn vf_number_of(base: &Path) -> Option<u32> {
+    let own = fs::read_link(base.join("device")).ok()?;
+    let own = own.file_name()?.to_owned();
+    for e in fs::read_dir(base.join("device/physfn")).ok()?.flatten() {
+        let name = e.file_name();
+        let Some(n) = name
+            .to_string_lossy()
+            .strip_prefix("virtfn")
+            .and_then(|n| n.parse().ok())
+        else {
+            continue;
+        };
+        if fs::read_link(e.path())
+            .ok()
+            .and_then(|t| t.file_name().map(|f| f == own))
+            .unwrap_or(false)
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// The cached facts for `index`, re-read when `stale` says the entry no
@@ -284,6 +315,9 @@ impl Topology {
                 // read_dir on a missing directory fails by itself; asking
                 // twice was one syscall per interface for nothing.
                 link.is_vf = dev.join("physfn").exists();
+                if link.is_vf {
+                    link.vf_number = vf_number_of(&base);
+                }
                 if let Ok(rd) = fs::read_dir(dev.join("physfn/net")) {
                     for e in rd.flatten() {
                         names
@@ -456,6 +490,7 @@ impl Topology {
                                 })
                                 .unwrap_or_default(),
                             is_vf: base.join("device/physfn").exists(),
+                            vf_number: vf_number_of(&base),
                         };
                         // The directory has to answer for this index after
                         // the reads as well as before, or a rename in
@@ -468,6 +503,7 @@ impl Topology {
                 .unwrap_or_default();
                 link.driver = facts.driver;
                 link.is_vf = facts.is_vf;
+                link.vf_number = facts.vf_number;
                 link.pf_netdevs = facts
                     .pf_netdevs
                     .iter()
@@ -982,6 +1018,11 @@ pub(crate) mod fixture {
 
         pub fn physfn(mut self, pf: &str) -> Self {
             self.last_names().physfn = Some(pf.to_string());
+            self
+        }
+
+        pub fn vf_number(mut self, n: u32) -> Self {
+            self.last().vf_number = Some(n);
             self
         }
 
@@ -1679,6 +1720,41 @@ mod tests {
     /// The facts are read once per index and believed until the reading
     /// says they no longer fit - then read again; a reading that refuses
     /// (the directory moved) caches nothing.
+    /// The function number is read off the PF's `virtfnN` links, the only
+    /// place sysfs says it: the link whose target is this interface's own
+    /// PCI function. A PF, or a VF whose PF is not there, has none.
+    #[test]
+    fn the_vf_number_is_the_virtfn_link_that_points_back() {
+        use super::vf_number_of;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("sriov-mac-sync-vfnum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let pci = root.join("pci");
+        for f in ["0000:01:00.0", "0000:01:00.4", "0000:01:00.5"] {
+            fs::create_dir_all(pci.join(f)).unwrap();
+        }
+        symlink("../0000:01:00.4", pci.join("0000:01:00.0/virtfn0")).unwrap();
+        symlink("../0000:01:00.5", pci.join("0000:01:00.0/virtfn1")).unwrap();
+        symlink("../0000:01:00.0", pci.join("0000:01:00.4/physfn")).unwrap();
+        symlink("../0000:01:00.0", pci.join("0000:01:00.5/physfn")).unwrap();
+        let net = root.join("net");
+        for (name, dev) in [
+            ("nic1", "0000:01:00.0"),
+            ("nic1v0", "0000:01:00.4"),
+            ("nic1v1", "0000:01:00.5"),
+        ] {
+            fs::create_dir_all(net.join(name)).unwrap();
+            symlink(format!("../../pci/{dev}"), net.join(name).join("device")).unwrap();
+        }
+        assert_eq!(vf_number_of(&net.join("nic1v0")), Some(0));
+        assert_eq!(vf_number_of(&net.join("nic1v1")), Some(1));
+        assert_eq!(vf_number_of(&net.join("nic1")), None, "a PF has no number");
+        assert_eq!(vf_number_of(&net.join("gone")), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn device_facts_are_read_once_and_re_read_when_stale() {
         let reads = std::cell::Cell::new(0);
@@ -1690,6 +1766,7 @@ mod tests {
                     driver: Some("t".into()),
                     pf_netdevs: vec![name.into()],
                     is_vf: true,
+                    vf_number: None,
                 })
             }
         };

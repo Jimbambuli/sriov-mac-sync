@@ -3255,6 +3255,9 @@ impl FdbWriter for FlipSock {
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
         self.inner.dump_links()
     }
+    fn vf_info_of(&mut self, pf: u32) -> io::Result<Vec<crate::netlink::VfInfo>> {
+        self.inner.vf_info_of(pf)
+    }
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>> {
         if let Some(p) = self.heal.take() {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
