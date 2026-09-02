@@ -54,7 +54,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::netlink::{format_mac, FdbEntry, Socket};
-use crate::topology::Topology;
+use crate::topology::{Anatomy, Topology};
 
 pub type Mac = [u8; 6];
 
@@ -79,6 +79,7 @@ enum FastPhase {
 }
 
 struct FastPair {
+    anat: Anatomy,
     /// kept for the messages a person reads
     dev: String,
     bridge: u32,
@@ -539,23 +540,6 @@ pub fn vf_may_have_changed(
     })
 }
 
-/// Every physical function whose VF addresses must be excluded for `dev`.
-///
-/// Usually one - a VF has a PF, a PF is its own. A multiport card that shares
-/// one PCI function across its ports is the exception: each port's netdev
-/// reports only its own port's VF addresses, so a VF there has a PF netdev per
-/// port and all of them must be asked, or a sibling VF on the other port is
-/// left out of the exclusion set and its address registered past its guest.
-fn physical_functions(topo: &Topology, dev: u32) -> Vec<u32> {
-    match topo.at(dev) {
-        Some(l) if !l.pf_netdevs.is_empty() => l.pf_netdevs.clone(),
-        // `physfn` is only ever the first of `pf_netdevs` (every Link
-        // constructor derives it so), hence empty pf_netdevs means no
-        // physfn either: the uplink is its own function.
-        _ => vec![dev],
-    }
-}
-
 impl Syncer {
     pub fn new(pairs: Vec<Pair>, state_dir: PathBuf) -> Self {
         Syncer {
@@ -917,11 +901,11 @@ impl Syncer {
     /// path once carried its own abbreviation of this list - it had none of
     /// it - and registered a guest VF's own address, which tells the eSwitch
     /// the guest lives behind the bridge and sends its traffic past it.
-    fn exclusions(&self, topo: &Topology, dev: u32, port: u32, vf_macs: &[(u32, Mac)]) -> Set<Mac> {
+    fn exclusions(&self, topo: &Topology, anat: &Anatomy, vf_macs: &[(u32, Mac)]) -> Set<Mac> {
         let mut skip: Set<Mac> = crate::hash::set();
         skip.extend(self.exclude.iter().copied());
-        skip.extend(topo.subtree_macs(port));
-        if let Some(l) = topo.at(dev) {
+        skip.extend(topo.subtree_macs(anat.port));
+        if let Some(l) = topo.at(anat.dev) {
             if let Some(mac) = l.mac {
                 skip.insert(mac);
             }
@@ -931,9 +915,9 @@ impl Syncer {
         // DEPENDS on vf_own being a subset of skip, and two hand-kept
         // copies of this walk agreeing is exactly the kind of promise that
         // silently breaks. Subset by construction instead.
-        skip.extend(Self::vf_reported(topo, dev, vf_macs));
-        for pf in physical_functions(topo, dev) {
-            if let Some(pf_link) = topo.at(pf) {
+        skip.extend(Self::vf_reported(&anat.functions, vf_macs));
+        for pf in &anat.functions {
+            if let Some(pf_link) = topo.at(*pf) {
                 if let Some(mac) = pf_link.mac {
                     skip.insert(mac);
                 }
@@ -994,7 +978,10 @@ impl Syncer {
     /// Nothing can be done about it here - the address is not knowable - so
     /// the operator is told, once, with the two ways to close it.
     fn warn_about_unknowable_vfs(&mut self, topo: &Topology, dev: &str, vf_macs: &[(u32, Mac)]) {
-        let Some(pfs) = topo.index_of(dev).map(|d| physical_functions(topo, d)) else {
+        let Some(pfs) = topo
+            .index_of(dev)
+            .map(|d| topo.physical_functions(topo.filter_carrier(d)))
+        else {
             return;
         };
         // numvfs and host-bound netdevs are device-level - the same on every
@@ -1666,17 +1653,13 @@ impl Syncer {
     fn wanted_with_keeps(
         &self,
         topo: &Topology,
-        bridge: u32,
-        dev: u32,
-        port: u32,
+        anat: &Anatomy,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
         owned_before: &Set<Mac>,
     ) -> (Set<Mac>, Vec<String>, Set<Mac>, Map<Mac, u32>, Set<Mac>) {
-        let (mut want, stacked, wire, learnt_at) =
-            self.desired(topo, bridge, dev, port, fdb, vf_macs);
-        let kept =
-            self.quiet_survivors(topo, bridge, dev, port, &want, &wire, vf_macs, owned_before);
+        let (mut want, stacked, wire, learnt_at) = self.desired(topo, anat, fdb, vf_macs);
+        let kept = self.quiet_survivors(topo, anat, &want, &wire, vf_macs, owned_before);
         want.extend(kept.iter().copied());
         (want, stacked, wire, learnt_at, kept)
     }
@@ -1702,16 +1685,14 @@ impl Syncer {
     fn quiet_survivors(
         &self,
         topo: &Topology,
-        bridge: u32,
-        dev: u32,
-        port: u32,
+        anat: &Anatomy,
         want: &Set<Mac>,
         wire: &Set<Mac>,
         vf_macs: &[(u32, Mac)],
         owned_before: &Set<Mac>,
     ) -> Set<Mac> {
         let mut kept = crate::hash::set();
-        let Some(name) = topo.name_of(dev) else {
+        let Some(name) = topo.name_of(anat.dev) else {
             return kept;
         };
         let Some(ports) = self.carried_ports.get(name) else {
@@ -1721,13 +1702,13 @@ impl Syncer {
             return kept;
         }
         // The one canonical exclusion set, asked again rather than re-spelt.
-        let skip = self.exclusions(topo, dev, port, vf_macs);
+        let skip = self.exclusions(topo, anat, vf_macs);
         // Everything under the uplink port is the wire's side of the fence,
         // the port itself included: a learn-port later re-enslaved beneath
         // the uplink (two NICs folded into a bond uplink) now leads out,
         // and keeping its addresses would steer wire traffic into the
         // bridge.
-        let wireward = topo.subtree_of(&[port]);
+        let wireward = topo.subtree_of(&[anat.port]);
         for m in owned_before {
             if want.contains(m) || wire.contains(m) || skip.contains(m) {
                 continue;
@@ -1748,7 +1729,7 @@ impl Syncer {
             // the inverse walk of the same edges desired() takes downward
             // through `uplink_ward` and `relevant`.
             let reachable = match topo.bridge_above(p) {
-                Some((br, _)) => topo.leads_to(br, bridge),
+                Some((br, _)) => topo.leads_to(br, anat.bridge),
                 None => false,
             };
             if !reachable {
@@ -1764,12 +1745,11 @@ impl Syncer {
     fn desired(
         &self,
         topo: &Topology,
-        bridge: u32,
-        dev: u32,
-        port: u32,
+        anat: &Anatomy,
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
     ) -> (Set<Mac>, Vec<String>, Set<Mac>, Map<Mac, u32>) {
+        let bridge = anat.bridge;
         let Some(bridge_link) = topo.at(bridge) else {
             return (
                 crate::hash::set(),
@@ -1816,7 +1796,7 @@ impl Syncer {
             }
             let Some(master) = e.master else { continue };
             if master == bridge_link.index {
-                if e.ifindex == port {
+                if e.ifindex == anat.port {
                     // out on the wire: registering it would divert its traffic
                     // to the bridge, which cannot send it back out of the port
                     // it arrived on
@@ -1849,7 +1829,7 @@ impl Syncer {
 
         // Everything the host owns on this side of the uplink, plus what the
         // wire already carries.
-        let mut skip: Set<Mac> = self.exclusions(topo, dev, port, vf_macs);
+        let mut skip: Set<Mac> = self.exclusions(topo, anat, vf_macs);
         skip.extend(wire.iter().copied());
 
         // Addresses pinned by configuration are registered even when nothing
@@ -1882,7 +1862,7 @@ impl Syncer {
             // return came out of a link this very topology holds, so one
             // here would ask whether the reading contains what the reading
             // just said. It was there, and it never fired.
-            for pf in physical_functions(topo, idx) {
+            for pf in topo.physical_functions(topo.filter_carrier(idx)) {
                 if !pfs.contains(&pf) {
                     pfs.push(pf);
                 }
@@ -1894,18 +1874,12 @@ impl Syncer {
     /// The addresses the driver reports for the virtual functions behind
     /// this uplink - the share of the exclusion set that can go stale when
     /// the answer is carried, which is why the fast path keeps it apart.
-    fn vf_reported(topo: &Topology, dev: u32, vf_macs: &[(u32, Mac)]) -> Set<Mac> {
-        let mut own = crate::hash::set();
-        for pf in physical_functions(topo, dev) {
-            if let Some(pf_link) = topo.at(pf) {
-                for (ifindex, mac) in vf_macs {
-                    if *ifindex == pf_link.index {
-                        own.insert(*mac);
-                    }
-                }
-            }
-        }
-        own
+    fn vf_reported(functions: &[u32], vf_macs: &[(u32, Mac)]) -> Set<Mac> {
+        vf_macs
+            .iter()
+            .filter(|(pf, _)| functions.contains(pf))
+            .map(|(_, mac)| *mac)
+            .collect()
     }
 
     /// The carried answer, if it may be used for these very physical
@@ -2020,13 +1994,14 @@ impl Syncer {
             // Fail closed for the same reason as the missing bridge: a
             // detached device taken for the wire port makes every cable-side
             // peer look registrable.
-            let Some(port) = topo.uplink_port(dev_index, bridge_index) else {
+            let Some(anat) = topo.anatomy(dev_index, bridge_index) else {
                 eprintln!(
                     "warning: {}: not under bridge {} in this reading, leaving the filter alone",
                     pair.dev, pair.bridge
                 );
                 continue;
             };
+            let port = anat.port;
             let port_name = topo.name_of(port).unwrap_or(&pair.dev).to_string();
             // Loaded before the grow-refresh decides, because the quiet
             // survivors have to be in `want` by then: a kept address missing
@@ -2043,16 +2018,8 @@ impl Syncer {
             // set - and pruning against that would erase the very memory
             // the gate exists to protect.
             let owned_was_readable = self.note_is_readable(&pair.dev);
-            let (mut want, mut stacked, mut wire, mut learnt_at, mut kept) = self
-                .wanted_with_keeps(
-                    topo,
-                    bridge_index,
-                    dev_index,
-                    port,
-                    &fdb,
-                    &vf_macs,
-                    &owned_before,
-                );
+            let (mut want, mut stacked, mut wire, mut learnt_at, mut kept) =
+                self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
 
             let present: Set<Mac> = fdb
                 .iter()
@@ -2096,15 +2063,7 @@ impl Syncer {
                 timings.vf_addresses = vf_macs.len();
                 // The same asking again, against the fresh answer: an
                 // address the driver now calls a VF's own must not be kept.
-                let again = self.wanted_with_keeps(
-                    topo,
-                    bridge_index,
-                    dev_index,
-                    port,
-                    &fdb,
-                    &vf_macs,
-                    &owned_before,
-                );
+                let again = self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
                 (want, stacked, wire, learnt_at, kept) = again;
             }
             self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
@@ -2152,7 +2111,7 @@ impl Syncer {
             // an uplink that counted only its own share would let the card
             // overflow with every pair believing it had room. Where nothing
             // is stacked, this is the uplink itself and nothing changes.
-            let carrier = topo.filter_carrier(dev_index);
+            let carrier = anat.card;
             let on_card: Set<Mac> = if carrier == dev_index {
                 present.clone()
             } else {
@@ -2598,13 +2557,13 @@ impl Syncer {
                 // A pair whose device is not under its bridge right now is
                 // skipped here too; the link event that detached it buys the
                 // full pass, which says so out loud.
-                let port = topo.uplink_port(dev, bridge)?;
-                let skip = self.exclusions(topo, dev, port, &vf_macs);
+                let anat = topo.anatomy(dev, bridge)?;
+                let skip = self.exclusions(topo, &anat, &vf_macs);
                 Some(FastPair {
                     dev: p.dev.clone(),
                     bridge,
                     index: dev,
-                    port,
+                    port: anat.port,
                     skip,
                     reflected: crate::hash::set(),
                     // Only the carried path reads this: it is what turns a
@@ -2613,10 +2572,11 @@ impl Syncer {
                     // answer there is nothing to settle, and building the
                     // set would be a walk per pair per batch for nobody.
                     vf_own: if vf_carried {
-                        Self::vf_reported(topo, dev, &vf_macs)
+                        Self::vf_reported(&anat.functions, &vf_macs)
                     } else {
                         crate::hash::set()
                     },
+                    anat,
                 })
             })
             .collect();
@@ -2824,7 +2784,7 @@ impl Syncer {
                 fresh.extend(sock.vf_macs_of(&ask)?);
                 self.remember_vf(pfs.clone(), fresh.clone());
                 for fp in &mut pairs {
-                    fp.skip = self.exclusions(topo, fp.index, fp.port, &fresh);
+                    fp.skip = self.exclusions(topo, &fp.anat, &fresh);
                     // fp.vf_own is deliberately NOT refreshed: its only
                     // reader is the Decide phase, which ran before this
                     // refresh - the Commit phase judges by `skip`, which

@@ -44,6 +44,12 @@ pub struct Link {
     pub master: Option<u32>,
     /// what is enslaved to, or stacked under, this interface
     pub lowers: Vec<u32>,
+    /// The interface whose unicast filter this one really writes into: a
+    /// VLAN interface has none of its own, the kernel hands a `self` entry
+    /// down to its parent. Only VLAN, measured; a VXLAN is a tunnel and its
+    /// guests never appear on the underlay, and for macvlan and the rest it
+    /// is unknown - naming the wrong carrier is worse than naming none.
+    pub filter_below: Option<u32>,
     pub is_bridge: bool,
     /// How long this bridge takes to forget a silent address, in
     /// milliseconds - and so how long ago an address it has just aged out
@@ -73,6 +79,16 @@ pub struct Link {
     pub uppers: Vec<u32>,
     /// what is enslaved to this interface - the inverse of `master`
     pub slaves: Vec<u32>,
+}
+
+/// See `Topology::anatomy`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Anatomy {
+    pub dev: u32,
+    pub bridge: u32,
+    pub port: u32,
+    pub card: u32,
+    pub functions: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -310,12 +326,17 @@ impl Topology {
                 _ => Vec::new(),
             };
 
+            let filter_below = match (l.kind.as_deref(), l.link) {
+                (Some("vlan"), Some(parent)) => Some(parent),
+                _ => None,
+            };
             let mut link = Link {
                 name: l.name,
                 index: l.index,
                 mac: l.mac,
                 master: l.master,
                 lowers,
+                filter_below,
                 is_bridge: l.kind.as_deref() == Some("bridge"),
                 // clock_t is USER_HZ hundredths of a second on every
                 // architecture this runs on: 30000 is the default 300 s.
@@ -526,39 +547,62 @@ impl Topology {
         self.flood(roots, |l| &l.lowers)
     }
 
-    /// The interface whose unicast filter an uplink really writes into.
-    ///
-    /// A VLAN interface has no filter of its own: the kernel passes a
-    /// `self` entry down to the interface it is stacked on, and that one
-    /// holds the entry. Several uplinks can therefore end up sharing one
-    /// filter - three VLANs of one virtual function are three uplinks but
-    /// one list of, say, 128 slots. Whoever counts how full the card is
-    /// has to ask this interface, not the uplink.
-    ///
-    /// Only the stacking relation is followed, never a master: a bond's
-    /// members each have their own filter, and the kernel spreads entries
-    /// over them, so a bond carries its own.
+    /// The interface whose unicast filter an uplink really writes into -
+    /// down the VLAN stack to the first interface that holds one.
     pub fn filter_carrier(&self, dev: u32) -> u32 {
         let mut seen = crate::hash::set();
         let mut cur = dev;
         while seen.insert(cur) {
-            // `lowers` holds two different relations - the ports of a master
-            // and the parent of a stacked interface - and only the second one
-            // shares a filter. They are told apart by looking back: a port
-            // names its master, a parent does not name what sits on it. Get
-            // this wrong and a bond looks like it were stacked on its first
-            // member.
-            let Some(l) = self.at(cur) else { break };
-            let stacked = l
-                .lowers
-                .iter()
-                .find(|&&u| self.at(u).and_then(|p| p.master) != Some(cur));
-            match (l.lowers.len(), stacked) {
-                (1, Some(&parent)) => cur = parent,
-                _ => break,
+            match self.at(cur).and_then(|l| l.filter_below) {
+                Some(parent) => cur = parent,
+                None => break,
             }
         }
         cur
+    }
+
+    /// The physical functions behind an interface - the PFs whose VF
+    /// addresses must never be registered through it (invariant 2).
+    /// A VF names its function's netdevs; a PF is its own; a bond has none
+    /// itself but every member's, because the kernel spreads its entries
+    /// over all of them. Empty means: no card behind this at all.
+    pub fn physical_functions(&self, dev: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let mut seen = crate::hash::set();
+        let mut stack = vec![dev];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(l) = self.at(cur) else { continue };
+            if !l.pf_netdevs.is_empty() {
+                out.extend(l.pf_netdevs.iter().copied());
+            } else if l.numvfs > 0 {
+                out.push(cur);
+            } else {
+                stack.extend(l.slaves.iter().copied());
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// What a pair is made of. One answer to the four questions every
+    /// invariant used to ask separately, computed once per pass:
+    /// `port` is where the wire comes in (invariant 1), `functions` are
+    /// the cards whose VF addresses stay out (invariant 2), `card` holds
+    /// the filter the capacity is measured on.
+    pub fn anatomy(&self, dev: u32, bridge: u32) -> Option<Anatomy> {
+        let port = self.uplink_port(dev, bridge)?;
+        let card = self.filter_carrier(dev);
+        Some(Anatomy {
+            dev,
+            bridge,
+            port,
+            card,
+            functions: self.physical_functions(card),
+        })
     }
 
     /// Follow the master chain upwards - through bonds, teams, whatever -
@@ -605,105 +649,83 @@ impl Topology {
             .collect()
     }
 
-    /// Interfaces that carry a bridge over an eSwitch: a NIC with virtual
-    /// functions, or a virtual function itself where one stands in for the
-    /// physical port. Both have to end up in a bridge, possibly through a
-    /// bond - without one there is nothing behind them to be missed.
+    /// Whether an interface can be an uplink at all: a card of its own, or a
+    /// VLAN interface with a card somewhere below. A bond is neither - its
+    /// members are the candidates, the bond is only their port - and so
+    /// nothing else stacked or enslaved is.
+    fn could_be_uplink(&self, link: &Link) -> bool {
+        if link.numvfs > 0 || !link.pf_netdevs.is_empty() {
+            return true;
+        }
+        link.filter_below.is_some()
+            && !self
+                .physical_functions(self.filter_carrier(link.index))
+                .is_empty()
+    }
+
+    /// The pairs this host wants: every interface that could be an uplink
+    /// and ends up in a bridge, one pair per (functions, bridge). Two vports
+    /// of one eSwitch must not both claim a bridge's addresses - a VF and its
+    /// PF, or two sister VFs - and which of them is the port is arbitrary,
+    /// so the first in name order wins and the rest are reported.
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut pairs: Vec<(String, String)> = Vec::new();
-        let mut taken_for: Vec<(u32, u32, String)> = Vec::new(); // pf, bridge, uplink name
+        let mut taken: Vec<(Vec<u32>, u32, String)> = Vec::new(); // functions, bridge, by
         let mut skipped = Vec::new();
-        // In name order, so a host with several candidates always chooses the
-        // same one rather than whichever the hash table offers first.
         let mut sorted: Vec<&Link> = self.links.values().collect();
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         for link in sorted {
-            let name = &link.name;
-            // A card of its own, or something stacked on one. The second
-            // case is a VLAN interface of a virtual function: it is what
-            // sits in the bridge, and the entries it takes land in the
-            // filter of the function below it. Without this, such a host
-            // has to be configured by hand - and loses the orphan sweep
-            // with it, because only autodetection may conclude a device is
-            // gone.
-            let traeger = self.filter_carrier(link.index);
-            let karte = if traeger == link.index {
-                Some(link)
-            } else {
-                self.at(traeger)
-            };
-            let Some(karte) = karte else { continue };
-            let has_vfs = karte.numvfs > 0;
-            if !has_vfs && karte.physfn.is_none() {
+            if !self.could_be_uplink(link) {
                 continue;
             }
-            match self.bridge_above(link.index) {
-                Some((br, port)) => {
-                    let br_name = self.name_of(br).unwrap_or_default().to_string();
-                    // A VF cannot stand in for a port its own PF already
-                    // holds: both would claim the same addresses, on two
-                    // vports of one eSwitch. The same goes for a sister VF
-                    // that was taken for this bridge a moment ago - the rule
-                    // is about the eSwitch, not about who is a PF.
-                    if let Some(pf) = karte.physfn {
-                        let pf_name = self.name_of(pf).unwrap_or_default();
-                        // Every netdev of this function, not just the first:
-                        // a card whose ports share one PCI function shows one
-                        // netdev per port, and which of them `physfn` names is
-                        // arbitrary. Asking only that one answers about the
-                        // right port by luck - one time in two on a dual-port
-                        // card, one in four on a quad - and the rest of the
-                        // time a VF is taken for a bridge its own port already
-                        // holds, which is what this rule exists to prevent.
-                        // A sister port carrying the bridge is a different
-                        // eSwitch and no conflict in theory; declining there
-                        // too costs an autodetection that `--pair` can still
-                        // make, and is the answer that cannot be wrong.
-                        if let Some(holder) = link
-                            .pf_netdevs
-                            .iter()
-                            .copied()
-                            .find(|&p| self.bridge_above(p).map(|(b, _)| b) == Some(br))
-                        {
-                            let holder_name = self.name_of(holder).unwrap_or_default();
-                            skipped.push(format!(
-                                "skip {name}: {holder_name} already carries {br_name}"
-                            ));
-                            continue;
-                        }
-                        if let Some((_, _, taken)) =
-                            taken_for.iter().find(|(p, b, _)| *p == pf && *b == br)
-                        {
-                            // Into `skipped` like every other declined
-                            // candidate: autodetection runs on every pass,
-                            // and a direct eprintln here was the same line
-                            // thousands of times a day.
-                            skipped.push(format!(
-                                "skip {name}: {taken} of the same {pf_name} already \
-                                 carries {br_name} - two vports of one eSwitch cannot \
-                                 both claim the same addresses"
-                            ));
-                            continue;
-                        }
-                        taken_for.push((pf, br, name.clone()));
-                    }
-                    if port != link.index {
-                        let port_name = self.name_of(port).unwrap_or_default();
-                        skipped.push(format!("{name} reaches {br_name} through {port_name}"));
-                    }
-                    pairs.push((name.clone(), br_name));
+            let Some((br, port)) = self.bridge_above(link.index) else {
+                if link.numvfs > 0 {
+                    skipped.push(format!(
+                        "skip {}: {} VF(s) but does not end up in a bridge",
+                        link.name, link.numvfs
+                    ));
                 }
-                // A VF outside a bridge is the ordinary case - it belongs to
-                // a guest. Only a NIC handing out VFs is worth remarking on.
-                None => {
-                    if has_vfs {
-                        skipped.push(format!(
-                            "skip {name}: {} VF(s) but does not end up in a bridge",
-                            link.numvfs
-                        ));
-                    }
-                }
+                continue;
+            };
+            let Some(anat) = self.anatomy(link.index, br) else {
+                continue;
+            };
+            let br_name = self.name_of(br).unwrap_or_default().to_string();
+            // A PF that itself carries this bridge, on any of its ports: the
+            // bridge's addresses already have a vport, and a VF taking it
+            // too would claim them twice on one eSwitch.
+            if let Some(pf) = anat
+                .functions
+                .iter()
+                .find(|&&pf| pf != link.index && self.bridge_above(pf).map(|(b, _)| b) == Some(br))
+            {
+                skipped.push(format!(
+                    "skip {}: {} already carries {br_name}",
+                    link.name,
+                    self.name_of(*pf).unwrap_or_default()
+                ));
+                continue;
             }
+            if let Some((_, _, by)) = taken
+                .iter()
+                .find(|(f, b, _)| *b == br && f.iter().any(|x| anat.functions.contains(x)))
+            {
+                skipped.push(format!(
+                    "skip {}: {by} of the same function already carries {br_name} - two \
+                     vports of one eSwitch cannot both claim the same addresses",
+                    link.name
+                ));
+                continue;
+            }
+            if port != link.index {
+                skipped.push(format!(
+                    "{} reaches {br_name} through {}",
+                    link.name,
+                    self.name_of(port).unwrap_or_default()
+                ));
+            }
+            taken.push((anat.functions.clone(), br, link.name.clone()));
+            pairs.push((link.name.clone(), br_name));
         }
         (pairs, skipped)
     }
@@ -735,6 +757,7 @@ pub(crate) mod fixture {
         physfn: Option<String>,
         pf_netdevs: Vec<String>,
         vf_netdevs: Vec<String>,
+        filter_below: Option<String>,
     }
 
     impl Builder {
@@ -790,6 +813,14 @@ pub(crate) mod fixture {
             self
         }
 
+        /// A VLAN interface on `parent`: stacked, and writing into the
+        /// filter below - unlike a tunnel, whose guests never reach it.
+        pub fn vlan_on(mut self, parent: &str) -> Self {
+            self.last_names().lowers.push(parent.to_string());
+            self.last_names().filter_below = Some(parent.to_string());
+            self
+        }
+
         pub fn vfs(mut self, n: u32) -> Self {
             self.last().numvfs = n;
             self
@@ -830,6 +861,7 @@ pub(crate) mod fixture {
                 .map(|(mut l, n)| {
                     l.master = n.master.as_ref().and_then(idx);
                     l.lowers = n.lowers.iter().filter_map(idx).collect();
+                    l.filter_below = n.filter_below.as_ref().and_then(idx);
                     // A VF described with only `physfn` has that one PF as its
                     // whole function; the multiport case names them explicitly.
                     let pf_names = if n.pf_netdevs.is_empty() {
@@ -1095,10 +1127,10 @@ mod tests {
             .vfs(1)
             .add("nic1.100", 20, Some(mac(1)))
             .master("br100")
-            .lower("nic1")
+            .vlan_on("nic1")
             .add("nic1.200", 21, Some(mac(1)))
             .master("br200")
-            .lower("nic1")
+            .vlan_on("nic1")
             .add("br100", 30, Some(mac(1)))
             .bridge()
             .lower("nic1.100")
@@ -1145,10 +1177,10 @@ mod tests {
             .vfs(2)
             .add("nic1.100", 20, Some(mac(1)))
             .master("br100")
-            .lower("nic1")
+            .vlan_on("nic1")
             .add("nic1.200", 21, Some(mac(1)))
             .master("br200")
-            .lower("nic1")
+            .vlan_on("nic1")
             .add("br100", 30, Some(mac(1)))
             .bridge()
             .lower("nic1.100")
@@ -1164,6 +1196,186 @@ mod tests {
                 ("nic1.200".to_string(), "br200".to_string())
             ],
             "both VLAN interfaces are uplinks in their own right"
+        );
+    }
+
+    /// 1a: a tunnel stacked on a VF is not a VLAN. Its guests never reach
+    /// the underlay, so it neither shares the VF's filter nor is an uplink.
+    #[test]
+    fn a_tunnel_over_a_vf_is_neither_carrier_nor_uplink() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(1)
+            .vf_netdev("nic1v0")
+            .add("nic1v0", 3, Some(mac(3)))
+            .physfn("nic1")
+            .pf_netdevs(&["nic1"])
+            .add("vx0", 20, Some(mac(20)))
+            .master("br0")
+            .lower("nic1v0")
+            .add("br0", 30, Some(mac(30)))
+            .bridge()
+            .lower("vx0")
+            .build();
+        let idx = |n: &str| t.index_of(n).unwrap();
+        assert_eq!(
+            t.filter_carrier(idx("vx0")),
+            idx("vx0"),
+            "a tunnel holds no filter below"
+        );
+        let (pairs, _) = t.autodetect();
+        assert!(pairs.is_empty(), "a tunnel is no uplink, got {pairs:?}");
+    }
+
+    /// 1b: the sister rule judges by the card, not by the interface in the
+    /// bridge. A VLAN of a VF must decline a bridge its PF already carries -
+    /// asked of the VLAN interface, whose netdev list is empty, the rule
+    /// let it through.
+    #[test]
+    fn a_vlan_uplink_declines_a_bridge_its_pf_carries() {
+        // The PF sorts AFTER the VLAN interface on purpose: the "already
+        // taken" rule must not be what catches this, only the PF rule can.
+        let t = Builder::new()
+            .add("pf9", 2, Some(mac(1)))
+            .master("br0")
+            .vfs(1)
+            .vf_netdev("pf9v0")
+            .add("pf9v0", 3, Some(mac(3)))
+            .physfn("pf9")
+            .pf_netdevs(&["pf9"])
+            .add("pf9v0.7", 20, Some(mac(3)))
+            .master("br0")
+            .vlan_on("pf9v0")
+            .add("br0", 30, Some(mac(30)))
+            .bridge()
+            .lower("pf9")
+            .lower("pf9v0.7")
+            .build();
+        let (pairs, skipped) = t.autodetect();
+        assert_eq!(pairs, vec![("pf9".to_string(), "br0".to_string())]);
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.starts_with("skip pf9v0.7: pf9 already carries")),
+            "{skipped:?}"
+        );
+    }
+
+    /// 1c: a bond has no card of its own but every member's. Named as an
+    /// uplink by hand, its exclusion set has to reach the sister VFs of
+    /// each member's function - the worst failure direction this program
+    /// has ran through the bond, which answered with an empty list.
+    #[test]
+    fn a_bond_answers_with_its_members_functions() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .vf_netdev("nic1v0")
+            .add("nic2", 4, Some(mac(2)))
+            .vfs(2)
+            .vf_netdev("nic2v0")
+            .add("nic1v0", 3, Some(mac(3)))
+            .master("bond0")
+            .physfn("nic1")
+            .pf_netdevs(&["nic1"])
+            .add("nic2v0", 5, Some(mac(5)))
+            .master("bond0")
+            .physfn("nic2")
+            .pf_netdevs(&["nic2"])
+            .add("bond0", 10, Some(mac(3)))
+            .master("br0")
+            .lower("nic1v0")
+            .lower("nic2v0")
+            .add("br0", 30, Some(mac(30)))
+            .bridge()
+            .lower("bond0")
+            .build();
+        let idx = |n: &str| t.index_of(n).unwrap();
+        assert_eq!(
+            t.physical_functions(idx("bond0")),
+            vec![idx("nic1"), idx("nic2")]
+        );
+        let anat = t.anatomy(idx("bond0"), idx("br0")).unwrap();
+        assert_eq!(anat.functions, vec![idx("nic1"), idx("nic2")]);
+        assert_eq!(anat.port, idx("bond0"));
+    }
+
+    /// 1d: a VLAN on a bond of VFs. The bond is nobody's card, but there are
+    /// cards below it, and the VLAN interface is what sits in the bridge.
+    #[test]
+    fn autodetect_finds_a_vlan_on_a_bond_of_vfs() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .vf_netdev("nic1v0")
+            .add("nic2", 4, Some(mac(2)))
+            .vfs(2)
+            .vf_netdev("nic2v0")
+            .add("nic1v0", 3, Some(mac(3)))
+            .master("bond0")
+            .physfn("nic1")
+            .pf_netdevs(&["nic1"])
+            .add("nic2v0", 5, Some(mac(5)))
+            .master("bond0")
+            .physfn("nic2")
+            .pf_netdevs(&["nic2"])
+            .add("bond0", 10, Some(mac(3)))
+            .lower("nic1v0")
+            .lower("nic2v0")
+            .add("bond0.100", 11, Some(mac(3)))
+            .master("br100")
+            .vlan_on("bond0")
+            .add("br100", 30, Some(mac(30)))
+            .bridge()
+            .lower("bond0.100")
+            .build();
+        let (pairs, _) = t.autodetect();
+        assert_eq!(pairs, vec![("bond0.100".to_string(), "br100".to_string())]);
+        let idx = |n: &str| t.index_of(n).unwrap();
+        let anat = t.anatomy(idx("bond0.100"), idx("br100")).unwrap();
+        assert_eq!(
+            anat.card,
+            idx("bond0"),
+            "the filter is the bond's, spread over its members"
+        );
+        assert_eq!(anat.functions, vec![idx("nic1"), idx("nic2")]);
+    }
+
+    /// 1e: a bond straight in the bridge is still carried by its member
+    /// VFs, one pair each - the bond itself must not become a third
+    /// candidate that outranks them by name.
+    #[test]
+    fn a_bond_in_a_bridge_is_carried_by_its_members_not_itself() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .vf_netdev("nic1v0")
+            .add("nic2", 4, Some(mac(2)))
+            .vfs(2)
+            .vf_netdev("nic2v0")
+            .add("nic1v0", 3, Some(mac(3)))
+            .master("bond0")
+            .physfn("nic1")
+            .pf_netdevs(&["nic1"])
+            .add("nic2v0", 5, Some(mac(5)))
+            .master("bond0")
+            .physfn("nic2")
+            .pf_netdevs(&["nic2"])
+            .add("bond0", 10, Some(mac(3)))
+            .master("br0")
+            .lower("nic1v0")
+            .lower("nic2v0")
+            .add("br0", 30, Some(mac(30)))
+            .bridge()
+            .lower("bond0")
+            .build();
+        let (pairs, _) = t.autodetect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("nic1v0".to_string(), "br0".to_string()),
+                ("nic2v0".to_string(), "br0".to_string())
+            ]
         );
     }
 
@@ -1217,6 +1429,51 @@ mod tests {
     /// five minutes. Both harnesses build their bridges at the default,
     /// where the dating provably cannot move a stamp, so nothing else here
     /// would notice.
+    /// Of the stacked kinds only a VLAN writes into the filter below it -
+    /// a tunnel's guests never reach the underlay. Decided where the kind
+    /// is still known: on the way in.
+    #[test]
+    fn only_a_vlan_shares_the_filter_below_it() {
+        let link = |index, name: &str, kind: &str| crate::netlink::LinkInfo {
+            index,
+            name: name.into(),
+            mac: None,
+            master: None,
+            link: Some(2),
+            kind: Some(kind.into()),
+            parent_dev: None,
+            ageing: None,
+        };
+        let topo = Topology::from_links(vec![
+            crate::netlink::LinkInfo {
+                index: 2,
+                name: "nic1".into(),
+                mac: None,
+                master: None,
+                link: None,
+                kind: None,
+                parent_dev: None,
+                ageing: None,
+            },
+            link(20, "nic1.100", "vlan"),
+            link(21, "vx0", "vxlan"),
+            link(22, "mv0", "macvlan"),
+        ]);
+        assert_eq!(
+            topo.at(20).unwrap().filter_below,
+            Some(2),
+            "a VLAN shares the filter"
+        );
+        assert_eq!(topo.at(21).unwrap().filter_below, None, "a tunnel does not");
+        assert_eq!(
+            topo.at(22).unwrap().filter_below,
+            None,
+            "macvlan is unmeasured, so no"
+        );
+        assert_eq!(topo.filter_carrier(20), 2);
+        assert_eq!(topo.filter_carrier(21), 21);
+    }
+
     #[test]
     fn the_ageing_time_arrives_in_milliseconds() {
         let topo = Topology::from_links(vec![crate::netlink::LinkInfo {

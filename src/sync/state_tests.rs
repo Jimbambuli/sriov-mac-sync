@@ -3476,10 +3476,10 @@ fn vlan_host() -> crate::topology::Topology {
         .vfs(1)
         .add("nic1.100", 20, Some(mac(1)))
         .master("br100")
-        .lower("nic1")
+        .vlan_on("nic1")
         .add("nic1.200", 21, Some(mac(1)))
         .master("br200")
-        .lower("nic1")
+        .vlan_on("nic1")
         .add("vetha", 4, Some(mac(4)))
         .master("br100")
         .add("br100", 10, Some(mac(3)))
@@ -3490,6 +3490,74 @@ fn vlan_host() -> crate::topology::Topology {
         .bridge()
         .lower("nic1.200")
         .build()
+}
+
+/// A bond named as the uplink by hand. Its exclusion set has to hold the
+/// sister VFs of BOTH members' functions: an address a guest VF owns must
+/// not be registered through the bond, or the eSwitch sends that guest's
+/// traffic past it. The bond has no function of its own; asked naively it
+/// answered with an empty list, which is invariant 2 with a hole in it.
+#[test]
+fn a_bond_uplink_excludes_the_sister_vfs_of_every_member() {
+    let topo = Builder::new()
+        .add("nic1", 2, Some(mac(1)))
+        .vfs(2)
+        .vf_netdev("nic1v0")
+        .vf_netdev("nic1v1")
+        .add("nic2", 4, Some(mac(2)))
+        .vfs(2)
+        .vf_netdev("nic2v0")
+        .vf_netdev("nic2v1")
+        .add("nic1v0", 3, Some(mac(3)))
+        .master("bond0")
+        .physfn("nic1")
+        .pf_netdevs(&["nic1"])
+        .add("nic1v1", 6, Some(mac(0x16)))
+        .physfn("nic1")
+        .pf_netdevs(&["nic1"])
+        .add("nic2v0", 5, Some(mac(5)))
+        .master("bond0")
+        .physfn("nic2")
+        .pf_netdevs(&["nic2"])
+        .add("nic2v1", 7, Some(mac(0x27)))
+        .physfn("nic2")
+        .pf_netdevs(&["nic2"])
+        .add("bond0", 10, Some(mac(3)))
+        .master("br0")
+        .lower("nic1v0")
+        .lower("nic2v0")
+        .add("vetha", 8, Some(mac(8)))
+        .master("br0")
+        .add("br0", 30, Some(mac(30)))
+        .bridge()
+        .lower("bond0")
+        .lower("vetha")
+        .build();
+    let s = syncer();
+    // The sister VFs' addresses turn up learnt behind the bridge - a guest
+    // holding one has spoken - and both must stay out of the bond's filter.
+    let fdb = vec![
+        learned(8, 30, mac(0x16)),
+        learned(8, 30, mac(0x27)),
+        learned(8, 30, [0x02, 0xaa, 0, 0, 0, 1]),
+    ];
+    let p = Pair {
+        dev: "bond0".into(),
+        bridge: "br0".into(),
+    };
+    let (want, _, _) = desired_named(&s, &topo, &p, "bond0", &fdb, &[]);
+    assert!(
+        want.contains(&[0x02, 0xaa, 0, 0, 0, 1]),
+        "an ordinary guest is wanted"
+    );
+    assert!(
+        !want.contains(&mac(0x16)),
+        "nic1's sister VF address is excluded through the bond"
+    );
+    assert!(
+        !want.contains(&mac(0x27)),
+        "nic2's sister VF address is excluded through the bond"
+    );
 }
 
 /// Two uplinks on one card share its filter, and the pressure valve has to

@@ -196,7 +196,17 @@ pub(crate) fn desired_named(
     let port = topo
         .index_of(port)
         .unwrap_or_else(|| panic!("fixture: no interface named {port}"));
-    let (want, stacked, wire, _) = s.desired(topo, bridge, dev, port, fdb, vf_macs);
+    // The port is named by the test, not derived - a fixture may put the
+    // uplink somewhere uplink_port would not, on purpose.
+    let card = topo.filter_carrier(dev);
+    let anat = crate::topology::Anatomy {
+        dev,
+        bridge,
+        port,
+        card,
+        functions: topo.physical_functions(card),
+    };
+    let (want, stacked, wire, _) = s.desired(topo, &anat, fdb, vf_macs);
     (want, stacked, wire)
 }
 
