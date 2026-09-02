@@ -80,20 +80,23 @@ def fail(msg):
     sys.exit(2)
 
 
-def filter_capacity(dev):
-    """The card's own number where devlink offers it, the CX-4 constant
-    where it does not - the same order of trust the daemon applies. A VF
-    uplink usually cannot answer; the constant then errs on the careful
-    side."""
+def filter_capacity(dev, binary):
+    """The number the daemon itself works with for this uplink's card - it
+    prints it at the top of --status ("<card>: the <driver> driver holds N
+    addresses ...") - and the CX-4 constant where it names none. Asking the
+    daemon rather than the hardware keeps the preflight in step with the
+    driver table the daemon reads."""
     try:
-        pci = os.path.basename(os.readlink(f"/sys/class/net/{dev}/device"))
-        out = run(["devlink", "dev", "param", "show", f"pci/{pci}",
-                   "name", "max_macs", "-j"]).stdout
-        vals = re.findall(r'"value":\s*(\d+)', out)
-        if vals:
-            return int(vals[0])
-    except (OSError, ValueError):
-        pass
+        out = run([binary, "--status"]).stdout
+    except OSError:
+        return FILTER_CAPACITY
+    found = {}
+    for card, n in re.findall(r"^(\S+): the \S+ driver holds (\d+) addresses", out, re.M):
+        found[card] = int(n)
+    if dev in found:
+        return found[dev]
+    if found:
+        return min(found.values())
     return FILTER_CAPACITY
 
 
@@ -543,7 +546,7 @@ def preflight(args, binary):
         # multicast self entries do not live in the UC vport list the
         # 128-entry limit is about
         occupied = sum(1 for m in self_macs(up) if int(m[:2], 16) & 1 == 0)
-        capacity = filter_capacity(up)
+        capacity = filter_capacity(up, binary)
         if occupied + TEST_MACS_TOTAL + CAPACITY_MARGIN > capacity:
             fail(f"{up} holds {occupied} entries; adding {TEST_MACS_TOTAL} would "
                  f"come within {CAPACITY_MARGIN} of the {capacity}-entry "

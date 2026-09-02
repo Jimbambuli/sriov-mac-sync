@@ -12,12 +12,13 @@
 # Addresses are registered the moment the kernel reports them and removed when
 # they move out onto the wire or their bridge port goes - an aged-out address
 # whose port still hangs in the bridge is kept, see the README. Interface
-# changes - a new NIC, a new bridge - arrive as link notifications. A VF address changed silently (a down PF, a
-# guest-side change over the driver mailbox) is caught by the fresh driver
-# question that precedes any filter growth. A learn that names a port or a
-# bridge the daemon does not know makes it re-read the picture by itself.
-# The timed pass exists for a host that is silent AND wrong, and it warns
-# when it finds work - that is what --resync is for by hand.
+# changes - a new NIC, a new bridge - arrive as link notifications, and every
+# batch and every pass reads the interfaces afresh anyway. A VF address
+# changed silently (a down PF, a guest-side change over the driver mailbox)
+# is caught by the fresh driver question that precedes any filter growth,
+# and the carried answer is asked afresh once per interval regardless. The
+# timed pass exists for a host that is silent AND wrong, and it warns when
+# it finds work - that is what --resync is for by hand.
 #RESYNC=3600
 
 # The filter capacity to respect: warn above it, and shed kept quiet

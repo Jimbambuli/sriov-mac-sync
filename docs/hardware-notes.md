@@ -7,7 +7,9 @@ read out of a datasheet.
 
 On ConnectX-4 Lx it holds 128 entries. Beyond that the driver drops addresses
 silently, and *which* is not predictable — with 257 entries a given address
-still worked, with 513 it did not.
+still worked, with 513 it did not. (It is predictable after all: mlx5 fills
+the vport list in hash order of the address's last byte and truncates the
+tail, see [driver-limits.md](driver-limits.md).)
 
 That 128 was arrived at by experiment. The number the daemon works with now
 comes from the kernel driver sources: [driver-limits.md](driver-limits.md) is

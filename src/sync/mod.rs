@@ -33,8 +33,9 @@
 //!   fast path.
 //! * **reflection** - one of our addresses turning up on the wire, and the
 //!   removal that answers it.
-//! * **ward** - the uplink's own address, registered so the host stays
-//!   reachable.
+//! * **ward** - the host's own addresses on the bridge and on what is stacked
+//!   above it, registered so the host is reachable from the VF; the uplink's
+//!   own address is excluded, not warded.
 //! * **orphan** - a note whose uplink is gone; only autodetection may
 //!   conclude that.
 //! * **carried** - state kept between passes, always revalidated before

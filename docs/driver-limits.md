@@ -9,7 +9,7 @@ against a newer tree. The kernel path is the same everywhere:
 `ndo_dflt_fdb_add` -> `dev_uc_add` -> the driver's `ndo_set_rx_mode`. The
 kernel accepts any number of entries, and the list read back from it says
 nothing about what the card holds - which is why this daemon cannot find the
-limit by reading back, and needs devlink `max_macs` or this table.
+limit by reading back, and needs this table.
 
 Two facts drive many rows. A netdev without `IFF_UNICAST_FLT` is switched to
 promiscuous mode by the kernel itself as soon as its list is non-empty, before
@@ -22,7 +22,7 @@ a driver refuses; every driver here ignores that return value.
 ## Intel drivers: unicast filter capacity per netdev and overflow behaviour
 
 Scope: `bridge fdb add <mac> dev <netdev> self permanent` -> `ndo_dflt_fdb_add` -> `dev_uc_add` -> driver `ndo_set_rx_mode`.
-Kernel source read: `/home/claude/linux/drivers/net/ethernet/intel/*` (mainline sparse checkout, 2026-09-02).
+Kernel source read: `drivers/net/ethernet/intel/*` (mainline sparse checkout, 2026-09-02).
 No Intel driver registers `DEVLINK_PARAM_GENERIC_ID_MAX_MACS` (grep over the whole intel/ tree: zero hits).
 i40e registers the *different* generic param `max_mac_per_vf` (i40e_devlink.c: `DEVLINK_PARAM_GENERIC(MAX_MAC_PER_VF, ...)`).
 
@@ -62,8 +62,8 @@ i40e registers the *different* generic param `max_mac_per_vf` (i40e_devlink.c: `
 
 ## Unicast-filter capacity per driver (mlx5, mlx4, bnxt, bnx2x)
 
-Source: mainline sparse checkout under /home/claude/linux (drivers/net/ethernet, net/core). All
-paths below are relative to /home/claude/linux/drivers/net/ethernet/ unless noted.
+Source: mainline sparse checkout under the kernel tree (drivers/net/ethernet, net/core). All
+paths below are relative to drivers/net/ethernet/ unless noted.
 
 Common core path (net/core): `bridge fdb add … self permanent` -> `rtnetlink.c:ndo_dflt_fdb_add` ->
 `dev_addr_lists.c:dev_uc_add_excl` -> `__dev_set_rx_mode`. This tree has the new
@@ -123,7 +123,7 @@ bnx2x VF are silently ineffective. No devlink `max_macs`.
 
 ## Unicast-filter capacity per driver: qede/qed, qlcnic, cxgb4/cxgb4vf, benet, sfc, nfp
 
-Source: mainline sparse checkout at /home/claude/linux (drivers/net/ethernet, net/core), read 2026-09-02.
+Source: mainline sparse checkout at the kernel tree (drivers/net/ethernet, net/core), read 2026-09-02.
 Path used by the daemon: `bridge fdb add <mac> dev <netdev> self` -> ndo_dflt_fdb_add -> dev_uc_add -> ndo_set_rx_mode.
 Core facts that apply to every row:
 - `__hw_addr_sync_dev` (net/core/dev_addr_lists.c:317) stops at the first `sync()` error and leaves the address unsynced; nothing is logged by the core, and the caller (`__dev_uc_sync`) return value is ignored by every driver below.
@@ -166,7 +166,7 @@ Core facts that apply to every row:
 
 ## Unicast-filter capacity: Marvell / Cavium / HiSilicon / Huawei drivers
 
-Source: mainline sparse checkout under `/home/claude/linux/drivers/net/ethernet` (`E=` below), `net/core/dev_addr_lists.c`.
+Source: mainline sparse checkout under `drivers/net/ethernet` (`E=` below), `net/core/dev_addr_lists.c`.
 Core facts that drive several rows: (a) `__hw_addr_sync_dev` (dev_addr_lists.c:317) calls `sync()` per unsynced
 address and **returns on the first error**, leaving that and all later addresses unsynced (retried on the next
 `ndo_set_rx_mode`). (b) A netdev **without `IFF_UNICAST_FLT`** never gets its uc list programmed: `netif_uc_promisc_update`
@@ -239,7 +239,7 @@ turns into a promiscuous-mode request. None of the drivers below registers `DEVL
 
 ## Unicast-filter capacity per driver (cloud NICs and others)
 
-Source: mainline sparse checkout under /home/claude/linux (drivers/net/ethernet, net/core), read 2026-09-02.
+Source: mainline sparse checkout under the kernel tree (drivers/net/ethernet, net/core), read 2026-09-02.
 Kernel path for `bridge fdb add <mac> dev X self permanent`: rtnl_fdb_add (NTF_SELF, no ndo_fdb_add) -> ndo_dflt_fdb_add -> dev_uc_add_excl -> __dev_set_rx_mode
 (net/core/dev_addr_lists.c). __dev_set_rx_mode: if the netdev lacks IFF_UNICAST_FLT, netif_uc_promisc_update() flips IFF_PROMISC
 (logs "<dev>: entered promiscuous mode", dev.c __dev_set_promiscuity); then ndo_set_rx_mode is called if present. No driver below

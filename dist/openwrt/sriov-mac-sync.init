@@ -36,5 +36,6 @@ stop_service() {
 }
 
 reload_service() {
-	restart
+	# SIGHUP asks the daemon for a full pass that believes nothing carried.
+	procd_send_signal sriov-mac-sync
 }

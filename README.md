@@ -54,7 +54,7 @@ Statically linked, depends on nothing — no runtime, no libc, no configuration.
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_amd64.deb
 dpkg -i sriov-mac-sync_amd64.deb
 
-# OpenWrt 24.10+ (apk) — the flags are the price of a package outside a repository
+# OpenWrt 24.10+ (apk)
 # (the stock image has uclient-fetch, not curl: uclient-fetch -O <file> <url>)
 curl -LO https://github.com/Jimbambuli/sriov-mac-sync/releases/latest/download/sriov-mac-sync_x86_64.apk
 apk add --allow-untrusted --force-non-repository ./sriov-mac-sync_x86_64.apk
@@ -166,8 +166,10 @@ hardware are welcome; those four steps are the whole test.
   role, with what happens past it: some cards go promiscuous instead, some
   never program the list at all); where the source names none, it assumes 128,
   which is what a ConnectX-4 Lx holds. The number is what the daemon warns
-  above and what it releases quiet addresses to stay under. `--max` overrides
-  it.
+  above and what it releases quiet addresses to stay under, four slots early
+  as an allowance for counting drift (one slot on a card holding four or
+  fewer). On mlx4 the table is one per physical port, shared by the PF and
+  every VF, which the daemon does not model. `--max` overrides it.
 - **It knows nothing about VLANs.** One entry covers a MAC in every VLAN. So
   registering is all-or-nothing, and an address learnt on the uplink in *any*
   VLAN is left out entirely. A kept quiet address is VLAN-blind the same way:

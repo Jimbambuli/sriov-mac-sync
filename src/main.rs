@@ -209,21 +209,20 @@ usage: sriov-mac-sync [options]
                   it carried (it leaves its pid in the state directory)
   --dry-run       report changes without applying them
   --timings       with the daemon or --once: after every pass, say what
-                  each phase cost and what it
-                  found, and name anything that failed along the way
+                  each phase cost and what it found, and name anything
+                  that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
   --interval SEC  timed pass after this many seconds of silence (default 3600)
   --max NUM       the filter capacity to respect: warn above it, and shed
                   quiet keeps as the list nears it (default 128)
   --exclude MACS  addresses never to register, comma or space separated
   --extra MACS    addresses to register unconditionally, likewise separated
-                  list every wanted address with the port it was learnt
-                  behind, longest silence last
   -h, --help      this text
       --version   print the version
 
 Pairs are found automatically: every interface with virtual functions - or
-itself a virtual function - that ends up in a bridge, following bonds.
+itself a virtual function, or a VLAN interface on either - that ends up in a
+bridge, following bonds.
 {CONF} may set PAIRS, RESYNC, MAX_MACS, EXCLUDE and EXTRA.
 See sriov-mac-sync(8) for the whole of it.
 "
@@ -461,7 +460,7 @@ fn resolve_pairs(topo: &Topology, opts: &Options) -> Result<Vec<Pair>, String> {
         }
         if found.is_empty() && !allow_empty {
             return Err("no SR-IOV interface found that ends up in a bridge \
-                 (use --pair; -v explains what was skipped)"
+                 (use --pair; the lines above say what was skipped)"
                 .into());
         }
         pairs.extend(found.into_iter().map(|(dev, bridge)| Pair { dev, bridge }));
@@ -890,6 +889,8 @@ fn run() -> Result<bool, String> {
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
             report_changes(&reports, opts.dry_run, "once");
+            // The per-address listing, for the one mode besides --status
+            // that is run by hand and read on a screen.
             {
                 for r in &reports {
                     let Some(detail) = r.detail.as_ref() else {
@@ -914,7 +915,7 @@ fn run() -> Result<bool, String> {
         Mode::Daemon => {
             let listed = pair_names(&pairs);
             note!(
-                "sriov-mac-sync {VERSION}: watching {}, full reconciliation every {}s",
+                "sriov-mac-sync {VERSION}: watching {}; a timed pass after {}s of silence",
                 if listed.is_empty() {
                     "nothing yet".to_string()
                 } else {
@@ -1051,9 +1052,9 @@ mod tests {
         }
     }
 
-    /// Every option a help line offers. "-v, --verbose" is two spellings
-    /// of one option; taking only a line's first token let the long form
-    /// escape every doc check - and the README really had forgotten it.
+    /// Every option a help line offers. "-h, --help" is two spellings of one
+    /// option; taking only a line's first token let a long form escape every
+    /// doc check - and the README really had forgotten one once.
     fn help_options(text: &str) -> Vec<String> {
         text.lines()
             .flat_map(|l| {

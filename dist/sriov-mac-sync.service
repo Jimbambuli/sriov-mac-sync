@@ -7,6 +7,8 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/sriov-mac-sync
+# SIGHUP asks for a full pass that believes nothing carried (--resync).
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 KillMode=control-group
@@ -40,8 +42,8 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-# Netlink - commands, the subscription, one devlink question - is the
-# whole of its outside world.
+# Netlink - commands and the subscription - is the whole of its outside
+# world.
 RestrictAddressFamilies=AF_NETLINK
 UMask=0077
 # Which entries are ours is noted here. Keep it across a restart, or the

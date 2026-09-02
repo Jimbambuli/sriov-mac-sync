@@ -8,8 +8,9 @@ entry, and subscribe to `RTNLGRP_NEIGH` *and* `RTNLGRP_LINK` for changes —
 interfaces matter as much as addresses, and a link message is what spends the
 carried driver answer below. No shelling out to `bridge`, no output parsing, no
 async runtime — and real error codes, which is what makes `EEXIST` and
-`ENOSPC` distinguishable instead of guessed at. Nothing outside rtnetlink:
-what a card holds comes from a table read off the kernel driver sources
+`ENOSPC` distinguishable instead of guessed at. Outside rtnetlink only a few
+`/sys` reads per card (driver, VF count, the PF behind a VF); what a card
+holds comes from a table read off the kernel driver sources
 (`src/drivers.rs`, evidence in driver-limits.md), not from the card.
 
 Topology comes from one `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
@@ -96,7 +97,12 @@ no memory — the daemon then falls back to what every build before the file
 existed did.
 
 The interface graph is read afresh for every batch and every pass — 0.4 ms
-on a 38-interface host, and nothing about it is ever carried or can go stale.
+on a 38-interface host — so nothing about it is carried across events. What
+is cached is the `/sys` side of a card (driver, the PF behind a VF), checked
+against every reading and re-read when a name no longer fits. Two moments
+remain inside one pass or batch: the graph and the forwarding dump, or the
+events and the graph read after them; a port re-enslaved between them is
+judged against the other moment for that one pass, and the next one heals it.
 What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever

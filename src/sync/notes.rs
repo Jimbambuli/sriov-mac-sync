@@ -85,7 +85,7 @@ impl Syncer {
     /// build can read (as with the index record). The first line is the
     /// marker `sriov-mac-sync ports 3`; each line after it is
     ///
-    /// <address> <port-name> <port-ifindex> <last-seen-millis>
+    /// `<address> <port-name> <port-ifindex> <last-seen-millis>`
     ///
     /// The port is written both ways: a line is believed only while the name
     /// still carries that very index, so a replaced or moved interface loses

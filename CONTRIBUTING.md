@@ -5,8 +5,8 @@
 `src/sync/mod.rs` is the core and carries the canon: the three numbered
 invariants and the project vocabulary live in its module doc. From there:
 
-    main.rs      CLI, conf file, the modes (--status/--once/--check/--flush)
-    daemon.rs    the loop: Schedule, Picture, run_pass, handle_batch
+    main.rs      CLI, conf file, the modes (--status/--once/--check/--flush/--resync)
+    daemon.rs    the loop: Schedule, run_pass, handle_batch, the card limits
     sync/mod.rs  the decisions: reconcile, the fast path, both valves
     sync/notes.rs the ownership files: locks, atomicity, the quiet memory
     netlink.rs   the wire format, hand-rolled and fuzz-tested
@@ -81,8 +81,8 @@ daemon is already at work.
 `bench/trial.py` puts a *running* daemon on trial against real hardware; see
 [docs/internals.md](docs/internals.md).
 
-CI runs all of the above, an MSRV build and a static build on every push to main
-and on pull requests.
+CI runs all of the above, the netns integration suite, the package build, an
+MSRV build and a static build on every push to main and on pull requests.
 
 ## Releasing
 

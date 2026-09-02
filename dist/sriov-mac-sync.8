@@ -1,4 +1,4 @@
-.TH SRIOV\-MAC\-SYNC 8 "August 2026" "sriov\-mac\-sync" "System Administration"
+.TH SRIOV\-MAC\-SYNC 8 "September 2026" "sriov\-mac\-sync" "System Administration"
 .SH NAME
 sriov\-mac\-sync \- keep an SR\-IOV uplink's unicast filter in step with the bridge behind it
 .SH SYNOPSIS
@@ -139,7 +139,7 @@ on a virtualisation host it names the guest: a Proxmox
 is container 106, a
 .I tap210i0
 is virtual machine 210. Addresses with no port are the structural ones: the
-bridge's own address, the uplink's ward, anything pinned by
+bridge's own address, the host's own addresses on what is stacked above it, anything pinned by
 .BR EXTRA .
 Nothing is looked up for this line, and no address is shown: the neighbour
 table would offer one, but it is emptiest exactly where this list is most
@@ -237,6 +237,11 @@ on the tmpfs there - never the overlay. OpenWrt 24.10 symlinks
 .I /run
 to it, so both spellings reach the same files there.
 .TP
+.I /run/sriov\-mac\-sync/pid
+The daemon's pid, for
+.BR \-\-resync ;
+removed on a clean stop.
+.TP
 .I /usr/lib/systemd/system/sriov\-mac\-sync.service
 The service, as installed by the Debian package.
 .TP
@@ -253,7 +258,8 @@ and
 stop the daemon and leave the registrations in the card.
 .B SIGHUP
 asks for a full pass that trusts nothing carried, as
-.BR \-\-resync . Use
+.BR \-\-resync .
+Use
 .B \-\-flush
 to take them back.
 .SH EXAMPLES
@@ -292,17 +298,22 @@ each keeps its own ownership note.
 They do share one thing: the unicast filter. A VLAN interface has none of
 its own \(em the kernel keeps its entries on the interface below it \(em so
 two such uplinks are two pairs but one list of slots. This is accounted for:
-how full a card is, is read from the interface that holds the filter, and the
-capacity is asked of that one too. Each uplink therefore sees its sister's
-entries as foreign, counts them against the limit, and never touches them.
+how full a card is, is read from the interface that holds the filter, by the
+pass and by every batch that registers, and the limit is that interface's
+driver's. Each uplink therefore sees its sister's entries as foreign, counts
+them against the limit, and never touches them.
 .PP
-A bond is different: every member has a filter of its own and the kernel
-spreads the entries over them, so a bond carries its own.
+A bond is different: the kernel copies its list to every member, each of
+which has a filter of its own, so the bond's own list is what is counted and
+the smallest member's driver names the limit.
 .SH LIMITS
-The unicast list is finite; beyond it the driver
-drops addresses silently. Hardware that can represent virtual functions as real
-bridge ports \(em switchdev with bridge offload \(em should use that instead; this
-exists for the cards that cannot.
+The unicast list is finite, and what happens beyond it is the driver's:
+most drop the extra addresses silently, some make the interface promiscuous
+instead, and some never program the list at all \(em docs/driver\-limits.md
+in the source tree says which. Four slots are always kept free as an allowance
+for counting drift; on a card holding four or fewer, one. Hardware that can
+represent virtual functions as real bridge ports \(em switchdev with bridge
+offload \(em should use that instead; this exists for the cards that cannot.
 .SH SEE ALSO
 .BR bridge (8),
 .BR ip\-link (8),
