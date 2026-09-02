@@ -20,7 +20,7 @@ mod netlink;
 mod sync;
 mod topology;
 
-use crate::daemon::{apply_card_limits, daemon_loop, read_topology, Live};
+use crate::daemon::{apply_card_limits, daemon_loop, read_topology, Live, Trigger};
 use crate::hash::Set;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
@@ -713,7 +713,7 @@ fn address_lines(detail: &sync::Detail) -> Vec<String> {
         .collect()
 }
 
-fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: &str) {
+fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: Trigger) {
     for r in reports {
         if r.foreign > 0 {
             note!(
@@ -726,7 +726,7 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: &str) {
             // The timer only fires after an interval of silence. Work found
             // then is work an event should have brought - say so, because
             // that is the one thing the timer is still for.
-            if trigger == "timed" {
+            if trigger == Trigger::Timed {
                 eprintln!(
                     "warning: {}: the timed pass found +{} -{} - an event should \
                      have brought this",
@@ -740,19 +740,21 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: &str) {
             };
             if dry_run {
                 note!(
-                    "{}: would be +{} -{}, {} address(es) in total{quiet} [{trigger}]",
+                    "{}: would be +{} -{}, {} address(es) in total{quiet} [{}]",
                     r.dev,
                     r.added,
                     r.removed,
-                    r.wanted
+                    r.wanted,
+                    trigger.label()
                 );
             } else {
                 note!(
-                    "{}: +{} -{}, {} address(es) registered{quiet} [{trigger}]",
+                    "{}: +{} -{}, {} address(es) registered{quiet} [{}]",
                     r.dev,
                     r.added,
                     r.removed,
-                    r.wanted
+                    r.wanted,
+                    trigger.label()
                 );
             }
         }
@@ -888,7 +890,7 @@ fn run() -> Result<bool, String> {
             let reports = syncer
                 .reconcile(&mut sock, true, &topo, topo_load)
                 .map_err(|e| e.to_string())?;
-            report_changes(&reports, opts.dry_run, "once");
+            report_changes(&reports, opts.dry_run, Trigger::Once);
             // The per-address listing, for the one mode besides --status
             // that is run by hand and read on a screen.
             {

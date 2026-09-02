@@ -191,10 +191,40 @@ struct Schedule {
     /// When the last full pass ran, so event storms are answered with a
     /// bounded pass rate rather than with waiting. Registrations never wait.
     last_pass: Instant,
-    /// Which of the three reasons for a pass produced work is the only way to
-    /// tell whether the timed one earns its keep.
-    trigger: &'static str,
+    /// Which reason for a pass produced work is the only way to tell whether
+    /// the timed one earns its keep.
+    trigger: Trigger,
     interval: Duration,
+}
+
+/// Why a pass runs. The label is what the journal shows and what the trial
+/// harness greps for; the variant is what the code compares, so a typo in
+/// a label cannot silently disable a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    Start,
+    Timed,
+    Operator,
+    Recovery,
+    LostEvents,
+    InterfaceChange,
+    ForwardingChange,
+    Once,
+}
+
+impl Trigger {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Trigger::Start => "start",
+            Trigger::Timed => "timed",
+            Trigger::Operator => "operator",
+            Trigger::Recovery => "recovery",
+            Trigger::LostEvents => "lost events",
+            Trigger::InterfaceChange => "interface change",
+            Trigger::ForwardingChange => "forwarding change",
+            Trigger::Once => "once",
+        }
+    }
 }
 
 impl Schedule {
@@ -202,7 +232,7 @@ impl Schedule {
         Self {
             next_full: now,
             last_pass: now - interval,
-            trigger: "start",
+            trigger: Trigger::Start,
             interval,
         }
     }
@@ -230,18 +260,18 @@ impl Schedule {
     fn completed(&mut self, now: Instant) {
         self.last_pass = now;
         self.next_full = now + self.interval;
-        self.trigger = "timed";
+        self.trigger = Trigger::Timed;
     }
 
     /// A batch wants a pass sooner. Everything that does goes through here.
-    fn bring_forward(&mut self, due: Instant, trigger: &'static str) {
+    fn bring_forward(&mut self, due: Instant, trigger: Trigger) {
         self.next_full = self.next_full.min(due);
         self.trigger = trigger;
     }
 
     /// Nothing carried over may be believed and the pass cannot wait: a failed
     /// wait, or notifications the kernel dropped.
-    fn at_once(&mut self, now: Instant, trigger: &'static str) {
+    fn at_once(&mut self, now: Instant, trigger: Trigger) {
         self.next_full = now;
         self.trigger = trigger;
     }
@@ -287,7 +317,7 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
         // The operator knocked: now, and believe nothing.
         if world.resync_wanted() {
             syncer.vf_stale = true;
-            schedule.at_once(world.now(), "operator");
+            schedule.at_once(world.now(), Trigger::Operator);
         }
         let now = world.now();
         if now.saturating_duration_since(vf_fresh) >= interval {
@@ -329,7 +359,7 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
                     world.pause(RETRY_AFTER);
                 }
                 wait_failures = wait_failures.saturating_add(1);
-                schedule.at_once(world.now(), "recovery");
+                schedule.at_once(world.now(), Trigger::Recovery);
                 syncer.vf_stale = true;
                 continue;
             }
@@ -346,7 +376,7 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
             // believed.
             Err(e) => {
                 eprintln!("warning: lost neighbour notifications: {e}");
-                schedule.at_once(world.now(), "lost events");
+                schedule.at_once(world.now(), Trigger::LostEvents);
                 syncer.vf_stale = true;
                 continue;
             }
@@ -380,7 +410,7 @@ fn run_pass<W: World>(
     syncer: &mut Syncer,
     last: &mut Option<Topology>,
     opts: &Options,
-    trigger: &'static str,
+    trigger: Trigger,
     state: &mut LoopState,
 ) -> Pass {
     // Nothing to work from fails closed; the caller comes back soon.
@@ -423,7 +453,11 @@ fn run_pass<W: World>(
         Ok(reports) => {
             report_changes(&reports, opts.dry_run, trigger);
             if opts.timings {
-                note!("pass [{}]\n{}", trigger, syncer.timings.report().trim_end());
+                note!(
+                    "pass [{}]\n{}",
+                    trigger.label(),
+                    syncer.timings.report().trim_end()
+                );
             }
             Pass::Done
         }
@@ -448,15 +482,15 @@ fn handle_batch<W: World>(
     last: &mut Option<Topology>,
     events: &netlink::Events,
     last_pass: Instant,
-) -> Option<(Instant, &'static str)> {
+) -> Option<(Instant, Trigger)> {
     if events.fdb.is_empty() && !events.links_changed {
         return None; // something else's neighbour, not a bridge's
     }
     // A batch carrying both kinds is called a forwarding change.
     let trigger = if events.fdb.is_empty() {
-        "interface change"
+        Trigger::InterfaceChange
     } else {
-        "forwarding change"
+        Trigger::ForwardingChange
     };
     // Whether the batch left anything for a pass. A pass dumps the whole
     // forwarding table, so a batch that was entirely somebody else's must not
@@ -467,15 +501,29 @@ fn handle_batch<W: World>(
         sync::Urgency::Nothing
     };
 
-    // A fresh reading for every batch. What the batch's link messages were
-    // about is judged against the reading before it as well, because an
-    // interface that has just gone is only in that one.
-    let fresh = match read_picture(world) {
-        Ok((topo, _)) => Some(topo),
-        Err(e) => {
-            eprintln!("warning: {e}");
-            None
+    // A fresh reading for every batch that could register or that changed
+    // an interface. What the batch's link messages were about is judged
+    // against the reading before it as well, because an interface that has
+    // just gone is only in that one. A deletions-only batch - the commonest
+    // kind on a quiet host, an ageing table by the hundred - only dates the
+    // silence, and the reading before is good enough for that: a bridge's
+    // ageing time and any restacking arrive as link messages, which force
+    // the read.
+    let needs_reading = events.links_changed
+        || events
+            .fdb
+            .iter()
+            .any(|(kind, _)| *kind == netlink::RTM_NEWNEIGH);
+    let fresh = if needs_reading {
+        match read_picture(world) {
+            Ok((topo, _)) => Some(topo),
+            Err(e) => {
+                eprintln!("warning: {e}");
+                None
+            }
         }
+    } else {
+        None
     };
     if !events.changed_links.is_empty()
         && (fresh.is_none()
@@ -484,7 +532,12 @@ fn handle_batch<W: World>(
         // Nothing readable to judge with spends the carried answer too.
         syncer.vf_stale = true;
     }
-    match &fresh {
+    let judged_by = if needs_reading {
+        fresh.as_ref()
+    } else {
+        last.as_ref()
+    };
+    match judged_by {
         // The whole batch, both kinds; what each means is the fast path's
         // business (see `fast_apply`).
         Some(topo) => match syncer.fast_apply(world, topo, &events.fdb) {
@@ -694,9 +747,13 @@ mod tests {
         let now = Instant::now();
         let interval = Duration::from_secs(300);
         let mut s = Schedule::new(now, interval);
-        assert_eq!(s.trigger, "start", "the first pass is the restart catch-up");
+        assert_eq!(
+            s.trigger,
+            Trigger::Start,
+            "the first pass is the restart catch-up"
+        );
         s.completed(now);
-        assert_eq!(s.trigger, "timed", "the default between events");
+        assert_eq!(s.trigger, Trigger::Timed, "the default between events");
         assert!(
             !s.pass_due(now + interval / 2),
             "a completed pass pushes the timer a whole interval out"
@@ -705,20 +762,22 @@ mod tests {
             s.pass_due(now + interval),
             "and after an interval of silence it fires"
         );
-        s.bring_forward(now, "forwarding change");
+        s.bring_forward(now, Trigger::ForwardingChange);
         assert_eq!(
-            s.trigger, "forwarding change",
+            s.trigger,
+            Trigger::ForwardingChange,
             "an event keeps its own label"
         );
         s.retry_soon(now);
         assert_eq!(
-            s.trigger, "forwarding change",
+            s.trigger,
+            Trigger::ForwardingChange,
             "the retried pass forgot whose pass it was"
         );
-        s.at_once(now, "recovery");
-        assert_eq!(s.trigger, "recovery");
+        s.at_once(now, Trigger::Recovery);
+        assert_eq!(s.trigger, Trigger::Recovery);
         s.completed(now);
-        assert_eq!(s.trigger, "timed");
+        assert_eq!(s.trigger, Trigger::Timed);
     }
 
     /// The kernel source answers for each card by driver and role; the
@@ -1348,13 +1407,13 @@ mod tests {
             let start = Instant::now();
             let mut sched = Schedule::new(start, Duration::from_secs(300));
             // A pass is due at once.
-            sched.at_once(start, "recovery");
+            sched.at_once(start, Trigger::Recovery);
             assert!(sched.pass_due(start));
             // The timer comes round: it may not push that pass away.
             let later = start + Duration::from_secs(600);
             assert!(sched.pass_due(later), "a due pass stays due");
             // Neither may a batch that only wants one soon.
-            sched.bring_forward(later + Duration::from_secs(60), "forwarding change");
+            sched.bring_forward(later + Duration::from_secs(60), Trigger::ForwardingChange);
             assert!(
                 sched.pass_due(later),
                 "a batch pushed a pass that was already due"
@@ -1503,8 +1562,8 @@ mod tests {
                 "a link change nothing could judge kept the carried answer"
             );
             assert_eq!(
-                bought.map(|(_, label)| label),
-                Some("interface change"),
+                bought.map(|(_, t)| t),
+                Some(Trigger::InterfaceChange),
                 "a batch nothing could judge has to buy a pass, under its own name"
             );
             // And a learning batch without a reading registers nothing but
@@ -1519,7 +1578,7 @@ mod tests {
                 },
                 started,
             );
-            assert_eq!(bought.map(|(_, label)| label), Some("forwarding change"));
+            assert_eq!(bought.map(|(_, t)| t), Some(Trigger::ForwardingChange));
             assert!(
                 world.fdb.added.is_empty(),
                 "nothing may be registered blind"

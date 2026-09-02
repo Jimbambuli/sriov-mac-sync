@@ -67,8 +67,6 @@ pub(super) struct Said {
     pub over: Set<String>,
     /// a batch found no room
     pub tight: Set<String>,
-    /// which addresses are being kept quiet, per device
-    pub quiet: Map<String, Set<Mac>>,
     /// the note could not be read
     pub unreadable: Set<String>,
     /// the note's lock could not be taken
@@ -88,7 +86,6 @@ impl Said {
             extra,
             over,
             tight,
-            quiet,
             unreadable,
             lock,
             ports,
@@ -98,7 +95,6 @@ impl Said {
         extra.remove(dev);
         over.remove(dev);
         tight.remove(dev);
-        quiet.remove(dev);
         unreadable.remove(dev);
         lock.remove(dev);
         ports.remove(dev);
@@ -116,14 +112,12 @@ impl Said {
             extra,
             over,
             tight,
-            quiet,
             ..
         } = self;
         unknown_vf.remove(dev);
         extra.remove(dev);
         over.remove(dev);
         tight.remove(dev);
-        quiet.remove(dev);
     }
 
     /// A device renamed: what was said stays said under the new name.
@@ -133,7 +127,6 @@ impl Said {
             extra,
             over,
             tight,
-            quiet,
             unreadable,
             lock,
             ports,
@@ -144,10 +137,8 @@ impl Said {
                 set.insert(new.to_string());
             }
         }
-        for map in [extra, quiet] {
-            if let Some(v) = map.remove(old) {
-                map.insert(new.to_string(), v);
-            }
+        if let Some(v) = extra.remove(old) {
+            extra.insert(new.to_string(), v);
         }
     }
 }
@@ -245,8 +236,12 @@ struct Carried {
     /// not: by construction free of pinned EXTRA addresses, anything still
     /// wanted, foreign entries and addresses the note does not name. A pass
     /// that could not read its note keeps nothing, so the event path sheds
-    /// nothing either.
+    /// nothing either. Also the "already said" set of the [quiet] note.
     quiet: Set<Mac>,
+    /// What the pass saw on the wire, plus what reflections since took out:
+    /// an address on the wire in one VLAN and behind the bridge in another
+    /// must not flap in and out of the filter on every learn.
+    wire: Set<Mac>,
     /// When that pass ran, in the boot-clock the addresses are stamped in: an
     /// address whose stamp predates the last pass is one the last pass did
     /// not see.
@@ -418,10 +413,6 @@ pub struct Syncer {
     /// The interface index last recorded beside each note, so the record
     /// is written when the answer changes rather than once per pass.
     indices: std::cell::RefCell<Map<String, u32>>,
-    /// Which addresses the last pass saw on the wire, per uplink: the fast
-    /// path has no dump, and an address on the wire in one VLAN and behind
-    /// the bridge in another must not flap in and out on every learn.
-    carried_wire: Map<String, Set<Mac>>,
     /// The bridge port each owned address was last learnt behind, per uplink,
     /// with when the bridge was last seen holding it (milliseconds since
     /// boot).
@@ -590,7 +581,6 @@ impl Syncer {
             absent_since: crate::hash::map(),
             dir_checked: std::cell::Cell::new(false),
             dir_list_warned: std::cell::Cell::new(false),
-            carried_wire: crate::hash::map(),
             carried_ports: crate::hash::map(),
             ports_loaded: crate::hash::set(),
             ports_written: crate::hash::map(),
@@ -734,17 +724,12 @@ impl Syncer {
                             self.ports_written.remove(&new_name);
                             // Every said-once mark in one call - see Said.
                             self.said.borrow_mut().rename(&dev, &new_name);
-                            // The wire set follows for the same reason: the fast
-                            // path would otherwise judge the renamed uplink
-                            // against an empty set - or the old name's set
-                            // against whoever inherits it.
-                            if let Some(wire) = self.carried_wire.remove(&dev) {
-                                self.carried_wire.insert(new_name.clone(), wire);
-                            }
-                            // The capacity arithmetic follows too - moot when
-                            // the migrating pass also reconciles the new
-                            // name, not when it skips the pair while the
-                            // event path keeps registering for it.
+                            // The pass's leavings follow - the wire set, or
+                            // the fast path would judge the renamed uplink
+                            // against an empty one; the keeps and occupancy,
+                            // moot when the migrating pass also reconciles
+                            // the new name, not when it skips the pair while
+                            // the event path keeps registering for it.
                             if let Some(c) = self.carried.remove(&dev) {
                                 self.carried.insert(new_name.clone(), c);
                             }
@@ -837,9 +822,8 @@ impl Syncer {
             } else {
                 self.said.borrow_mut().retire(&dev);
             }
-            // Neither a month-old wire set nor a stale capacity warning
-            // greets a device that returns.
-            self.carried_wire.remove(&dev);
+            // Neither a month-old wire set nor stale keeps greet a device
+            // that returns.
             self.carried.remove(&dev);
             // remove_note took the file; a device that returns as a pair
             // reads afresh rather than believing this run's leftovers.
@@ -1897,8 +1881,8 @@ impl Syncer {
             // as its VF's own over the driver mailbox. Asked once per entry
             // into the state: the say-once set is what the last pass kept, so
             // anything kept now and not in it has just gone quiet.
-            let newly_quiet = match self.said.borrow().quiet.get(&pair.dev) {
-                Some(said) => w.kept.iter().any(|m| !said.contains(m)),
+            let newly_quiet = match self.carried.get(&pair.dev) {
+                Some(c) => w.kept.iter().any(|m| !c.quiet.contains(m)),
                 None => !w.kept.is_empty(),
             };
             if vf_carried && (newly_quiet || w.want.iter().any(|m| !present.contains(m))) {
@@ -1947,8 +1931,6 @@ impl Syncer {
             }
             *warned = unpinned;
             drop(said);
-
-            self.carried_wire.insert(pair.dev.clone(), wire);
 
             // Kept addresses cost slots, and past capacity the card drops
             // silently - so they are surrendered first as the list nears the
@@ -2017,10 +1999,12 @@ impl Syncer {
 
             // Said once per entry into the quiet state: ageing comes in
             // bursts, and seventeen thousand identical journal lines a day
-            // teach an operator to stop reading.
-            let mut marks = self.said.borrow_mut();
-            let said = marks.quiet.entry(pair.dev.clone()).or_default();
-            let fresh_quiet = kept.iter().filter(|m| !said.contains(*m)).count();
+            // teach an operator to stop reading. What the last pass kept is
+            // the set already said.
+            let fresh_quiet = match self.carried.get(&pair.dev) {
+                Some(c) => kept.iter().filter(|m| !c.quiet.contains(*m)).count(),
+                None => kept.len(),
+            };
             if apply && fresh_quiet > 0 {
                 note!(
                     "{}: {fresh_quiet} address(es) aged out of the bridge but \
@@ -2028,8 +2012,6 @@ impl Syncer {
                     pair.dev
                 );
             }
-            *said = kept.clone();
-            drop(marks);
 
             let mut owned = owned_before.clone();
             let mut added = 0usize;
@@ -2185,6 +2167,7 @@ impl Syncer {
                     // ground until it reads back itself.
                     occupancy: occupied,
                     quiet: kept.clone(),
+                    wire,
                     // A pass that could not read its note refreshed no stamp,
                     // so it must not advance the ground either: every live
                     // guest would read as quiet.
@@ -2443,9 +2426,10 @@ impl Syncer {
             // replaces this set, and wire-side learning no longer schedules
             // one.
             if !retired.removed.is_empty() {
-                self.carried_wire
+                self.carried
                     .entry(fp.dev.clone())
                     .or_default()
+                    .wire
                     .extend(retired.removed);
             }
         }
@@ -2699,9 +2683,9 @@ impl Syncer {
             //   until
             // the timer.
             if self
-                .carried_wire
+                .carried
                 .get(&fp.dev)
-                .is_some_and(|w| w.contains(&entry.mac))
+                .is_some_and(|c| c.wire.contains(&entry.mac))
             {
                 ours = true;
                 continue;

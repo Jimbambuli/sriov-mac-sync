@@ -475,24 +475,6 @@ impl Topology {
                     .collect();
                 link.pf_netdevs.sort_unstable();
                 link.physfn = link.pf_netdevs.first().copied();
-                if link.numvfs > 0 {
-                    if let Ok(rd) = fs::read_dir(base.join("device")) {
-                        for e in rd.flatten() {
-                            if !e.file_name().to_string_lossy().starts_with("virtfn") {
-                                continue;
-                            }
-                            if let Ok(nets) = fs::read_dir(e.path().join("net")) {
-                                for n in nets.flatten() {
-                                    if let Some(i) =
-                                        n.file_name().to_str().and_then(|n| by_name.get(n))
-                                    {
-                                        link.vf_netdevs.push(*i);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
             out.push(link);
         }
@@ -514,6 +496,25 @@ impl Topology {
             if let Some(i) = at.get(&master) {
                 out[*i].lowers.push(port);
             }
+        }
+        // A PF's host-bound VF netdevs are the inverse of the VFs' PF
+        // relation, which the facts cache already holds - one directory
+        // walk per PF per reading fewer, and the same answer: both are
+        // sysfs's view of this namespace. On a shared function (mlx4) every
+        // port netdev lists the VF, as `physfn/net` lists every port.
+        let mut vfs_of: Vec<(u32, u32)> = Vec::new();
+        for l in &out {
+            for pf in &l.pf_netdevs {
+                vfs_of.push((*pf, l.index));
+            }
+        }
+        for (pf, vf) in vfs_of {
+            if let Some(i) = at.get(&pf) {
+                out[*i].vf_netdevs.push(vf);
+            }
+        }
+        for l in &mut out {
+            l.vf_netdevs.sort_unstable();
         }
         Self::assemble(out, by_name)
     }

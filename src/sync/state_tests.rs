@@ -418,7 +418,7 @@ fn the_fast_path_agrees_with_the_full_pass_on_every_fixture_entry() {
     let vf = vec![(2, VF_ADMIN)];
     let mut s = ready_syncer(&dir);
     let (want, _, wire) = desired_named(&s, &topo, &pair(), "nic1", &fdb(), &vf);
-    s.carried_wire.insert("nic1".into(), wire);
+    s.carried.entry("nic1".into()).or_default().wire = wire;
     s.remember_vf(vec![2], vf.clone());
 
     for entry in fdb() {
@@ -2196,8 +2196,7 @@ fn an_address_the_wire_set_still_holds_still_buys_a_pass() {
     let mut s = ready_syncer(&dir);
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     // The last pass saw this address out on the wire.
-    s.carried_wire
-        .insert("nic1".into(), [BEHIND_NIC].into_iter().collect::<Set<_>>());
+    s.carried.entry("nic1".into()).or_default().wire = [BEHIND_NIC].into_iter().collect::<Set<_>>();
 
     let mut sock = FakeSock::default();
     let urgency = s
@@ -3475,7 +3474,6 @@ fn forgetting_a_device_leaves_no_mark_behind() {
     said.extra.insert(d.clone(), [mac(1)].into_iter().collect());
     said.over.insert(d.clone());
     said.tight.insert(d.clone());
-    said.quiet.insert(d.clone(), [mac(2)].into_iter().collect());
     said.unreadable.insert(d.clone());
     said.lock.insert(d.clone());
     said.ports.insert(d.clone());
@@ -3495,8 +3493,6 @@ fn renaming_a_device_carries_every_mark() {
         .insert("a".into(), [mac(1)].into_iter().collect());
     said.over.insert("a".into());
     said.tight.insert("a".into());
-    said.quiet
-        .insert("a".into(), [mac(2)].into_iter().collect());
     said.unreadable.insert("a".into());
     said.lock.insert("a".into());
     said.ports.insert("a".into());
@@ -3509,9 +3505,6 @@ fn renaming_a_device_carries_every_mark() {
         .insert("b".into(), [mac(1)].into_iter().collect());
     erwartet.over.insert("b".into());
     erwartet.tight.insert("b".into());
-    erwartet
-        .quiet
-        .insert("b".into(), [mac(2)].into_iter().collect());
     erwartet.unreadable.insert("b".into());
     erwartet.lock.insert("b".into());
     erwartet.ports.insert("b".into());
