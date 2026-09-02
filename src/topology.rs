@@ -866,6 +866,12 @@ pub(crate) mod fixture {
             self
         }
 
+        /// The driver behind the interface, as sysfs names it.
+        pub fn driver(mut self, name: &str) -> Self {
+            self.last().driver = Some(name.to_string());
+            self
+        }
+
         pub fn physfn(mut self, pf: &str) -> Self {
             self.last_names().physfn = Some(pf.to_string());
             self

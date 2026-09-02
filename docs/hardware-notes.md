@@ -15,10 +15,15 @@ parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
 function and its VFs, which is exactly the experimental figure. The daemon asks
 over devlink at startup — and again when a pair appears at runtime — and both
 warns above what the card says and releases quiet addresses to stay under it; `--max` or
-`MAX_MACS` overrides it, and a card that says nothing leaves the assumed 128 in
-place. The daemon reports the card's answer, or its silence, at start; a
-written-down `--max` settles the number before devlink is ever asked, so
-nothing is printed for it.
+`MAX_MACS` overrides it. A card that says nothing - every driver but mlx4 and
+mlx5 - is answered from the kernel source where that names a number:
+[driver-limits.md](driver-limits.md) is the evidence, `src/drivers.rs` the
+table the daemon reads, one row per driver and role. bnxt holds 4, an
+untrusted iavf about 12, igbvf 3; several VF drivers never program the list at
+all (ena, mana, bnx2x, qede untrusted, fm10k), and the daemon says so at start.
+Where the limit lives in firmware the assumed 128 stays. The daemon reports
+the card's answer, or its silence, at start; a written-down `--max` settles the
+number before devlink is ever asked, so nothing is printed for it.
 
 devlink is not otherwise used and cannot be: it has no forwarding database, no
 unicast filter and no neighbour notifications. This one number is the whole of

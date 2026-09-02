@@ -8,7 +8,9 @@ use crate::netlink::Socket;
 use crate::sync::{self, Pair, Syncer};
 use crate::topology::Topology;
 use crate::Options;
-use crate::{clamp_max_macs, devlink, netlink, note, pair_names, report_changes, stopping};
+use crate::{
+    clamp_max_macs, devlink, drivers, netlink, note, pair_names, report_changes, stopping,
+};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -555,10 +557,11 @@ fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, topo: &Topology) 
     let answers = world.filter_capacities(&filter_carriers(&devs, Some(topo)));
     let all_present = devs.iter().all(|d| topo.index_of(d).is_some());
     syncer.capacity_settled = all_present && answers.iter().all(|(_, a)| a.is_ok());
-    for (karte, wert) in reported_capacities(answers.clone(), syncer.max_macs) {
-        syncer.max_macs_je_karte.insert(karte, wert);
+    let usable = card_capacities(answers, syncer.max_macs, topo);
+    for (karte, wert) in &usable {
+        syncer.max_macs_je_karte.insert(karte.clone(), *wert);
     }
-    adopt_reported_capacity(answers, syncer.max_macs)
+    adopt_capacity(&usable, syncer.max_macs)
 }
 
 /// The interfaces that really hold the uplinks' filters: the uplink itself,
@@ -583,61 +586,75 @@ pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<S
     aus
 }
 
-/// What the cards reported, per card, plus the minimum as the default for
-/// everything that reported nothing - so a large card does not work to the
-/// smallest one's measure.
-pub(crate) fn reported_capacities(
+/// What each card holds, by the interface holding the filter: what it
+/// reported over devlink, else what the kernel source says its driver does
+/// (see `drivers`), else nothing - the assumed number then stands. Said per
+/// card, once per asking. A driver that never programs the list on this
+/// role is a warning: nothing this daemon registers there takes effect.
+pub(crate) fn card_capacities(
     answers: Vec<(String, CapacityAnswer)>,
     assumed: usize,
+    topo: &Topology,
 ) -> Vec<(String, usize)> {
     let mut usable: Vec<(String, usize)> = Vec::new();
     for (dev, answer) in answers {
         match answer {
             Ok(Some(v)) => match clamp_max_macs(v as usize) {
                 Ok(v) => usable.push((dev, v)),
-                Err(_) => {
-                    note!("{dev}: reported capacity {v} is unusable, ignored");
-                }
+                Err(_) => note!("{dev}: reported capacity {v} is unusable, ignored"),
             },
             Ok(None) => {
-                note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
+                let link = topo.index_of(&dev).and_then(|i| topo.at(i));
+                let known = link.and_then(|l| {
+                    l.driver
+                        .as_deref()
+                        .and_then(|d| drivers::filter_of(d, l.physfn.is_some()).map(|f| (d, f)))
+                });
+                match known {
+                    Some((driver, f)) if f.past == drivers::Past::Ignored => eprintln!(
+                        "warning: {dev}: the {driver} driver never programs a unicast \
+                         list on this interface - nothing registered here takes effect"
+                    ),
+                    Some((driver, f)) => {
+                        let past = match f.past {
+                            drivers::Past::Drops => "drops silently",
+                            drivers::Past::Promisc => "goes unicast-promiscuous",
+                            drivers::Past::Hashes => "falls back to a hash filter",
+                            drivers::Past::Ignored => unreachable!(),
+                        };
+                        match f.holds {
+                            Some(n) => {
+                                note!(
+                                    "{dev}: no capacity reported; the {driver} driver holds \
+                                     {n} by the kernel source and {past} past that"
+                                );
+                                usable.push((dev, n));
+                            }
+                            None => note!(
+                                "{dev}: no capacity reported and the {driver} driver's limit \
+                                 lives in firmware; keeping the assumed {assumed}, and it \
+                                 {past} past its real one"
+                            ),
+                        }
+                    }
+                    None => {
+                        note!("{dev}: no filter capacity reported; keeping the assumed {assumed}")
+                    }
+                }
             }
-            Err(e) => {
-                note!("{dev}: could not ask for the filter capacity: {e}");
-            }
+            Err(e) => note!("{dev}: could not ask for the filter capacity: {e}"),
         }
     }
     usable
 }
 
-pub(crate) fn adopt_reported_capacity(
-    answers: Vec<(String, CapacityAnswer)>,
-    assumed: usize,
-) -> Option<usize> {
-    let mut usable: Vec<(String, usize)> = Vec::new();
-    for (dev, answer) in answers {
-        match answer {
-            Ok(Some(v)) => match clamp_max_macs(v as usize) {
-                Ok(v) => usable.push((dev, v)),
-                Err(_) => {
-                    note!("{dev}: reported capacity {v} is unusable, ignored");
-                }
-            },
-            Ok(None) => {
-                note!("{dev}: no filter capacity reported; keeping the assumed {assumed}");
-            }
-            Err(e) => {
-                note!("{dev}: could not ask for the filter capacity: {e}");
-            }
-        }
-    }
-    let (dev, value) = usable.into_iter().min_by_key(|(_, v)| *v)?;
-    if value == assumed {
-        // Worth saying only to somebody who asked what was skipped: the
-        // number moved nowhere, but that it was *asked for* is the
-        // difference between a card that agrees and a card that is silent.
+/// The smallest usable capacity as the number to warn at: one number governs
+/// every uplink, and the filter that fills first drops addresses. `None`
+/// means the assumed threshold stands.
+pub(crate) fn adopt_capacity(usable: &[(String, usize)], assumed: usize) -> Option<usize> {
+    let (dev, value) = usable.iter().min_by_key(|(_, v)| *v)?;
+    if *value == assumed {
         note!("{dev} says its filter holds {value} addresses, which is what was assumed");
-
         return None;
     }
     note!(
@@ -645,7 +662,7 @@ pub(crate) fn adopt_reported_capacity(
          {assumed}; warning above that, and releasing quiet addresses as the \
          list comes near it"
     );
-    Some(value)
+    Some(*value)
 }
 
 #[cfg(test)]
@@ -695,9 +712,12 @@ mod tests {
     #[test]
     fn the_reported_capacity_policy() {
         let dev = |d: &str, a: CapacityAnswer| (d.to_string(), a);
+        let topo = crate::topology::fixture::Builder::new().build();
+        let adopt =
+            |answers, assumed| adopt_capacity(&card_capacities(answers, assumed, &topo), assumed);
         // The smallest usable answer wins across uplinks.
         assert_eq!(
-            adopt_reported_capacity(
+            adopt(
                 vec![dev("nic0", Ok(Some(256))), dev("nic1", Ok(Some(64)))],
                 128
             ),
@@ -705,30 +725,62 @@ mod tests {
         );
         // A card reporting nonsense is ignored, not a veto on the good one.
         assert_eq!(
-            adopt_reported_capacity(
+            adopt(
                 vec![dev("nic0", Ok(Some(0))), dev("nic1", Ok(Some(64)))],
                 128
             ),
             Some(64)
         );
         // Nothing usable at all leaves the default standing.
-        assert_eq!(
-            adopt_reported_capacity(vec![dev("nic0", Ok(Some(0)))], 128),
-            None
-        );
+        assert_eq!(adopt(vec![dev("nic0", Ok(Some(0)))], 128), None);
         // Agreement is not a change.
-        assert_eq!(
-            adopt_reported_capacity(vec![dev("nic0", Ok(Some(128)))], 128),
-            None
-        );
+        assert_eq!(adopt(vec![dev("nic0", Ok(Some(128)))], 128), None);
         // Silence and failure leave the default standing.
         assert_eq!(
-            adopt_reported_capacity(
+            adopt(
                 vec![dev("nic0", Ok(None)), dev("nic1", Err("no".into()))],
                 128
             ),
             None
         );
+    }
+
+    /// Where the card says nothing, the kernel source may: a driver the
+    /// table knows answers for its role, one it does not leaves the assumed
+    /// number, and a driver that ignores the list never sets a limit.
+    #[test]
+    fn a_silent_card_is_answered_by_its_driver_where_the_source_names_a_number() {
+        use crate::topology::fixture::{mac, Builder};
+        let topo = Builder::new()
+            .add("bx", 2, Some(mac(1)))
+            .driver("bnxt_en")
+            .add("bxv", 3, Some(mac(2)))
+            .driver("bnxt_en")
+            .physfn("bx")
+            .add("mx", 4, Some(mac(3)))
+            .driver("mlx5_core")
+            .add("ena0", 5, Some(mac(4)))
+            .driver("ena")
+            .add("veth", 6, Some(mac(5)))
+            .build();
+        let silent = |d: &str| (d.to_string(), Ok(None));
+        let usable = card_capacities(
+            vec![
+                silent("bx"),
+                silent("bxv"),
+                silent("mx"),
+                silent("ena0"),
+                silent("veth"),
+            ],
+            128,
+            &topo,
+        );
+        assert_eq!(
+            usable,
+            vec![("bx".to_string(), 4), ("bxv".to_string(), 4)],
+            "bnxt holds 4 on both roles; mlx5 and ena leave the assumed number"
+        );
+        assert_eq!(adopt_capacity(&usable, 128), Some(4));
     }
 
     mod loop_tests {

@@ -162,9 +162,12 @@ hardware are welcome; those four steps are the whole test.
 
 - **The filter list is finite, and past its end the driver drops addresses
   silently.** Where the card reports its capacity through devlink the daemon
-  asks and respects that; where it does not, it assumes 128, which is what a
-  ConnectX-4 Lx holds. The number is what the daemon warns above and what it
-  releases quiet addresses to stay under. `--max` overrides both.
+  asks and respects that; where it does not, it uses what the kernel driver's
+  own source says the card holds ([docs/driver-limits.md](docs/driver-limits.md),
+  one row per driver and role); where neither names a number, it assumes 128,
+  which is what a ConnectX-4 Lx holds. The number is what the daemon warns
+  above and what it releases quiet addresses to stay under. `--max` overrides
+  all of it.
 - **It knows nothing about VLANs.** One entry covers a MAC in every VLAN. So
   registering is all-or-nothing, and an address learnt on the uplink in *any*
   VLAN is left out entirely. A kept quiet address is VLAN-blind the same way:
