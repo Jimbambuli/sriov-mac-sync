@@ -22,8 +22,11 @@ their limit instead of dropping; and several VF drivers never program the list
 at all (ena, mana, bnx2x, qede untrusted, fm10k), which the daemon says at
 start because nothing registered there takes effect. Where trust decides -
 bnxt, qede, hns3, rvu and the Intel VF drivers - the daemon reads the PF's
-answer and says whom its number is for; a VF whose address the PF set without
-trusting it gets a warning, because those PFs then refuse every other address.
+answer and says whom its number is for, and for the Intel VF drivers, bnxt and
+hinic adds that a PF-set address on an untrusted function would have the PF
+refuse every other - which it cannot read, only say. On pve4's i40e the
+untrusted limit is real: past 18 filters the PF logs "Cannot add more MAC
+addresses, VF is not trusted" while the kernel list keeps growing.
 Where the limit lives in firmware the assumed 128 stays. `--max` or `MAX_MACS`
 overrides all of it.
 

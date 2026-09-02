@@ -21,10 +21,16 @@ PF vf N trust on` lifts bnxt's promisc veto, turns qede's and rvu's dropped
 promisc request into a working one, opens hns3's promisc fallback and the
 i40e/ice formula for iavf; and on the Intel VF drivers, bnxt and hinic a PF
 that set the function's address without trusting it refuses every other
-address outright. The daemon reads trust and the PF-set address off the PF's
-VF list (`IFLA_VF_TRUST`, `IFLA_VF_MAC`) for exactly these drivers - the table
-in `src/drivers.rs` carries a `TrustedVf` row where the answer changes, and a
-list of the drivers that lock - and treats unknown trust as none.
+address outright. The daemon reads trust off the PF's VF list
+(`IFLA_VF_TRUST`) for exactly these drivers - the table in `src/drivers.rs`
+carries a `TrustedVf` row where the answer changes, and a list of the drivers
+that lock - and treats unknown trust as none. Whether the PF set the address it
+cannot read: `IFLA_VF_MAC` shows the function's own address the same way
+(i40e copies the VF's first address into `default_lan_addr`, ixgbe hands every
+VF a random one at creation), so the daemon says what a PF-set address would
+mean rather than claiming one. Seen on pve4's i40e: an untrusted iavf uplink
+carrying a trial's 33 addresses had the PF log "Cannot add more MAC addresses,
+VF is not trusted" past 18 - the kernel list held all 33, the card did not.
 
 
 ---

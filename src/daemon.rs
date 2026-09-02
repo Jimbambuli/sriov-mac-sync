@@ -595,13 +595,15 @@ pub(crate) fn filter_carriers(devs: &[String], topo: &Topology) -> Vec<String> {
 }
 
 /// What the physical function says about a VF card, where the driver's
-/// answer depends on it: trust, and whether the PF set the address without
-/// trusting the function - the lock some PFs put on the list. `lift` is
-/// the command that changes it, for the message.
+/// answer depends on it: trust, and the command that changes it, for the
+/// message. Whether the PF set the function's address - the other half of
+/// the lock some PFs put on an untrusted function's list - is not
+/// observable: IFLA_VF_MAC shows the function's own address just the same
+/// on i40e and ixgbe, so the message says what would follow rather than
+/// claiming it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Standing {
     trusted: Option<bool>,
-    locked: bool,
     lift: Option<String>,
 }
 
@@ -620,7 +622,6 @@ fn judge(
     }
     let unknown = Standing {
         trusted: None,
-        locked: false,
         lift: None,
     };
     let standing = match (l.physfn, l.vf_number) {
@@ -636,9 +637,6 @@ fn judge(
             {
                 Some(i) => Standing {
                     trusted: i.trusted,
-                    locked: i.trusted == Some(false)
-                        && i.mac != [0u8; 6]
-                        && drivers::locks_untrusted(driver),
                     lift: Some(format!("ip link set {pf_name} vf {n} trust on")),
                 },
                 None => unknown,
@@ -730,7 +728,9 @@ pub(crate) fn apply_card_limits(
         let first = driver.is_some() && said.insert(card.clone());
         let mut holds = assumed;
         // What the PF said, for the message: nothing where the driver does
-        // not care, else whom the number is for and what would change it.
+        // not care, else whom the number is for and what would change it -
+        // and, for an untrusted function of a driver whose PF locks the
+        // list once it set the address, what that would mean.
         let (whom, lift) = match &standing {
             None => (String::new(), String::new()),
             Some(s) => {
@@ -739,32 +739,22 @@ pub(crate) fn apply_card_limits(
                     Some(false) => " for an untrusted VF",
                     None => " for a VF of unknown trust",
                 };
-                let changes = driver.as_deref().is_some_and(|d| {
-                    drivers::filter_of(d, true, true) != drivers::filter_of(d, true, false)
-                });
-                let lift = match (&s.lift, s.trusted, changes) {
+                let d = driver.as_deref().unwrap_or("");
+                let changes =
+                    drivers::filter_of(d, true, true) != drivers::filter_of(d, true, false);
+                let mut lift = match (&s.lift, s.trusted, changes) {
                     (Some(cmd), Some(false), true) => format!("; `{cmd}` changes that"),
                     _ => String::new(),
                 };
+                if s.trusted != Some(true) && drivers::locks_untrusted(d) {
+                    lift.push_str(
+                        " - and had the PF set this function's address, it would refuse \
+                         every other until trusted",
+                    );
+                }
                 (whom.to_string(), lift)
             }
         };
-        if standing.as_ref().is_some_and(|s| s.locked) {
-            if first {
-                eprintln!(
-                    "warning: {card}: the {} driver's PF set this function's address \
-                     without trusting it and refuses every other - nothing registered \
-                     here takes effect; `{}` lifts that",
-                    driver.as_deref().unwrap_or("?"),
-                    standing
-                        .as_ref()
-                        .and_then(|s| s.lift.as_deref())
-                        .unwrap_or("?")
-                );
-            }
-            limits.insert(card, holds);
-            continue;
-        }
         match (driver, filter) {
             (Some(d), Some(f)) => match f.past {
                 drivers::Past::Ignored => {
@@ -1030,13 +1020,13 @@ mod tests {
         );
         assert_eq!(
             syncer.max_macs_per_card.get("bnv1"),
-            Some(&128),
-            "a locked VF has no list; the assumed number, as for an ignored card"
+            Some(&4),
+            "an untrusted bnxt VF holds 4 and drops past that"
         );
         assert_eq!(
             syncer.max_macs_per_card.get("ixv"),
             Some(&96),
-            "untrusted, but no PF-set address: not locked"
+            "untrusted ixgbevf"
         );
         assert_eq!(syncer.max_macs_per_card.get("mxv"), Some(&128));
 

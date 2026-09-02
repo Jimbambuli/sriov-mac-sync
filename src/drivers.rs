@@ -11,8 +11,9 @@
 //! different number, or go promiscuous rather than drop, once the PF trusts
 //! the function (`ip link set PF vf N trust on`), and some refuse every
 //! address on a function whose address the PF set without trusting it. The
-//! daemon reads both off the PF's VF list (IFLA_VF_TRUST, IFLA_VF_MAC) for
-//! the drivers where it matters, and judges an unknown trust as none.
+//! daemon reads trust off the PF's VF list (IFLA_VF_TRUST) for the drivers
+//! where it matters, judges an unknown trust as none, and says what a
+//! PF-set address would mean - that one it cannot read.
 
 /// What happens to addresses past the number the card holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +56,9 @@ enum Role {
 
 /// VF drivers whose PF refuses every address beyond the one it set, for a
 /// function it does not trust: a VF with an administratively set address
-/// and trust off has no unicast list at all, whatever the row says.
+/// and trust off has no unicast list at all, whatever the row says. Whether
+/// the PF set the address cannot be read - IFLA_VF_MAC shows the function's
+/// own address the same way - so this only shapes the message.
 const LOCKED_UNTRUSTED: &[&str] = &["igbvf", "ixgbevf", "iavf", "bnxt_en", "hinic"];
 
 use Past::*;
