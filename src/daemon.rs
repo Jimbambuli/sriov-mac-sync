@@ -47,9 +47,10 @@ pub(crate) trait World: sync::FdbWriter {
     fn resync_wanted(&mut self) -> bool {
         false
     }
-    /// Wait on the subscription for at most this many milliseconds; whether
-    /// something arrived. An interrupted wait reads as "nothing", so a stop
-    /// is noticed at the loop's top rather than after the full interval.
+    /// Wait on the subscription for at most this many milliseconds, or
+    /// without end for a negative number; whether something arrived. An
+    /// interrupted wait reads as "nothing", so a stop is noticed at the
+    /// loop's top rather than after the whole wait.
     fn wait(&mut self, millis: i32) -> std::io::Result<bool>;
     fn recv_events(&mut self) -> std::io::Result<netlink::Events>;
     /// Sit out a moment without listening - the brake for error paths
@@ -112,7 +113,7 @@ impl World for Live {
                 revents: 0,
             },
         ];
-        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, millis.max(0)) };
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, millis.max(-1)) };
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -182,19 +183,23 @@ impl World for Live {
 /// whose coupling was the subtlest thing in this file - every batch renames
 /// the pass, and a rule gated on the name silently stopped holding. Held
 /// together, every rule about them is one of these methods.
+///
+/// There is no timer. A pass is bought by an event, a failure or the
+/// operator; a quiet host runs none, for ever. The interval this once had
+/// (3600 s of silence, then a pass "trusting nothing") never corrected
+/// anything in a month of provoking it, and what it guarded against - a VF
+/// address changed without a notification - is caught by the fresh driver
+/// question that precedes any filter growth.
 struct Schedule {
     /// A deadline, not a sleep: wake-ups that are none of our business must
-    /// not push the pass away. Every completed pass moves it a whole interval
-    /// out, so the timer fires only after an interval of silence, and that
-    /// pass trusts nothing it carried.
-    next_full: Instant,
+    /// not push the pass away. `None` is a host with nothing owed.
+    due: Option<Instant>,
     /// When the last full pass ran, so event storms are answered with a
     /// bounded pass rate rather than with waiting. Registrations never wait.
     last_pass: Instant,
-    /// Which reason for a pass produced work is the only way to tell whether
-    /// the timed one earns its keep.
+    /// Why the due pass runs - the label the journal shows with every
+    /// change line.
     trigger: Trigger,
-    interval: Duration,
 }
 
 /// Why a pass runs. The label is what the journal shows and what the trial
@@ -203,7 +208,6 @@ struct Schedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Trigger {
     Start,
-    Timed,
     Operator,
     Recovery,
     LostEvents,
@@ -216,7 +220,6 @@ impl Trigger {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Trigger::Start => "start",
-            Trigger::Timed => "timed",
             Trigger::Operator => "operator",
             Trigger::Recovery => "recovery",
             Trigger::LostEvents => "lost events",
@@ -228,25 +231,24 @@ impl Trigger {
 }
 
 impl Schedule {
-    fn new(now: Instant, interval: Duration) -> Self {
+    fn new(now: Instant) -> Self {
         Self {
-            next_full: now,
-            last_pass: now - interval,
+            due: Some(now),
+            last_pass: now,
             trigger: Trigger::Start,
-            interval,
         }
     }
 
     fn pass_due(&self, now: Instant) -> bool {
-        now >= self.next_full
+        self.due.is_some_and(|due| now >= due)
     }
 
-    /// A pass that could not run comes back soon rather than sitting out the
-    /// interval, and keeps the name of the pass that failed: a forwarding
+    /// A pass that could not run comes back soon rather than waiting for
+    /// the next event, and keeps the name of the pass that failed: a forwarding
     /// change whose pass hit a transient rtnl error is still a forwarding
     /// change five seconds later.
     fn retry_soon(&mut self, now: Instant) {
-        self.next_full = now + RETRY_AFTER;
+        self.due = Some(now + RETRY_AFTER);
         // The attempt counts as a pass for pacing, not for the trigger name:
         // `last_pass` bounds the 200 ms floor `handle_batch` puts under every
         // batch-bought pass. Left standing during a refusal streak, every
@@ -255,29 +257,30 @@ impl Schedule {
         self.last_pass = now;
     }
 
-    /// A pass that ran. The next belongs to the timer until something claims
-    /// it, which is what keeps `[timed]` honest.
+    /// A pass that ran. Nothing is owed until something claims a pass.
     fn completed(&mut self, now: Instant) {
         self.last_pass = now;
-        self.next_full = now + self.interval;
-        self.trigger = Trigger::Timed;
+        self.due = None;
     }
 
-    /// A batch wants a pass sooner. Everything that does goes through here.
+    /// A batch wants a pass. The earlier deadline stands, the newer reason
+    /// names it: a forwarding change that lands while an interface change
+    /// is still pending is answered by that pass, under the later name.
     fn bring_forward(&mut self, due: Instant, trigger: Trigger) {
-        self.next_full = self.next_full.min(due);
+        self.due = Some(self.due.map_or(due, |d| d.min(due)));
         self.trigger = trigger;
     }
 
     /// Nothing carried over may be believed and the pass cannot wait: a failed
     /// wait, or notifications the kernel dropped.
     fn at_once(&mut self, now: Instant, trigger: Trigger) {
-        self.next_full = now;
+        self.due = Some(now);
         self.trigger = trigger;
     }
 
-    fn wait_for(&self, now: Instant) -> Duration {
-        self.next_full.saturating_duration_since(now)
+    /// How long the wait may be: `None` is for ever, until an event.
+    fn wait_for(&self, now: Instant) -> Option<Duration> {
+        self.due.map(|due| due.saturating_duration_since(now))
     }
 }
 
@@ -295,12 +298,7 @@ fn read_picture<W: World>(world: &mut W) -> Result<(Topology, Duration), String>
 /// and nothing about it can go stale. The world arrives as a parameter so the
 /// tests can hand in a scripted one.
 pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
-    let interval = Duration::from_secs(opts.interval);
-    let mut schedule = Schedule::new(world.now(), interval);
-    // When the driver's VF answer was last read fresh. A carried answer is
-    // good for one interval, whatever the passes were called: on a busy
-    // host no pass is ever "timed", and staleness has to be a matter of age.
-    let mut vf_fresh = world.now();
+    let mut schedule = Schedule::new(world.now());
     // The previous reading, kept for one question only: what a link message
     // was about. An interface that has just gone is in no fresh reading.
     let mut last: Option<Topology> = None;
@@ -320,17 +318,9 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
             schedule.at_once(world.now(), Trigger::Operator);
         }
         let now = world.now();
-        if now.saturating_duration_since(vf_fresh) >= interval {
-            syncer.vf_stale = true;
-        }
         if schedule.pass_due(now) {
             match run_pass(world, syncer, &mut last, opts, schedule.trigger, &mut state) {
-                Pass::Done => {
-                    if !syncer.timings.vf_carried {
-                        vf_fresh = now;
-                    }
-                    schedule.completed(world.now())
-                }
+                Pass::Done => schedule.completed(world.now()),
                 Pass::Refused => {
                     schedule.retry_soon(world.now());
                     continue;
@@ -338,12 +328,14 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
             }
         }
 
-        let due = schedule.wait_for(world.now());
         // Rounded up, not truncated: poll sleeps at most what it is told, so
         // a truncated wait woke just before the deadline and spun through
         // poll(0) for the last millisecond. The deadline is re-checked at the
-        // top.
-        let millis = due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+        // top. Nothing owed is a wait without end: -1 to poll.
+        let millis = match schedule.wait_for(world.now()) {
+            Some(due) => due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
+            None => -1,
+        };
         let woken = match world.wait(millis) {
             Ok(w) => {
                 wait_failures = 0;
@@ -738,29 +730,32 @@ mod tests {
     use super::*;
     use crate::Mode;
 
-    /// The trigger labels are what bench/trial.py's quiescence check and the
-    /// [timed] canary read, and internals.md promises recovery passes name
-    /// themselves; a retry that stole a batch's label made the canary cry
-    /// wolf.
+    /// The trigger labels are what bench/trial.py's quiescence check reads,
+    /// and internals.md promises recovery passes name themselves; a retry
+    /// that stole a batch's label misnamed the pass in the journal. And a
+    /// completed pass owes nothing: without an event the daemon never runs
+    /// another.
     #[test]
     fn the_trigger_labels_survive_what_the_schedule_does() {
         let now = Instant::now();
-        let interval = Duration::from_secs(300);
-        let mut s = Schedule::new(now, interval);
+        let mut s = Schedule::new(now);
         assert_eq!(
             s.trigger,
             Trigger::Start,
             "the first pass is the restart catch-up"
         );
         s.completed(now);
-        assert_eq!(s.trigger, Trigger::Timed, "the default between events");
         assert!(
-            !s.pass_due(now + interval / 2),
-            "a completed pass pushes the timer a whole interval out"
+            !s.pass_due(now + Duration::from_secs(365 * 24 * 3600)),
+            "a completed pass left a pass owed"
         );
-        assert!(
-            s.pass_due(now + interval),
-            "and after an interval of silence it fires"
+        assert_eq!(s.wait_for(now), None, "nothing owed is a wait without end");
+        s.bring_forward(now + Duration::from_secs(2), Trigger::InterfaceChange);
+        s.bring_forward(now + Duration::from_secs(5), Trigger::ForwardingChange);
+        assert_eq!(
+            s.wait_for(now),
+            Some(Duration::from_secs(2)),
+            "the earlier deadline has to stand"
         );
         s.bring_forward(now, Trigger::ForwardingChange);
         assert_eq!(
@@ -776,8 +771,7 @@ mod tests {
         );
         s.at_once(now, Trigger::Recovery);
         assert_eq!(s.trigger, Trigger::Recovery);
-        s.completed(now);
-        assert_eq!(s.trigger, Trigger::Timed);
+        assert!(s.pass_due(now));
     }
 
     /// The kernel source answers for each card by driver and role; the
@@ -1004,7 +998,13 @@ mod tests {
                     }
                     return Err(std::io::Error::from_raw_os_error(errno));
                 }
-                let until = self.offset + Duration::from_millis(millis.max(0) as u64);
+                // A wait without end lasts until the next scripted event,
+                // or until the world stops.
+                let until = if millis < 0 {
+                    self.stop_at
+                } else {
+                    self.offset + Duration::from_millis(millis as u64)
+                };
                 if let Some((at, _)) = self.script.front() {
                     if *at <= until {
                         self.offset = (*at).max(self.offset);
@@ -1081,9 +1081,8 @@ mod tests {
         /// autodetect.
         /// The guard MUST be bound at the call site: dropped early, the
         /// directory vanishes while the daemon still writes into it.
-        fn setup(name: &str, interval: u64) -> (Syncer, Options, Scratch) {
+        fn setup(name: &str) -> (Syncer, Options, Scratch) {
             let mut opts = Options {
-                interval,
                 pairs: vec!["nic1:vmbr1".into()],
                 ..Default::default()
             };
@@ -1103,19 +1102,21 @@ mod tests {
             d.as_secs()
         }
 
-        /// The timed pass runs at the interval, exactly, for as long as
-        /// nothing happens - the heartbeat everything else is measured
-        /// against, and until now the one thing no test could see.
+        /// A quiet host gets the restart pass and then nothing, for as long
+        /// as nothing happens: no timer, no reading, no driver question.
         #[test]
-        fn a_quiet_host_gets_its_pass_once_per_interval() {
-            let (mut syncer, opts, _dir) = setup("cadence", 10);
-            let mut world = FakeWorld::new(25);
+        fn a_quiet_host_gets_no_pass_after_the_first() {
+            let (mut syncer, opts, _dir) = setup("cadence");
+            let mut world = FakeWorld::new(25 * 3600);
             daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
-                vec![0, 10, 20],
-                "the pass has to run at the interval, and only then"
+                vec![0],
+                "a pass ran that no event bought"
             );
+            assert_eq!(world.topo_calls, 1, "a reading nobody asked for");
+            assert_eq!(world.fdb.vf_asked, 1, "a driver question nobody asked for");
+            assert_eq!(world.wait_calls, 1, "the wait without end woke up");
         }
 
         /// A bridge built at runtime is adopted by the prompt pass its own
@@ -1123,11 +1124,10 @@ mod tests {
         /// on every pass's own reading.
         #[test]
         fn a_pair_appearing_at_runtime_is_adopted_by_the_prompt_pass() {
-            let mut opts = Options {
-                interval: 300,
+            let opts = Options {
+                mode: Mode::Daemon,
                 ..Default::default()
             };
-            opts.mode = Mode::Daemon;
             let _dir = scratch("hotplug");
             let mut syncer = Syncer::new(Vec::new(), _dir.0.clone());
             let mut world = FakeWorld::new(5);
@@ -1157,29 +1157,12 @@ mod tests {
             );
         }
 
-        /// The timed pass believes nothing it was told: the interfaces are
-        /// read afresh as always, and the driver is asked again.
-        #[test]
-        fn the_timed_refresh_rereads_the_picture_and_reasks_the_driver() {
-            let (mut syncer, opts, _dir) = setup("refresh-distrust", 10);
-            let mut world = FakeWorld::new(25);
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert_eq!(
-                world.topo_calls, 3,
-                "each interval owes the picture a fresh reading"
-            );
-            assert_eq!(
-                world.fdb.vf_asked, 3,
-                "each interval owes the driver a fresh question"
-            );
-        }
-
         /// A failed wait is survived, answered with a prompt pass, and
         /// nothing carried is believed - the only user of the "recovery"
         /// label, which no test could reach before.
         #[test]
         fn a_failed_wait_is_survived_and_distrusted() {
-            let (mut syncer, opts, _dir) = setup("wait-fails", 8);
+            let (mut syncer, opts, _dir) = setup("wait-fails");
             let mut world = FakeWorld::new(8);
             world.fail_wait = Some(libc::EINTR);
             daemon_loop(&mut world, &mut syncer, &opts);
@@ -1200,10 +1183,10 @@ mod tests {
 
         /// A batch of learning is answered twice: the fast path registers
         /// the moment the batch is read, and the full pass follows at the
-        /// bounded rate rather than at the interval.
+        /// bounded rate.
         #[test]
         fn a_learning_batch_registers_at_once_and_buys_a_prompt_pass() {
-            let (mut syncer, opts, _dir) = setup("learn", 300);
+            let (mut syncer, opts, _dir) = setup("learn");
             let guest = [0xaa, 0, 0, 0, 0, 0x51];
             let mut world = FakeWorld::new(8).at(
                 5,
@@ -1220,7 +1203,7 @@ mod tests {
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 5],
-                "the pass after a registration must not wait out the interval"
+                "the pass after a registration has to follow at once"
             );
         }
 
@@ -1229,7 +1212,7 @@ mod tests {
         /// of nothing but deletions waits out the settle time.
         #[test]
         fn a_deletions_only_batch_waits_for_the_table_to_settle() {
-            let (mut syncer, opts, _dir) = setup("ageing", 300);
+            let (mut syncer, opts, _dir) = setup("ageing");
             let gone = [0xaa, 0, 0, 0, 0, 0x52];
             let mut world = FakeWorld::new(8).at(
                 1,
@@ -1251,7 +1234,7 @@ mod tests {
         /// the difference between answering traffic and being buried by it.
         #[test]
         fn somebody_elses_batch_buys_no_pass() {
-            let (mut syncer, opts, _dir) = setup("foreign", 300);
+            let (mut syncer, opts, _dir) = setup("foreign");
             let other = [0xaa, 0, 0, 0, 0, 0x53];
             let mut world = FakeWorld::new(8).at(
                 1,
@@ -1276,7 +1259,7 @@ mod tests {
         /// carried is distrusted and a pass runs now, on a fresh picture.
         #[test]
         fn lost_events_cost_a_fresh_picture_and_an_immediate_pass() {
-            let (mut syncer, opts, _dir) = setup("lost", 300);
+            let (mut syncer, opts, _dir) = setup("lost");
             let mut world = FakeWorld::new(8).at(5, Err(libc::ENOBUFS));
             daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
@@ -1295,11 +1278,11 @@ mod tests {
         }
 
         /// A kernel that will not describe the interfaces is retried in
-        /// seconds, not sat out for the whole interval - and no pass runs
-        /// on the picture that is not there.
+        /// seconds, not given up on - and no pass runs on the picture that
+        /// is not there.
         #[test]
         fn a_refused_topology_is_retried_soon_and_reconciles_nothing() {
-            let (mut syncer, opts, _dir) = setup("refused", 300);
+            let (mut syncer, opts, _dir) = setup("refused");
             let mut world = FakeWorld::new(12);
             world.topo_fails = true;
             daemon_loop(&mut world, &mut syncer, &opts);
@@ -1317,7 +1300,7 @@ mod tests {
         /// asks the driver afresh. The interfaces are read afresh anyway.
         #[test]
         fn an_interface_change_re_reads_the_picture_and_re_asks_the_driver() {
-            let (mut syncer, opts, _dir) = setup("links", 300);
+            let (mut syncer, opts, _dir) = setup("links");
             let mut world = FakeWorld::new(8).at(
                 5,
                 Ok(Events {
@@ -1346,7 +1329,7 @@ mod tests {
         /// once.
         #[test]
         fn a_refused_pass_still_paces_the_batches_behind_it() {
-            let (mut syncer, opts, _dir) = setup("retry-brake", 300);
+            let (mut syncer, opts, _dir) = setup("retry-brake");
             let mut world = FakeWorld::new(3);
             world.topo_fails = true;
             // Ten notifications inside one second, each one asking for a
@@ -1380,7 +1363,7 @@ mod tests {
         /// pace applies before the pass.
         #[test]
         fn a_wait_that_keeps_failing_is_paced() {
-            let (mut syncer, opts, _dir) = setup("wait-brake", 300);
+            let (mut syncer, opts, _dir) = setup("wait-brake");
             let mut world = FakeWorld::new(30);
             world.fail_wait = Some(libc::ENOMEM);
             world.fail_wait_times = 3;
@@ -1405,11 +1388,11 @@ mod tests {
         #[test]
         fn a_deadline_is_only_ever_pulled_earlier() {
             let start = Instant::now();
-            let mut sched = Schedule::new(start, Duration::from_secs(300));
+            let mut sched = Schedule::new(start);
             // A pass is due at once.
             sched.at_once(start, Trigger::Recovery);
             assert!(sched.pass_due(start));
-            // The timer comes round: it may not push that pass away.
+            // Time passes: a due pass stays due.
             let later = start + Duration::from_secs(600);
             assert!(sched.pass_due(later), "a due pass stays due");
             // Neither may a batch that only wants one soon.
@@ -1425,10 +1408,12 @@ mod tests {
         /// host - wait out the retry pace.
         #[test]
         fn a_wait_that_recovers_gets_its_prompt_pass_back() {
-            // A short interval, so the loop really gets to its third wait.
-            let (mut syncer, opts, _dir) = setup("wait-brake-reset", 2);
-            let mut world = FakeWorld::new(12);
-            // Fail, work, fail again.
+            let (mut syncer, opts, _dir) = setup("wait-brake-reset");
+            // Two empty batches keep the loop waiting, so it really gets to
+            // its third wait: fail, work, fail again.
+            let mut world = FakeWorld::new(12)
+                .at(2, Ok(Events::default()))
+                .at(6, Ok(Events::default()));
             world.wait_fail_calls = vec![1, 3];
             daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
@@ -1447,7 +1432,7 @@ mod tests {
         /// from entries that should be there.
         #[test]
         fn a_filling_filter_turns_deletions_urgent() {
-            let (mut syncer, mut opts, _dir) = setup("filling", 300);
+            let (mut syncer, mut opts, _dir) = setup("filling");
             // The operator's --max, the way run() wires it: the loop then
             // leaves the number alone.
             // Ten slots, nine held: exactly nine tenths, the edge the rule
@@ -1490,7 +1475,7 @@ mod tests {
         /// to BE a registration for the claim to mean anything.
         #[test]
         fn stopping_leaves_every_registration_in_place() {
-            let (mut syncer, opts, _dir) = setup("stop", 300);
+            let (mut syncer, opts, _dir) = setup("stop");
             let guest = [0x02u8, 0, 0, 0, 0, 0x71];
             let mut world = FakeWorld::new(4).at(
                 1,
@@ -1519,7 +1504,7 @@ mod tests {
         /// under a scripted world and no loop test could assert it.
         #[test]
         fn the_pass_reports_what_its_reading_cost() {
-            let (mut syncer, opts, _dir) = setup("topo-cost", 300);
+            let (mut syncer, opts, _dir) = setup("topo-cost");
             let mut world = FakeWorld::new(1);
             world.read_cost = Duration::from_millis(7);
             daemon_loop(&mut world, &mut syncer, &opts);
@@ -1535,7 +1520,7 @@ mod tests {
         /// - which reads again.
         #[test]
         fn a_batch_without_a_reading_spends_the_driver_answer_and_buys_a_pass() {
-            let (mut syncer, _opts, _dir) = setup("blind-batch", 300);
+            let (mut syncer, _opts, _dir) = setup("blind-batch");
             let mut world = FakeWorld::new(5);
             // The reading before says index 2 has no functions.
             let mut last = Some(
@@ -1589,7 +1574,7 @@ mod tests {
         /// that pass asks the driver afresh.
         #[test]
         fn a_resync_buys_a_distrusting_pass_at_once() {
-            let (mut syncer, opts, _dir) = setup("resync", 300);
+            let (mut syncer, opts, _dir) = setup("resync");
             let mut world = FakeWorld::new(8).at(3, Ok(Events::default()));
             world.resync_at = Some(Duration::from_secs(3));
             daemon_loop(&mut world, &mut syncer, &opts);
@@ -1609,7 +1594,7 @@ mod tests {
         /// only known to have had any by the reading before.
         #[test]
         fn a_link_change_is_judged_against_the_reading_before_it() {
-            let (mut syncer, _opts, _dir) = setup("before-picture", 300);
+            let (mut syncer, _opts, _dir) = setup("before-picture");
             let mut world = FakeWorld::new(5);
             // The reading before: nic1 hands out functions.
             let mut last = Some(host(mac(1)));
@@ -1642,7 +1627,7 @@ mod tests {
         /// pass that will do its work, rather than ending the batch quietly.
         #[test]
         fn a_batch_whose_fast_path_fails_buys_a_pass() {
-            let (mut syncer, _opts, _dir) = setup("fast-path-fails", 300);
+            let (mut syncer, _opts, _dir) = setup("fast-path-fails");
             let mut world = FakeWorld::new(5);
             let mut last = Some(host(mac(1)));
             syncer.vf_stale = true; // the batch has to ask the driver ...

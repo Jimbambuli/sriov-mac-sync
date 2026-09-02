@@ -8,18 +8,15 @@
 # --flush, because only autodetection can know it sees every uplink.
 #PAIRS="nic1:vmbr1 nic0:vmbr0"
 
-# Seconds of silence before a timed pass. This is paranoia, not the mechanism.
-# Addresses are registered the moment the kernel reports them and removed when
-# they move out onto the wire or their bridge port goes - an aged-out address
-# whose port still hangs in the bridge is kept, see the README. Interface
-# changes - a new NIC, a new bridge - arrive as link notifications, and every
-# batch and every pass reads the interfaces afresh anyway. A VF address
-# changed silently (a down PF, a guest-side change over the driver mailbox)
-# is caught by the fresh driver question that precedes any filter growth,
-# and the carried answer is asked afresh once per interval regardless. The
-# timed pass exists for a host that is silent AND wrong, and it warns when
-# it finds work - that is what --resync is for by hand.
-#RESYNC=3600
+# There is no timer. Addresses are registered the moment the kernel reports
+# them and removed when they move out onto the wire or their bridge port goes
+# - an aged-out address whose port still hangs in the bridge is kept, see the
+# README. Interface changes - a new NIC, a new bridge - arrive as link
+# notifications, and every batch and every pass reads the interfaces afresh
+# anyway. A VF address changed silently (a down PF, a guest-side change over
+# the driver mailbox) is caught by the fresh driver question that precedes
+# any filter growth. A quiet host does nothing; `sriov-mac-sync --resync`
+# asks the daemon for a full pass by hand.
 
 # The filter capacity to respect: warn above it, and shed kept quiet
 # addresses as the list nears it. The vport list on ConnectX-4 Lx holds 128;

@@ -131,16 +131,18 @@ when all of it is wire-side, 3.1 s when every address is a guest that has to be
 registered. That second figure is real work, and it is what a host learning 200
 addresses a second costs. A host of this project's kind learns a few an hour.
 
-**`RESYNC` has never been seen to do anything.** Run at ten seconds while
-deleting filter entries by hand, reassigning a VF's address to one that was
-registered, adding and removing bridge ports, and destroying a dozen veths under
-traffic, all twenty-five corrections came from notifications and none from the
-timer. It is kept because "nothing could be provoked" is not "nothing exists",
-and because a missed notification would otherwise be silent and permanent. It
-doubles as a canary: a change line ending in `[timed]` means the notification
-path missed something. Recovery passes label themselves `[lost events]` and
-`[recovery]` instead, so the canary stays honest. Every line reporting a change
-names what triggered the pass, for exactly that reason. The quiet-keep adds
+**There is no timer.** The daemon once ran a pass after an hour of silence,
+trusting nothing it carried. Run at ten seconds while deleting filter entries by
+hand, reassigning a VF's address to one that was registered, adding and removing
+bridge ports, and destroying a dozen veths under traffic, all twenty-five
+corrections came from notifications and none from the timer; on the production
+hosts it never found work in a month. What it guarded against - a VF address
+changed without a notification - is caught by the fresh driver question that
+precedes any filter growth, and every batch and every pass reads the interfaces
+afresh. So a quiet host does nothing, for ever; a missed notification is what
+`--resync` is for. Recovery passes label themselves `[lost events]` and
+`[recovery]`, and every line reporting a change names what triggered the pass,
+so the journal says where each correction came from. The quiet-keep adds
 three lines of its own: `kept [quiet]` when addresses enter the kept state,
 `took over ...` when a fresh daemon adopts the previous run's memory, and
 `released N quiet address(es) [pressure]` when the capacity valve sheds -
@@ -272,8 +274,8 @@ the machine as found; either way the choice is logged);
 an address of ours turning up on the uplink's own port (a guest that moved
 host); a VF's own address learnt behind the bridge; a guest going quiet whose
 entry has to stay — the keep, proven on the real eSwitch; the port's removal;
-and a closing quiescence check — journal quiet, no `[timed]` pass that had to
-fix anything, no residue, the quiet-keep memory file included. A failed
+and a closing quiescence check — journal quiet, no residue, the quiet-keep
+memory file included. A failed
 verification fails the exit code.
 
 It refuses to start unless everything holds: the service active and not in

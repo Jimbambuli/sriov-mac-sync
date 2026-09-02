@@ -88,15 +88,11 @@ that failed along the way.
 .BI \-\-pair " DEV:BR"
 Uplink and bridge to manage. Repeatable, and skips autodetection entirely.
 .TP
-.BI \-\-interval " SEC"
-After this many seconds of silence \(em no event, no pass \(em run one full pass
-that trusts nothing it carried (default 3600). This is a safety net, not the
-mechanism: addresses are registered the moment the kernel reports them, and
-every batch and every pass reads the interfaces afresh. A timed pass that
-finds work logs a warning: an event should have brought it.
-.TP
 .B \-\-resync
-Ask the running daemon for such a pass now. The daemon leaves its pid in the
+Ask the running daemon for a full pass now, one that trusts nothing it
+carried. There is no timer: addresses are registered the moment the kernel
+reports them, every batch and every pass reads the interfaces afresh, and a
+quiet host does nothing. The daemon leaves its pid in the
 state directory and answers
 .B SIGHUP
 the same way.
@@ -177,10 +173,6 @@ purpose: the daemon then cannot know it sees every uplink, so a pair removed
 from this list keeps its filter entries until
 .B \-\-flush
 takes them out or autodetection is allowed to conclude the device is gone.
-.TP
-.B RESYNC
-Seconds of silence before a timed pass, as
-.BR \-\-interval .
 .TP
 .B MAX_MACS
 The filter capacity to respect, as

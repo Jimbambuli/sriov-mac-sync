@@ -101,8 +101,6 @@ sriov-mac-sync --once               reconcile and exit; the exit code says
                                     whether every change went through
 sriov-mac-sync --flush              remove what this daemon registered
 sriov-mac-sync --resync             ask the running daemon for a full pass
-sriov-mac-sync --interval SEC       timed pass after this many seconds of
-                                    silence (default 3600)
 sriov-mac-sync --max NUM            filter capacity: warn above it, shed quiet
                                     keeps as the list nears it (default 128)
 sriov-mac-sync --timings            after every pass, what each phase cost
@@ -125,7 +123,7 @@ sriov-mac-sync --version            print the version
 
 Uplinks are found automatically: any interface with VFs — or itself a VF — that
 ends up in a bridge, following bonds. Override with `--pair DEV:BRIDGE`.
-`/etc/sriov-mac-sync.conf` may set `PAIRS`, `RESYNC`, `MAX_MACS`, `EXCLUDE` and
+`/etc/sriov-mac-sync.conf` may set `PAIRS`, `MAX_MACS`, `EXCLUDE` and
 `EXTRA`; a commented copy ships as `dist/sriov-mac-sync.conf.example`, and the
 Debian package installs `sriov-mac-sync(8)`.
 

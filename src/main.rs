@@ -84,7 +84,6 @@ enum Mode {
 struct Options {
     mode: Mode,
     pairs: Vec<String>,
-    interval: u64,
     max_macs: usize,
     /// Whether the threshold above came from the operator. If it did, nothing
     /// may quietly move it - not even a card that reports its own capacity.
@@ -100,7 +99,6 @@ impl Default for Options {
         Options {
             mode: Mode::Daemon,
             pairs: Vec::new(),
-            interval: 3600,
             max_macs: sync::DEFAULT_MAX_MACS,
             max_macs_set: false,
             exclude: Vec::new(),
@@ -206,13 +204,13 @@ usage: sriov-mac-sync [options]
   --check         test whether the uplink accepts unicast filter entries
   --flush         remove every address this daemon registered
   --resync        ask the running daemon for a full pass, trusting nothing
-                  it carried (it leaves its pid in the state directory)
+                  it carried (it leaves its pid in the state directory);
+                  there is no timer, passes come from events and from this
   --dry-run       report changes without applying them
   --timings       with the daemon or --once: after every pass, say what
                   each phase cost and what it found, and name anything
                   that failed along the way
   --pair DEV:BR   uplink/bridge pair to manage (repeatable, skips autodetect)
-  --interval SEC  timed pass after this many seconds of silence (default 3600)
   --max NUM       the filter capacity to respect: warn above it, and shed
                   quiet keeps as the list nears it (default 128)
   --exclude MACS  addresses never to register, comma or space separated
@@ -223,7 +221,7 @@ usage: sriov-mac-sync [options]
 Pairs are found automatically: every interface with virtual functions - or
 itself a virtual function, or a VLAN interface on either - that ends up in a
 bridge, following bonds.
-{CONF} may set PAIRS, RESYNC, MAX_MACS, EXCLUDE and EXTRA.
+{CONF} may set PAIRS, MAX_MACS, EXCLUDE and EXTRA.
 See sriov-mac-sync(8) for the whole of it.
 "
     )
@@ -304,7 +302,7 @@ fn read_conf(opts: &mut Options, text: &str) {
             eprintln!("warning: {CONF}: not a setting, ignored: {line}");
             continue;
         };
-        // "RESYNC=300  # seconds" means 300, but a hash inside quotes is part
+        // "MAX_MACS=30  # slots" means 30, but a hash inside quotes is part
         // of the value. Nothing this file takes can contain one today; the
         // rule is here so that the day something can, the parser does not
         // quietly eat half of it.
@@ -314,16 +312,13 @@ fn read_conf(opts: &mut Options, text: &str) {
             "PAIRS" => opts
                 .pairs
                 .extend(value.split_whitespace().map(|s| s.to_string())),
-            "RESYNC" => match value
-                .parse()
-                .map_err(|_| ())
-                .and_then(|v| clamp_interval(v).map_err(|_| ()))
-            {
-                Ok(v) => opts.interval = v,
-                Err(_) => eprintln!(
-                    "warning: {CONF}: RESYNC is not a usable number of seconds, ignored: {value}"
-                ),
-            },
+            // A file written for a release that still had the timer. Not an
+            // error: a daemon that refuses to start over a stale line in
+            // /etc leaves the host with no filter maintenance at all.
+            "RESYNC" => eprintln!(
+                "warning: {CONF}: RESYNC is retired, ignored - there is no timed pass; \
+                 --resync asks the daemon for one"
+            ),
             "MAX_MACS" => match value
                 .parse()
                 .map_err(|_| ())
@@ -342,20 +337,6 @@ fn read_conf(opts: &mut Options, text: &str) {
             other => eprintln!("warning: {CONF}: unknown setting, ignored: {other}"),
         }
     }
-}
-
-/// Two modes on one command line are a contradiction, and the last one
-/// winning in silence means somebody ran --flush thinking they ran --status.
-/// Zero would busy-loop (the deadline is always due) and u64::MAX overflows
-/// the Instant it is added to. Both are typos.
-fn clamp_interval(v: u64) -> Result<u64, String> {
-    const MAX: u64 = 30 * 24 * 3600;
-    if v == 0 || v > MAX {
-        return Err(format!(
-            "the interval has to be between 1 and {MAX} seconds"
-        ));
-    }
-    Ok(v)
 }
 
 /// A capacity of zero says the filter is always full, which schedules the
@@ -405,13 +386,14 @@ fn parse_args_from<I: Iterator<Item = String>>(opts: &mut Options, args: I) -> R
                 opts.pairs
                     .push(args.next().ok_or("--pair needs DEV:BRIDGE")?);
             }
+            // The timer's option, from a unit file or a script written for
+            // an older release: swallowed with its value, and said once.
             "--interval" => {
-                opts.interval = clamp_interval(
-                    args.next()
-                        .ok_or("--interval needs seconds")?
-                        .parse()
-                        .map_err(|_| "--interval needs a number")?,
-                )?
+                args.next().ok_or("--interval needs seconds")?;
+                eprintln!(
+                    "warning: --interval is retired, ignored - there is no timed pass; \
+                     --resync asks the daemon for one"
+                );
             }
             "--max" => {
                 opts.max_macs_set = true;
@@ -723,16 +705,6 @@ fn report_changes(reports: &[sync::Report], dry_run: bool, trigger: Trigger) {
             );
         }
         if r.added > 0 || r.removed > 0 {
-            // The timer only fires after an interval of silence. Work found
-            // then is work an event should have brought - say so, because
-            // that is the one thing the timer is still for.
-            if trigger == Trigger::Timed {
-                eprintln!(
-                    "warning: {}: the timed pass found +{} -{} - an event should \
-                     have brought this",
-                    r.dev, r.added, r.removed
-                );
-            }
             let quiet = if r.quiet > 0 {
                 format!(", {} held quiet", r.quiet)
             } else {
@@ -917,13 +889,12 @@ fn run() -> Result<bool, String> {
         Mode::Daemon => {
             let listed = pair_names(&pairs);
             note!(
-                "sriov-mac-sync {VERSION}: watching {}; a timed pass after {}s of silence",
+                "sriov-mac-sync {VERSION}: watching {}; passes come from events and --resync",
                 if listed.is_empty() {
                     "nothing yet".to_string()
                 } else {
                     listed.join(" ")
-                },
-                opts.interval
+                }
             );
             let stop_rx = catch_signals();
             // The pid, so --resync can find us. Best effort: a daemon that
@@ -941,7 +912,7 @@ fn run() -> Result<bool, String> {
             // interface reload takes a bridge away for a moment, and emptying
             // a live filter over that is the outage this daemon exists to
             // prevent. Long enough to outlive `ifreload -a`, short enough
-            // that a bridge really taken apart is tidied within the interval.
+            // that a bridge really taken apart is tidied within a minute.
             syncer.orphan_grace = Duration::from_secs(60);
             let mut world = Live { sock, mon, stop_rx };
             daemon_loop(&mut world, &mut syncer, &opts);
@@ -997,11 +968,6 @@ mod tests {
     fn help_states_the_defaults_the_code_actually_uses() {
         let d = Options::default();
         let text = usage_text();
-        assert!(
-            text.contains(&format!("(default {})", d.interval)),
-            "help does not name the real interval default of {}:\n{text}",
-            d.interval
-        );
         assert!(
             text.contains(&format!("(default {})", d.max_macs)),
             "help does not name the real max default of {}:\n{text}",
@@ -1079,7 +1045,6 @@ mod tests {
             let mut o = Options::default();
             let with_value = match opt.as_str() {
                 "--pair" => Some("nic0:vmbr0"),
-                "--interval" => Some("42"),
                 "--max" => Some("7"),
                 "--exclude" | "--extra" => Some("02:00:00:00:00:01"),
                 _ => None,
@@ -1098,12 +1063,7 @@ mod tests {
     #[test]
     fn values_reach_the_options() {
         let mut o = Options::default();
-        parse_args_from(
-            &mut o,
-            args(&["--interval", "42", "--max", "7"]).into_iter(),
-        )
-        .unwrap();
-        assert_eq!(o.interval, 42);
+        parse_args_from(&mut o, args(&["--max", "7"]).into_iter()).unwrap();
         assert_eq!(o.max_macs, 7);
     }
 
@@ -1156,9 +1116,6 @@ mod tests {
     /// The clamps accept their own boundaries and refuse one past them.
     #[test]
     fn the_clamps_hold_exactly_at_their_edges() {
-        const MONTH: u64 = 30 * 24 * 3600;
-        assert_eq!(clamp_interval(MONTH).ok(), Some(MONTH));
-        assert!(clamp_interval(MONTH + 1).is_err());
         assert_eq!(clamp_max_macs(1 << 20).ok(), Some(1 << 20));
         assert!(clamp_max_macs((1 << 20) + 1).is_err());
     }
@@ -1177,16 +1134,15 @@ mod tests {
              =\n\
              =a value with no key\n\
              NONSENSE=whatever\n\
-             RESYNC=\n\
-             RESYNC=not a number\n\
+             RESYNC=600\n\
              MAX_MACS=\n\
              EXCLUDE=\n\
-             \t  RESYNC = 600  # with a comment and spaces round the key\n\
+             \t  MAX_MACS = 60  # with a comment and spaces round the key\n\
              EXCLUDE=02:00:00:00:00:01\n",
         );
-        assert_eq!(o.interval, 600, "the one good setting did not take effect");
+        assert_eq!(o.max_macs, 60, "the one good setting did not take effect");
+        assert!(o.max_macs_set);
         assert_eq!(o.exclude, vec!["02:00:00:00:00:01"]);
-        assert_eq!(o.max_macs, Options::default().max_macs);
     }
 
     /// The value keeps its own equals signs. Splitting on the last one, or
@@ -1216,6 +1172,8 @@ mod tests {
     #[test]
     fn an_option_missing_its_value_is_refused() {
         for opt in ["--pair", "--interval", "--max", "--exclude", "--extra"] {
+            // --interval is retired but still swallows its value, so that a
+            // unit file from an older release keeps starting the daemon.
             let mut o = Options::default();
             assert!(
                 parse_args_from(&mut o, args(&[opt]).into_iter()).is_err(),
@@ -1226,8 +1184,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_number_is_refused_rather_than_silently_default() {
-        let mut o = Options::default();
-        assert!(parse_args_from(&mut o, args(&["--interval", "soon"]).into_iter()).is_err());
         let mut o = Options::default();
         assert!(parse_args_from(&mut o, args(&["--max", "lots"]).into_iter()).is_err());
     }
@@ -1428,20 +1384,24 @@ mod tests {
             .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
         {
             assert!(
-                ["PAIRS", "RESYNC", "MAX_MACS", "EXCLUDE", "EXTRA"].contains(&key.as_str()),
+                ["PAIRS", "MAX_MACS", "EXCLUDE", "EXTRA"].contains(&key.as_str()),
                 "the example offers {key}, which load_conf never reads"
             );
         }
     }
 
+    /// The retired option is swallowed with its value rather than refused:
+    /// a unit file or script from an older release keeps starting the
+    /// daemon, and the warning says what to use instead.
     #[test]
-    fn an_interval_that_would_spin_or_abort_is_refused() {
-        // Zero busy-loops; u64::MAX overflows the Instant it is added to.
-        assert!(clamp_interval(0).is_err());
-        assert!(clamp_interval(u64::MAX).is_err());
-        assert_eq!(clamp_interval(300), Ok(300));
+    fn the_retired_interval_option_is_swallowed_with_its_value() {
         let mut o = Options::default();
-        assert!(parse_args_from(&mut o, args(&["--interval", "0"]).into_iter()).is_err());
+        parse_args_from(
+            &mut o,
+            args(&["--interval", "300", "--max", "9"]).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(o.max_macs, 9, "the option after --interval was eaten");
     }
 
     /// Every way a --pair can be wrong, refused with a message that names

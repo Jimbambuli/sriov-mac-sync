@@ -81,7 +81,7 @@ wait_ready() {
 
 # A scenario daemon on the shared pair, logging to the named file.
 start_daemon() {
-  $NS "$BIN" --pair veth-up:br0 --interval 1 --timings >"$1" 2>&1 &
+  $NS "$BIN" --pair veth-up:br0 --timings >"$1" 2>&1 &
   DPID=$!
   wait_ready "$1"
 }
@@ -302,15 +302,17 @@ check "exit within 3 s (took ${MS}ms)" "[ -n \"$DEAD\" ] && [ $MS -lt 3000 ]"
 check "note survives" "[ -s $STATE/veth-up.owned ]"
 check "parting line" "grep -qi 'left registered' /tmp/sms-it-s4.log"
 
-say "S6b: a short-interval daemon repairs what happened behind its back"
-$NS "$BIN" --pair veth-up:br0 --interval 1 --timings >/tmp/sms-it-s6b.log 2>&1 &
+say "S6b: the daemon repairs what happened behind its back, once asked"
+$NS "$BIN" --pair veth-up:br0 --timings >/tmp/sms-it-s6b.log 2>&1 &
 DPID=$!
 check_soon "the restart pass calls itself [start]" "grep -q 'pass \[start\]' /tmp/sms-it-s6b.log"
-# Removed by hand, behind the daemon's back. The deletion notification may
-# buy a prompt pass, the 1-second refresh certainly follows - either way
-# the entry has to come back without anyone asking.
+# Removed by hand, behind the daemon's back. There is no timer, so the
+# operator asks: --resync knocks on the pid in the state directory and
+# the pass that answers calls itself [operator] and puts the entry back.
 $NS bridge fdb del $M1 dev veth-up self permanent
+$NS "$BIN" --resync
 check_soon "M1 restored" "has_self $M1"
+check_soon "the pass named the operator" "grep -q 'pass \[operator\]' /tmp/sms-it-s6b.log"
 check_soon "a pass reported the repair" "grep -qE '\+1' /tmp/sms-it-s6b.log"
 stop_daemon
 
@@ -355,7 +357,7 @@ M8="02:be:5c:00:00:78"
 M9="02:be:5c:00:00:79"
 BASE=$($NS "$BIN" --status --pair veth-up:br0 | awk '/registered by us/ {print $NF}')
 MAX=$((BASE + 2 + 4))  # allowed = MAX - headroom(4) = BASE + 2
-$NS "$BIN" --pair veth-up:br0 --interval 1 --max $MAX >/tmp/sms-it-s6f.log 2>&1 &
+$NS "$BIN" --pair veth-up:br0 --max $MAX >/tmp/sms-it-s6f.log 2>&1 &
 DPID=$!
 wait_ready /tmp/sms-it-s6f.log
 $NS bridge fdb replace $M7 dev veth-g1 master dynamic

@@ -952,7 +952,8 @@ impl Socket {
         self.fd.as_raw_fd()
     }
 
-    /// Wait for a notification, giving up after `millis`. False on timeout.
+    /// Wait for a notification, giving up after `millis` - or never, for a
+    /// negative number. False on timeout.
     pub fn wait(&self, millis: i32) -> io::Result<bool> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -963,7 +964,7 @@ impl Socket {
         // caller loops against its own deadline and comes straight back, and
         // gets to look at why it was interrupted. A stop that waits out an
         // interval is not a stop.
-        let rc = unsafe { libc::poll(&mut pfd, 1, millis.max(0)) };
+        let rc = unsafe { libc::poll(&mut pfd, 1, millis.max(-1)) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {

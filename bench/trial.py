@@ -960,8 +960,6 @@ class Trial:
                  "--since", f"@{since_epoch}", "-o", "cat"])
         noise = [l for l in j.stdout.splitlines()
                  if re.search(r"warning|error", l, re.I)]
-        timed = [l for l in j.stdout.splitlines()
-                 if "[timed]" in l and re.search(r"\+[1-9]|-[1-9]", l)]
         post = {u: (self_macs(u), note_bytes(u), ports_bytes(u)) for u in self.uplinks}
         # The trial's own footprint has to be gone; the rest of the bridge is
         # a live network whose guests come and go - that drift is the
@@ -981,13 +979,10 @@ class Trial:
             for u in self.uplinks
             if post[u] != pre_state[u]
         }
-        ok = not noise and not timed and not residue
+        ok = not noise and not residue
         problems = []
         if noise:
             problems.append(f"{len(noise)} warning/error line(s): {noise[0]!r}")
-        if timed:
-            problems.append(f"[timed] pass had to fix something: {timed[0]!r} "
-                            "- the event path missed it")
         if residue:
             problems.append(f"test residue left in filters: {residue}")
         note = ""
@@ -996,7 +991,7 @@ class Trial:
                     f"real guests coming or going, not the trial's doing)")
         self.verdict("quiescence and state", ok,
                      ("; ".join(problems) if problems else
-                      "journal quiet, no [timed] corrections, no test residue")
+                      "journal quiet, no test residue")
                      + note)
 
 
