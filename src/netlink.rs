@@ -1011,12 +1011,7 @@ fn link_dump_request() -> Vec<u8> {
         NLM_F_REQUEST | NLM_F_DUMP,
         0, // dump() assigns a fresh sequence number per attempt
     );
-    req.push(libc::AF_UNSPEC as u8);
-    req.push(0);
-    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-    req.extend_from_slice(&0i32.to_ne_bytes()); // ifi_index: all of them
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    put_ifinfomsg(&mut req, libc::AF_UNSPEC as u8, 0); // index 0: all of them
     put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_SKIP_STATS);
     req
 }
@@ -1036,12 +1031,7 @@ fn fdb_of_request(ifindex: u32) -> Vec<u8> {
         NLM_F_REQUEST | NLM_F_DUMP,
         0, // dump() assigns a fresh sequence number per attempt
     );
-    req.push(libc::AF_BRIDGE as u8); // ifi_family
-    req.push(0);
-    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-    req.extend_from_slice(&(ifindex as i32).to_ne_bytes());
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    put_ifinfomsg(&mut req, libc::AF_BRIDGE as u8, ifindex as i32);
     req
 }
 
@@ -1049,12 +1039,7 @@ fn vf_request(index: u32, seq: u32) -> Vec<u8> {
     let len = NLMSG_HDR + IFINFOMSG_LEN + RTATTR_HDR + 4;
     let mut req = Vec::with_capacity(len);
     put_nlmsghdr(&mut req, len as u32, RTM_GETLINK, NLM_F_REQUEST, seq);
-    req.push(libc::AF_UNSPEC as u8);
-    req.push(0);
-    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-    req.extend_from_slice(&(index as i32).to_ne_bytes());
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
-    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    put_ifinfomsg(&mut req, libc::AF_UNSPEC as u8, index as i32);
     put_attr_u32(
         &mut req,
         IFLA_EXT_MASK,
@@ -1114,10 +1099,7 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
     let mut foreign_parent = false;
     for (kind, value) in attrs(&payload[IFINFOMSG_LEN..]) {
         match kind {
-            IFLA_IFNAME => {
-                let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
-                out.name = String::from_utf8_lossy(&value[..end]).into_owned();
-            }
+            IFLA_IFNAME => out.name = attr_cstr(value),
             // The length guard is the whole check. Written with `?` it could
             // abandon the WHOLE interface over one attribute - and an
             // interface that falls out of the reading takes its PF and the
@@ -1129,37 +1111,23 @@ fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
                 m.copy_from_slice(&value[..6]);
                 out.mac = Some(m);
             }
-            IFLA_MASTER if value.len() >= 4 => {
-                out.master = Some(u32::from_ne_bytes([value[0], value[1], value[2], value[3]]));
-            }
-            IFLA_LINK if value.len() >= 4 => {
-                let i = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                if i != 0 {
-                    out.link = Some(i);
-                }
-            }
+            IFLA_MASTER => out.master = attr_u32(value),
+            IFLA_LINK => out.link = attr_u32(value).filter(|i| *i != 0),
             // The parent lives in another namespace, and IFLA_LINK is then
             // an index THERE: believing it here would draw a lower edge to
             // whatever local interface happens to wear that number.
             IFLA_LINK_NETNSID => {
                 foreign_parent = true;
             }
-            IFLA_PARENT_DEV_NAME => {
-                let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
-                out.parent_dev = Some(String::from_utf8_lossy(&value[..end]).into_owned());
-            }
+            IFLA_PARENT_DEV_NAME => out.parent_dev = Some(attr_cstr(value)),
             IFLA_LINKINFO => {
                 for (nested, v) in attrs(value) {
                     match nested {
-                        IFLA_INFO_KIND => {
-                            let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
-                            out.kind = Some(String::from_utf8_lossy(&v[..end]).into_owned());
-                        }
+                        IFLA_INFO_KIND => out.kind = Some(attr_cstr(v)),
                         IFLA_INFO_DATA => {
                             for (inner, iv) in attrs(v) {
-                                if inner == IFLA_BR_AGEING_TIME && iv.len() >= 4 {
-                                    out.ageing =
-                                        Some(u32::from_ne_bytes([iv[0], iv[1], iv[2], iv[3]]));
+                                if inner == IFLA_BR_AGEING_TIME {
+                                    out.ageing = attr_u32(iv).or(out.ageing);
                                 }
                             }
                         }
@@ -1388,6 +1356,24 @@ fn collect_vf_macs(payload: &[u8], out: &mut Vec<(u32, [u8; 6])>) {
 fn attr_u32(v: &[u8]) -> Option<u32> {
     v.get(..4)
         .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// A string attribute up to the NUL the kernel puts on names, or the whole
+/// attribute where there is none.
+fn attr_cstr(v: &[u8]) -> String {
+    let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+    String::from_utf8_lossy(&v[..end]).into_owned()
+}
+
+/// The `ifinfomsg` behind every link-shaped request: family, then the index
+/// - zero for all of them - with type, flags and change mask zero.
+fn put_ifinfomsg(buf: &mut Vec<u8>, family: u8, index: i32) {
+    buf.push(family);
+    buf.push(0);
+    buf.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    buf.extend_from_slice(&index.to_ne_bytes());
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
 }
 
 pub fn format_mac(mac: &[u8; 6]) -> String {
@@ -2242,6 +2228,164 @@ mod tests {
             "waited {:?} for an answer that had already arrived",
             started.elapsed()
         );
+    }
+
+    /// The other way a kernel ends a single question: NLMSG_DONE carrying
+    /// a negative code says the question FAILED. Read as "nothing to
+    /// report", a VF list would come back short and lose its exclusions.
+    #[test]
+    fn a_question_ended_with_an_error_code_is_a_failure() {
+        let (mut sock, kernel) = kernel_pair();
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETLINK, NLM_F_REQUEST, 7);
+        send_raw(
+            &kernel,
+            &msg_seq(NLMSG_DONE, 7, &(-libc::ENOMEM).to_ne_bytes()),
+        );
+        let err = sock
+            .request_one(&req, RTM_NEWLINK, &mut |_| {})
+            .expect_err("a DONE with a code is not an answer");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOMEM));
+    }
+
+    /// No acknowledgement is asked for on a dump, so an NLMSG_ERROR there
+    /// is only ever bad news - even one whose code reads zero. Taken as the
+    /// end of the dump, an "empty" table would have every registration
+    /// removed.
+    #[test]
+    fn an_error_of_code_zero_does_not_end_a_dump() {
+        let (mut sock, kernel) = kernel_pair();
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
+                if n < NLMSG_HDR as isize {
+                    return;
+                }
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                send_raw(&kernel, &msg_seq(NLMSG_ERROR, seq, &0i32.to_ne_bytes()));
+            }
+        });
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETNEIGH, NLM_F_REQUEST, 0);
+        let got = sock.dump_from(
+            64 * 1024,
+            &req,
+            RTM_NEWNEIGH,
+            "test",
+            |p, out: &mut Vec<usize>| out.push(p.len()),
+        );
+        drop(sock);
+        let _ = listener.join();
+        got.expect_err("an error message passed for a finished, empty dump");
+    }
+
+    /// A dump the kernel flags as interrupted - the table moved underneath
+    /// it - is asked again from the start, and only the clean attempt's
+    /// entries count. Handed over as finished, it would be a mixture of two
+    /// states with entries seen twice or not at all.
+    #[test]
+    fn an_interrupted_dump_is_asked_again_and_only_the_clean_one_counts() {
+        let (mut sock, kernel) = kernel_pair();
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut attempts = 0;
+            loop {
+                let n = recv_raw(kernel.as_raw_fd(), &mut buf);
+                if n < NLMSG_HDR as isize {
+                    return attempts;
+                }
+                attempts += 1;
+                let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+                let entry = |i: u8| ndmsg(1, 0x02, 0, Some([0x02, 0, 0, 0, 0, i]), Some(5));
+                if attempts == 1 {
+                    // One entry, flagged: the table moved while it was read.
+                    let mut m = msg_seq(RTM_NEWNEIGH, seq, &entry(1));
+                    m[6..8].copy_from_slice(&NLM_F_DUMP_INTR.to_ne_bytes());
+                    send_raw(&kernel, &m);
+                    send_raw(&kernel, &msg_seq(NLMSG_DONE, seq, &[]));
+                } else {
+                    let mut batch = Vec::new();
+                    for i in 0..3 {
+                        batch.extend_from_slice(&msg_seq(RTM_NEWNEIGH, seq, &entry(10 + i)));
+                    }
+                    send_raw(&kernel, &batch);
+                    send_raw(&kernel, &msg_seq(NLMSG_DONE, seq, &[]));
+                }
+            }
+        });
+        let mut req = Vec::new();
+        put_nlmsghdr(&mut req, NLMSG_HDR as u32, RTM_GETNEIGH, NLM_F_REQUEST, 0);
+        let got: Vec<u8> = sock
+            .dump_from(64 * 1024, &req, RTM_NEWNEIGH, "test", |p, out| {
+                if let Some(e) = parse_fdb(p) {
+                    out.push(e.mac[5]);
+                }
+            })
+            .expect("an interrupted dump is retried, not failed");
+        drop(sock);
+        let attempts = listener.join().unwrap();
+        assert_eq!(attempts, 2, "the interrupted attempt was not asked again");
+        assert_eq!(
+            got,
+            vec![10, 11, 12],
+            "the interrupted attempt's entry leaked through"
+        );
+    }
+
+    /// One wake takes the whole queue: three datagrams are one batch. And
+    /// the cap holds - what lies beyond it stays queued for the next wake
+    /// rather than starving the loop's clock.
+    #[test]
+    fn a_burst_is_drained_in_one_wake_up_to_the_cap() {
+        let (mut sock, kernel) = kernel_pair();
+        let learn = |i: u8| {
+            msg(
+                RTM_NEWNEIGH,
+                0,
+                &ndmsg(4, 0x02, 0, Some([2, 0, 0, 0, 0, i]), Some(9)),
+            )
+        };
+        for i in 1..=3 {
+            send_raw(&kernel, &learn(i));
+        }
+        let ev = sock.recv_events().unwrap();
+        assert_eq!(
+            ev.fdb.len(),
+            3,
+            "three datagrams have to come out of one wake"
+        );
+
+        let cap = Socket::DRAIN_CAP;
+        for i in 0..(cap + 2) {
+            send_raw(&kernel, &learn((i % 200) as u8));
+        }
+        let first = sock.recv_events().unwrap();
+        assert_eq!(first.fdb.len(), cap, "the drain went past its cap");
+        let rest = sock.recv_events().unwrap();
+        assert_eq!(rest.fdb.len(), 2, "what lay beyond the cap was lost");
+    }
+
+    /// An acknowledgement too short to carry a code is not one: booking a
+    /// registration that never happened as done leaves the guest's traffic
+    /// falling off the uplink until the next pass.
+    #[test]
+    fn a_short_acknowledgement_is_not_an_acknowledgement() {
+        let (mut sock, kernel) = kernel_pair();
+        let listener = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let n = recv_raw(kernel.as_raw_fd(), &mut buf);
+            if n < NLMSG_HDR as isize {
+                return;
+            }
+            let seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+            send_raw(&kernel, &msg_seq(NLMSG_ERROR, seq, &[0, 0]));
+        });
+        let err = sock
+            .set_self_fdb(3, &[2, 0, 0, 0, 0, 1], true)
+            .expect_err("two bytes passed for an acknowledgement");
+        assert!(err.raw_os_error().is_none(), "{err}");
+        let _ = listener.join();
     }
 
     /// A dump datagram larger than the buffer is asked for again into a
