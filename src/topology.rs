@@ -629,7 +629,10 @@ impl Topology {
                 out.extend(l.pf_netdevs.iter().copied());
             } else if l.numvfs > 0 {
                 out.push(cur);
-            } else {
+            } else if !l.is_bridge {
+                // A bond spreads its entries over its members; a bridge does
+                // not, and looking through one made every vnet VLAN on it an
+                // uplink candidate (seen on pve2: vmbr1.100:DMZ100).
                 stack.extend(l.slaves.iter().copied());
             }
         }
@@ -1554,6 +1557,44 @@ mod tests {
             costs[0].0.as_secs_f64() * 1e3,
             rest[rest.len() / 2].as_secs_f64() * 1e3,
             rest[0].as_secs_f64() * 1e3
+        );
+    }
+
+    /// A vnet VLAN on the host bridge has a card below it only through the
+    /// bridge, and a bridge does not spread its entries the way a bond does:
+    /// the VLAN is no uplink, and the stacked bridge's guests are the real
+    /// pair's business through `Reach`.
+    #[test]
+    fn a_vlan_on_a_bridge_is_no_uplink_candidate() {
+        let topo = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(1)
+            .add("nic1v0", 3, Some(mac(2)))
+            .physfn("nic1")
+            .master("vmbr1")
+            .add("vmbr1", 10, Some(mac(3)))
+            .bridge()
+            .lower("nic1v0")
+            .add("vmbr1.100", 11, Some(mac(3)))
+            .vlan_on("vmbr1")
+            .master("DMZ100")
+            .add("DMZ100", 20, Some(mac(4)))
+            .bridge()
+            .lower("vmbr1.100")
+            .build();
+        assert!(
+            topo.physical_functions(10).is_empty(),
+            "a bridge has no functions"
+        );
+        assert!(
+            topo.physical_functions(11).is_empty(),
+            "nor has a VLAN on it"
+        );
+        let pairs: Vec<(String, String)> = topo.autodetect().0;
+        assert_eq!(
+            pairs,
+            vec![("nic1v0".to_string(), "vmbr1".to_string())],
+            "only the VF is an uplink; vmbr1.100:DMZ100 is a phantom pair"
         );
     }
 
