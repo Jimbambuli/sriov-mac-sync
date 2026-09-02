@@ -475,11 +475,14 @@ say "S10: two uplinks on one card share its filter"
 # on the interface below it. Two such uplinks are two pairs but ONE list of
 # slots, and a pass that counted only its own share would let the card
 # overflow while both believed they had room.
-$NS ip link add vshare type dummy
+# Fixed addresses: a bridge takes the lowest of its ports' addresses, and
+# whether that is the uplink's (excluded as its own) or the guest port's
+# (wanted as the ward) must not be a coin toss the count below depends on.
+$NS ip link add vshare address 02:00:00:00:aa:00 type dummy
 $NS ip link add link vshare name vshare.11 type vlan id 11
 $NS ip link add link vshare name vshare.12 type vlan id 12
-$NS ip link add vbr1 type bridge
-$NS ip link add vbr2 type bridge
+$NS ip link add vbr1 address 02:00:00:00:b1:01 type bridge
+$NS ip link add vbr2 address 02:00:00:00:b2:02 type bridge
 $NS ip link set vshare.11 master vbr1
 $NS ip link set vshare.12 master vbr2
 $NS ip link add vg1 type veth peer name vg1p

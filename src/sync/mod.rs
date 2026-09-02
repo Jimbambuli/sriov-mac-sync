@@ -54,7 +54,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::netlink::{format_mac, FdbEntry, Socket};
-use crate::topology::{Anatomy, Topology};
+use crate::topology::{Anatomy, Learn, Reach, Topology};
 
 pub type Mac = [u8; 6];
 
@@ -80,9 +80,9 @@ enum FastPhase {
 
 struct FastPair {
     anat: Anatomy,
+    reach: Reach,
     /// kept for the messages a person reads
     dev: String,
-    bridge: u32,
     /// the interface of the bridge this uplink is enslaved through
     port: u32,
     /// the uplink's own interface index, which the filter is written to
@@ -1709,6 +1709,7 @@ impl Syncer {
         // and keeping its addresses would steer wire traffic into the
         // bridge.
         let wireward = topo.subtree_of(&[anat.port]);
+        let reach = topo.reach(anat.bridge);
         for m in owned_before {
             if want.contains(m) || wire.contains(m) || skip.contains(m) {
                 continue;
@@ -1729,7 +1730,7 @@ impl Syncer {
             // the inverse walk of the same edges desired() takes downward
             // through `uplink_ward` and `relevant`.
             let reachable = match topo.bridge_above(p) {
-                Some((br, _)) => topo.leads_to(br, anat.bridge),
+                Some((br, _)) => reach.reaches(br),
                 None => false,
             };
             if !reachable {
@@ -1765,21 +1766,7 @@ impl Syncer {
         // interface. A busy host has thousands of forwarding entries and a
         // few dozen interfaces, and asking the same structural question over
         // and over is what made this daemon show up in `top` at all.
-        let uplink_ward: Set<u32> = topo.stacked_above(bridge);
-
-        // Bridges stacked on the uplink bridge. Their tables hold the guests
-        // whose addresses the lower bridge never learns: that traffic enters it
-        // from the bridge's own local port, and a bridge does not learn from
-        // itself.
-        let mut relevant: Map<u32, String> = crate::hash::map();
-        for b in topo.bridges() {
-            if b.index == bridge {
-                continue;
-            }
-            if b.slaves.iter().any(|p| uplink_ward.contains(p)) {
-                relevant.insert(b.index, b.name.clone());
-            }
-        }
+        let reach = topo.reach(bridge);
 
         let mut wire: Set<Mac> = crate::hash::set();
         let mut want: Set<Mac> = crate::hash::set();
@@ -1795,19 +1782,18 @@ impl Syncer {
                 continue;
             }
             let Some(master) = e.master else { continue };
-            if master == bridge_link.index {
-                if e.ifindex == anat.port {
-                    // out on the wire: registering it would divert its traffic
-                    // to the bridge, which cannot send it back out of the port
-                    // it arrived on
+            match reach.classify(e.ifindex, master, anat.port) {
+                // out on the wire: registering it would divert its traffic
+                // to the bridge, which cannot send it back out of the port
+                // it arrived on
+                Learn::Wire => {
                     wire.insert(e.mac);
-                } else {
+                }
+                Learn::Behind => {
                     want.insert(e.mac);
                     learnt_at.insert(e.mac, e.ifindex);
                 }
-            } else if relevant.contains_key(&master) && !uplink_ward.contains(&e.ifindex) {
-                want.insert(e.mac);
-                learnt_at.insert(e.mac, e.ifindex);
+                Learn::NotOurs => {}
             }
         }
 
@@ -1818,11 +1804,11 @@ impl Syncer {
         if let Some(mac) = bridge_link.mac {
             want.insert(mac);
         }
-        for index in &uplink_ward {
-            if *index == bridge {
+        for index in topo.stacked_above(bridge) {
+            if index == bridge {
                 continue;
             }
-            if let Some(mac) = topo.at(*index).and_then(|l| l.mac) {
+            if let Some(mac) = topo.at(index).and_then(|l| l.mac) {
                 want.insert(mac);
             }
         }
@@ -1839,7 +1825,10 @@ impl Syncer {
 
         want.retain(|m| !skip.contains(m) && is_registerable(m));
 
-        let mut stacked: Vec<String> = relevant.into_values().collect();
+        let mut stacked: Vec<String> = reach
+            .stacked_bridges()
+            .filter_map(|b| topo.name_of(b).map(str::to_string))
+            .collect();
         stacked.sort();
         (want, stacked, wire, learnt_at)
     }
@@ -2559,9 +2548,10 @@ impl Syncer {
                 // full pass, which says so out loud.
                 let anat = topo.anatomy(dev, bridge)?;
                 let skip = self.exclusions(topo, &anat, &vf_macs);
+                let reach = topo.reach(bridge);
                 Some(FastPair {
+                    reach,
                     dev: p.dev.clone(),
-                    bridge,
                     index: dev,
                     port: anat.port,
                     skip,
@@ -2982,8 +2972,10 @@ impl Syncer {
                 ours = true;
                 continue;
             }
-            if entry.ifindex == fp.port {
-                continue; // on the wire; handled before any of this
+            match fp.reach.classify(entry.ifindex, master, fp.port) {
+                Learn::Wire => continue, // on the wire; handled before any of this
+                Learn::NotOurs => continue,
+                Learn::Behind => {}
             }
             // An inner learn of an address this very batch saw on the wire:
             // the wire has the last word, so it is not registered - but the
@@ -2995,22 +2987,6 @@ impl Syncer {
             // that is wire and nothing else stays passless.
             if fp.reflected.contains(&entry.mac) {
                 ours = true;
-                continue;
-            }
-            if master != fp.bridge {
-                // only bridges stacked on the uplink bridge are of interest
-                let Some(master_link) = topo.at(master) else {
-                    continue;
-                };
-                if !master_link
-                    .slaves
-                    .iter()
-                    .any(|p| topo.leads_to(*p, fp.bridge))
-                {
-                    continue;
-                }
-            }
-            if topo.leads_to(entry.ifindex, fp.bridge) {
                 continue;
             }
             ours = true;

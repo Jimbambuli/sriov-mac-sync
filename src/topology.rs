@@ -81,6 +81,58 @@ pub struct Link {
     pub slaves: Vec<u32>,
 }
 
+/// What a learn means to one bridge, worked out once per bridge: the
+/// interfaces stacked above it (uplink-ward: a learn there faces the
+/// host, never a guest) and the bridges stacked on it (whose learns are
+/// guests the lower bridge never sees). One spelling for the pass, the
+/// event path and the quiet-keep, which each used to walk this on their
+/// own - and one of them had drifted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reach {
+    pub bridge: u32,
+    uplink_ward: Set<u32>,
+    stacked_bridges: Set<u32>,
+}
+
+/// What a learnt address is to a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Learn {
+    /// on the uplink port itself: a peer out on the wire
+    Wire,
+    /// behind the bridge, or behind a bridge stacked on it: wanted
+    Behind,
+    /// somebody else's bridge, or an uplink-ward interface
+    NotOurs,
+}
+
+impl Reach {
+    /// A learn of `ifindex` recorded by bridge `master`, seen from the pair
+    /// whose uplink enters through `port`.
+    pub fn classify(&self, ifindex: u32, master: u32, port: u32) -> Learn {
+        if master == self.bridge {
+            if ifindex == port {
+                Learn::Wire
+            } else {
+                Learn::Behind
+            }
+        } else if self.stacked_bridges.contains(&master) && !self.uplink_ward.contains(&ifindex) {
+            Learn::Behind
+        } else {
+            Learn::NotOurs
+        }
+    }
+
+    /// Whether a bridge's ports count as behind this one: the bridge
+    /// itself, or one stacked on it.
+    pub fn reaches(&self, bridge: u32) -> bool {
+        bridge == self.bridge || self.stacked_bridges.contains(&bridge)
+    }
+
+    pub fn stacked_bridges(&self) -> impl Iterator<Item = u32> + '_ {
+        self.stacked_bridges.iter().copied()
+    }
+}
+
 /// See `Topology::anatomy`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Anatomy {
@@ -586,6 +638,26 @@ impl Topology {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// See `Reach`. One flood up from the bridge answers for every learn
+    /// of the pass, where asking per entry walked the same edges each time.
+    pub fn reach(&self, bridge: u32) -> Reach {
+        let uplink_ward = self.stacked_above(bridge);
+        let stacked_bridges = self
+            .bridges()
+            .iter()
+            // `lowers`, not `slaves`: a bridge's ports are both, but the walk
+            // every other question here takes is over lowers, and the two
+            // spellings this replaces had drifted exactly on that.
+            .filter(|b| b.index != bridge && b.lowers.iter().any(|p| uplink_ward.contains(p)))
+            .map(|b| b.index)
+            .collect();
+        Reach {
+            bridge,
+            uplink_ward,
+            stacked_bridges,
+        }
     }
 
     /// What a pair is made of. One answer to the four questions every
@@ -1377,6 +1449,58 @@ mod tests {
                 ("nic2v0".to_string(), "br0".to_string())
             ]
         );
+    }
+
+    /// One answer to "is this learn ours" for the pass, the event path and
+    /// the quiet-keep. On the stacked host: a learn on the uplink is wire,
+    /// behind vmbr1 is wanted, behind IOT (stacked on vmbr1) is wanted, on
+    /// the VLAN interface that leads back down is uplink-ward, and a bridge
+    /// that is not stacked on ours is nobody's business.
+    #[test]
+    fn reach_classifies_a_learn_the_same_way_for_everyone() {
+        let t = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .master("vmbr1")
+            .vfs(1)
+            .add("vmbr1", 10, Some(mac(1)))
+            .bridge()
+            .lower("nic1")
+            .add("vmbr1.44", 11, Some(mac(1)))
+            .master("IOT")
+            .lower("vmbr1")
+            .add("IOT", 12, Some(mac(0x12)))
+            .bridge()
+            .lower("vmbr1.44")
+            .lower("veth0")
+            .add("veth0", 13, Some(mac(0x13)))
+            .master("IOT")
+            .add("other", 20, Some(mac(0x20)))
+            .bridge()
+            .lower("vethz")
+            .add("vethz", 21, Some(mac(0x21)))
+            .master("other")
+            .build();
+        let idx = |n: &str| t.index_of(n).unwrap();
+        let r = t.reach(idx("vmbr1"));
+        let port = idx("nic1");
+        assert_eq!(
+            r.classify(idx("nic1"), idx("vmbr1"), port),
+            super::Learn::Wire
+        );
+        assert_eq!(
+            r.classify(idx("veth0"), idx("IOT"), port),
+            super::Learn::Behind
+        );
+        assert_eq!(
+            r.classify(idx("vmbr1.44"), idx("IOT"), port),
+            super::Learn::NotOurs,
+            "learnt on the VLAN interface that leads back down: uplink-ward"
+        );
+        assert_eq!(
+            r.classify(idx("vethz"), idx("other"), port),
+            super::Learn::NotOurs
+        );
+        assert!(r.reaches(idx("vmbr1")) && r.reaches(idx("IOT")) && !r.reaches(idx("other")));
     }
 
     #[test]
