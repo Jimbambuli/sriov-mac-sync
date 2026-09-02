@@ -139,7 +139,7 @@ pub struct Anatomy {
     pub siblings: Vec<u32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Topology {
     pub links: Map<u32, Link>,
     by_name: Map<String, u32>,

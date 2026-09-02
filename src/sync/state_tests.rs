@@ -4253,12 +4253,13 @@ fn a_relearn_buys_no_slot_and_sheds_nothing() {
     let mut sock2 = kernel(vec![card_holds(2, quiet), learned(4, 10, live)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
 
-    // Sitting exactly on the margin: allowed = 7 - 4 = 3, occupancy 3.
+    // Sitting exactly on the margin: allowed = 7 - 4 = 3, the card holds 3.
     // A re-learn of `live` must not be read as a fourth slot.
     s.max_macs = 7;
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let mut sock3 = FakeSock {
         vf: vec![(2, VF_ADMIN)],
+        fdb: sock2.card_after(2),
         ..Default::default()
     };
     s.fast_apply(&mut sock3, &topo, &[(RTM_NEWNEIGH, learned(4, 10, live))])
@@ -5080,11 +5081,141 @@ fn a_stamp_never_moves_backwards_whoever_writes_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A batch that re-learns a keep and brings a newcomer must not surrender
+/// the address it is re-learning: the learn stamps it now, and only stamps
+/// older than the last pass are candidates.
+#[test]
+fn a_batch_never_sheds_its_own_relearn() {
+    let dir = scratch("shed-not-relearn");
+    let a: Mac = [0x02, 0xed, 0, 0, 0, 1];
+    let b: Mac = [0x02, 0xed, 0, 0, 0, 2];
+    let topo = small_host();
+    let mut s = br0_syncer(&dir);
+    let mut sock = kernel(vec![learned(4, 10, a), learned(4, 10, b)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    // Both age out and are kept.
+    let mut sock2 = kernel(vec![card_holds(2, a), card_holds(2, b)]);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+
+    // Room for two: the card holds three, a newcomer needs a slot.
+    s.max_macs = 6;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let newcomer: Mac = [0x02, 0xed, 0, 0, 0, 9];
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fdb: sock2.card_after(2),
+        ..Default::default()
+    };
+    s.fast_apply(
+        &mut ev,
+        &topo,
+        &[
+            (RTM_NEWNEIGH, learned(4, 10, a)),
+            (RTM_NEWNEIGH, learned(4, 10, newcomer)),
+        ],
+    )
+    .unwrap();
+    assert!(
+        ev.removed.iter().any(|(_, m)| *m == b),
+        "the quiet keep b should have paid for the newcomer"
+    );
+    assert!(
+        !ev.removed.iter().any(|(_, m)| *m == a),
+        "the address this very batch re-learnt was surrendered"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A batch on a VLAN uplink measures its room against the card below it,
+/// where three VLANs of one function share one list: the sister VLAN's
+/// entries count, and the valve fires when the CARD is full, not when this
+/// uplink's own share is.
+#[test]
+fn a_batch_on_a_vlan_uplink_counts_the_whole_card() {
+    let dir = scratch("vlan-batch-card");
+    let topo = vlan_host();
+    let g1: Mac = [0x02, 0xe1, 0, 0, 0, 1];
+    let mut s = Syncer::new(
+        vec![Pair {
+            dev: "nic1.100".into(),
+            bridge: "br100".into(),
+        }],
+        dir.to_path_buf(),
+    );
+    s.authoritative = true;
+    let mut sock = kernel(vec![learned(4, 10, g1)]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+    // g1 goes quiet; the sister uplink holds six entries on the card.
+    let mut held = vec![card_holds(20, g1), card_holds(2, g1), card_holds(2, mac(3))];
+    held.extend((1..=6u8).map(|i| card_holds(2, [0x02, 0xff, 0, 0, 0, i])));
+    s.max_macs = 14;
+    let mut sock2 = kernel(held);
+    s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
+    std::thread::sleep(Dur::from_millis(5));
+
+    // The card holds eight; with eleven slots a newcomer does not fit
+    // without the keep. Judged by this uplink's own two, it would.
+    s.max_macs = 11;
+    s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
+    let mut fdb = sock2.card_after(20);
+    fdb.extend(sock2.card_after(2));
+    let mut ev = FakeSock {
+        vf: vec![(2, VF_ADMIN)],
+        fdb,
+        ..Default::default()
+    };
+    let newcomer: Mac = [0x02, 0xe1, 0, 0, 0, 9];
+    s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
+        .unwrap();
+    assert!(
+        ev.removed.iter().any(|(_, m)| *m == g1),
+        "the batch counted its own share instead of the card: {:?}",
+        ev.removed
+    );
+    assert!(ev.added.iter().any(|(_, m)| *m == newcomer));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A device that stopped being an uplink but whose note cannot be read keeps
+/// the note, and keeps what was said about it: the mark that makes the
+/// warning a one-off survives the sweep, or it came back every pass.
+#[test]
+fn an_orphan_with_an_unreadable_note_is_kept_and_said_once() {
+    let dir = scratch("orphan-unreadable-once");
+    let topo = small_host();
+    let mut s = Syncer::new(Vec::new(), dir.clone());
+    s.authoritative = true;
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nic9.owned");
+    fs::write(&path, [0xffu8, 0xfe, 0xfd]).unwrap();
+    fs::write(dir.join(".nic9.owned.index"), "2\n").unwrap();
+    let mut sock = kernel(vec![]);
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(path.exists(), "an unreadable note must not be unlinked");
+    assert!(
+        s.said.borrow().unreadable.contains("nic9"),
+        "the sweep forgot the mark, so the warning would come back every pass"
+    );
+    s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    assert!(path.exists());
+    assert!(s.said.borrow().unreadable.contains("nic9"));
+    // And a flush refuses it too, leaving the file where it is.
+    assert!(
+        !s.flush(&mut sock).unwrap(),
+        "a flush over an unreadable note is not clean"
+    );
+    assert!(path.exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A registration the card refused with a hard error is NOT in the card,
-/// and must not be recorded as if it were. The grow-gate reads
-/// owned-and-present as "re-learning this grows nothing" and skips the
-/// fresh driver question - so a wrongly-present address lets the next
-/// re-learn write a virtual function's own address into the filter.
+/// and the batch reads the card back rather than remembering: the next
+/// re-learn is a growth and asks the driver. Owned alone must not pass for
+/// present, or a virtual function's own address could follow the re-learn
+/// into the filter.
 #[test]
 fn a_refused_registration_is_not_recorded_as_present() {
     let dir = scratch("present-honest");

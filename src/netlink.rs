@@ -2226,6 +2226,14 @@ mod tests {
             RTM_GETNEIGH
         );
         assert_eq!(i32::from_ne_bytes(req[20..24].try_into().unwrap()), 42);
+        // The two bytes the kernel routes on: without AF_BRIDGE the request
+        // lands in the ARP table's dump, without NLM_F_DUMP in the single-
+        // entry getter.
+        assert_eq!(req[16], libc::AF_BRIDGE as u8);
+        assert_eq!(
+            u16::from_ne_bytes(req[6..8].try_into().unwrap()) & NLM_F_DUMP,
+            NLM_F_DUMP
+        );
     }
 
     #[test]

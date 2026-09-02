@@ -861,6 +861,10 @@ mod tests {
             /// 1-based wait() call numbers that fail, whatever else says
             wait_fail_calls: Vec<usize>,
             wait_calls: usize,
+            /// the reading to hand out instead of the fixtures, when set
+            topo_override: Option<Topology>,
+            /// when the operator knocks (--resync), if at all
+            resync_at: Option<Duration>,
             /// every pause the loop asked for
             paused: Vec<Duration>,
         }
@@ -883,6 +887,8 @@ mod tests {
                     fail_wait_times: 0,
                     wait_fail_calls: Vec::new(),
                     wait_calls: 0,
+                    topo_override: None,
+                    resync_at: None,
                     paused: Vec::new(),
                 }
             }
@@ -960,11 +966,20 @@ mod tests {
                 self.paused.push(wait);
                 self.offset += wait;
             }
+            fn resync_wanted(&mut self) -> bool {
+                if self.resync_at.is_some_and(|t| self.offset >= t) {
+                    self.resync_at = None;
+                    return true;
+                }
+                false
+            }
             fn read_topology(&mut self) -> Result<Topology, String> {
                 self.topo_calls += 1;
                 self.offset += self.read_cost;
                 if self.topo_fails {
                     Err("no picture today".into())
+                } else if let Some(t) = &self.topo_override {
+                    Ok(t.clone())
                 } else if self.offset < self.absent_until {
                     Ok(crate::topology::fixture::Builder::new()
                         .add("lo", 1, None)
@@ -1376,15 +1391,21 @@ mod tests {
             let (mut syncer, mut opts, _dir) = setup("filling", 300);
             // The operator's --max, the way run() wires it: the loop then
             // leaves the number alone.
-            opts.max_macs = 1;
+            // Ten slots, nine held: exactly nine tenths, the edge the rule
+            // is written at.
+            opts.max_macs = 10;
             opts.max_macs_set = true;
-            syncer.max_macs = 1;
-            // One address already on record. The file is the truth, so the
+            syncer.max_macs = 10;
+            let guests: Vec<[u8; 6]> = (1..=9u8).map(|i| [0x02, 0, 0, 0, 0, 0x60 + i]).collect();
+            // The addresses are on record. The file is the truth, so the
             // file is what the test writes.
             std::fs::create_dir_all(&syncer.state_dir).unwrap();
-            std::fs::write(syncer.state_dir.join("nic1.owned"), "02:00:00:00:00:60\n").unwrap();
+            let lines: String = guests
+                .iter()
+                .map(|m| format!("{}\n", crate::netlink::format_mac(m)))
+                .collect();
+            std::fs::write(syncer.state_dir.join("nic1.owned"), lines).unwrap();
             let gone = [0xaa, 0, 0, 0, 0, 0x54];
-            let kept = [0x02, 0, 0, 0, 0, 0x60];
             let mut world = FakeWorld::new(4).at(
                 1,
                 Ok(Events {
@@ -1392,10 +1413,11 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            // The recorded address is still wanted - it is learnt behind the
+            // The recorded addresses are still wanted - learnt behind the
             // bridge - or the first pass would settle the note back to
-            // nothing and the filter would not be filling any more.
-            world.fdb.fdb = vec![learned(3, 10, kept)];
+            // nothing and the filter would not be filling any more. Nine of
+            // ten: the bridge's own address is the uplink's and drops out.
+            world.fdb.fdb = guests.iter().map(|m| learned(3, 10, *m)).collect();
             daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
@@ -1480,9 +1502,10 @@ mod tests {
                 syncer.vf_stale,
                 "a link change nothing could judge kept the carried answer"
             );
-            assert!(
-                bought.is_some(),
-                "a batch nothing could judge has to buy a pass"
+            assert_eq!(
+                bought.map(|(_, label)| label),
+                Some("interface change"),
+                "a batch nothing could judge has to buy a pass, under its own name"
             );
             // And a learning batch without a reading registers nothing but
             // still buys the pass that will.
@@ -1496,11 +1519,87 @@ mod tests {
                 },
                 started,
             );
-            assert!(bought.is_some());
+            assert_eq!(bought.map(|(_, label)| label), Some("forwarding change"));
             assert!(
                 world.fdb.added.is_empty(),
                 "nothing may be registered blind"
             );
+        }
+
+        /// The operator's knock buys a pass at once, under its own name, and
+        /// that pass asks the driver afresh.
+        #[test]
+        fn a_resync_buys_a_distrusting_pass_at_once() {
+            let (mut syncer, opts, _dir) = setup("resync", 300);
+            let mut world = FakeWorld::new(8).at(3, Ok(Events::default()));
+            world.resync_at = Some(Duration::from_secs(3));
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert_eq!(
+                world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
+                vec![0, 3],
+                "the knock has to buy a pass now"
+            );
+            assert_eq!(
+                world.fdb.vf_asked, 2,
+                "and that pass believes nothing carried"
+            );
+        }
+
+        /// A link message is judged against the reading BEFORE the batch as
+        /// well as the fresh one: an interface that lost its functions is
+        /// only known to have had any by the reading before.
+        #[test]
+        fn a_link_change_is_judged_against_the_reading_before_it() {
+            let (mut syncer, _opts, _dir) = setup("before-picture", 300);
+            let mut world = FakeWorld::new(5);
+            // The reading before: nic1 hands out functions.
+            let mut last = Some(host(mac(1)));
+            // The fresh reading: nic1 is there, with nothing behind it.
+            world.topo_override = Some(
+                crate::topology::fixture::Builder::new()
+                    .add("nic1", 2, Some(mac(1)))
+                    .build(),
+            );
+            syncer.vf_stale = false;
+            let started = world.base;
+            handle_batch(
+                &mut world,
+                &mut syncer,
+                &mut last,
+                &netlink::Events {
+                    links_changed: true,
+                    changed_links: vec![2],
+                    ..Default::default()
+                },
+                started,
+            );
+            assert!(
+                syncer.vf_stale,
+                "the functions nic1 just lost were only in the reading before"
+            );
+        }
+
+        /// A fast path that fails - the driver would not answer - buys the
+        /// pass that will do its work, rather than ending the batch quietly.
+        #[test]
+        fn a_batch_whose_fast_path_fails_buys_a_pass() {
+            let (mut syncer, _opts, _dir) = setup("fast-path-fails", 300);
+            let mut world = FakeWorld::new(5);
+            let mut last = Some(host(mac(1)));
+            syncer.vf_stale = true; // the batch has to ask the driver ...
+            world.fdb.fail_vf = Some(libc::EIO); // ... and the driver refuses
+            let started = world.base;
+            let bought = handle_batch(
+                &mut world,
+                &mut syncer,
+                &mut last,
+                &netlink::Events {
+                    fdb: vec![(RTM_NEWNEIGH, learned(3, 10, [0x02, 0, 0, 0, 0, 0x78]))],
+                    ..Default::default()
+                },
+                started,
+            );
+            assert!(bought.is_some(), "a failed fast path has to buy a pass");
         }
     }
 }
