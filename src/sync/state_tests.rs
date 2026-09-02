@@ -588,10 +588,13 @@ fn reflection_keeps_what_a_parallel_writer_noted() {
 fn relearning_a_registered_address_buys_no_question() {
     let dir = scratch("owned-relearn");
     let topo = host(mac(1));
-    let (_, mut s, _) = registered(&dir);
+    let (_, mut s, first) = registered(&dir);
     assert!(s.load_owned("nic1").contains(&BEHIND_NIC));
     s.remember_vf(vec![2], Vec::new());
-    let mut sock = FakeSock::default();
+    let mut sock = FakeSock {
+        fdb: first.card_after(2),
+        ..Default::default()
+    };
     s.fast_apply(
         &mut sock,
         &topo,
@@ -4014,6 +4017,7 @@ fn a_future_stamp_is_clamped_not_believed() {
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xe7, 0, 0, 0, 9];
     let mut sock3 = FakeSock {
+        fdb: sock2b.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4138,6 +4142,7 @@ fn a_burst_over_capacity_sheds_a_keep_on_the_fast_path() {
     // the keep leaves in the same batch, the newcomer gets its slot.
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let mut sock3 = FakeSock {
+        fdb: sock2.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4185,9 +4190,11 @@ fn successive_batches_count_against_each_other() {
     s.max_macs = 8;
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomers: Vec<Mac> = (1..=3u8).map(|i| [0x02, 0xeb, 0, 0, 0, i]).collect();
-    let mut last = FakeSock::default();
+    // Each batch reads the card back, so each socket carries the last one's card.
+    let mut last = sock2;
     for m in &newcomers {
         last = FakeSock {
+            fdb: last.card_after(2),
             vf: vec![(2, VF_ADMIN)],
             ..Default::default()
         };
@@ -4284,6 +4291,7 @@ fn the_shedder_spares_the_live_and_the_incoming() {
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xed, 0, 0, 0, 9];
     let mut sock4 = FakeSock {
+        fdb: sock3.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4336,6 +4344,7 @@ fn a_fast_path_learn_makes_an_entry_young_again() {
     s.max_macs = 7;
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let mut sock4 = FakeSock {
+        fdb: sock3.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4345,6 +4354,7 @@ fn a_fast_path_learn_makes_an_entry_young_again() {
 
     let newcomer: Mac = [0x02, 0xee, 0, 0, 0, 9];
     let mut sock5 = FakeSock {
+        fdb: sock4.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4387,6 +4397,7 @@ fn a_refused_shed_keeps_its_note_line() {
         let mut fail = crate::hash::map();
         fail.insert(quiet, errno);
         let mut sock3 = FakeSock {
+            fdb: sock2.card_after(2),
             vf: vec![(2, VF_ADMIN)],
             fail_del: fail,
             ..Default::default()
@@ -4583,6 +4594,7 @@ fn the_capacity_arithmetic_survives_a_rename() {
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xf1, 0, 0, 0, 9];
     let mut sock4 = FakeSock {
+        fdb: sock3.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4602,6 +4614,7 @@ fn the_capacity_arithmetic_survives_a_rename() {
     // carried list the re-learn reads as a fresh slot and takes a keep
     // with it - here there are none left, so it would warn instead.
     let mut sock5 = FakeSock {
+        fdb: sock4.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4706,6 +4719,7 @@ fn the_shedder_stops_rather_than_take_a_living_guest() {
     let a: Mac = [0x02, 0xf2, 0, 0, 0, 8];
     let b: Mac = [0x02, 0xf2, 0, 0, 0, 9];
     let mut sock3 = FakeSock {
+        fdb: sock2.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4857,6 +4871,7 @@ fn a_deletion_says_how_long_after_the_pass_the_guest_spoke() {
     s.max_macs = 7;
     let newcomer: Mac = [0x02, 0xf4, 0, 0, 0, 9];
     let mut sock3 = FakeSock {
+        fdb: sock2.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -4914,6 +4929,7 @@ fn a_deletion_never_makes_an_address_older_than_it_is() {
     s.max_macs = 7;
     let newcomer: Mac = [0x02, 0xf5, 0, 0, 0, 9];
     let mut sock4 = FakeSock {
+        fdb: sock3.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -5063,11 +5079,6 @@ fn a_refused_registration_is_not_recorded_as_present() {
         s.load_owned("nic1").contains(&m),
         "a refused add keeps its note line for the retry"
     );
-    assert!(
-        !s.carried["nic1"].present.contains(&m),
-        "an address the card refused was recorded as present"
-    );
-
     // The re-learn is therefore a growth, and a growth asks the driver.
     let mut sock2 = FakeSock {
         vf: vec![(2, VF_ADMIN)],
@@ -5110,6 +5121,7 @@ fn the_fast_valve_never_sheds_a_pinned_address() {
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xf9, 0, 0, 0, 9];
     let mut sock3 = FakeSock {
+        fdb: sock2.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -5225,14 +5237,15 @@ fn a_shed_entry_stops_being_counted() {
     std::thread::sleep(Dur::from_millis(5));
     let mut sock2 = kernel(vec![card_holds(2, old)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    let before = s.carried["nic1"].present.len();
-    assert!(s.carried["nic1"].present.contains(&old));
+    let before = s.carried["nic1"].occupancy;
 
     s.max_macs = 5;
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xfc, 0, 0, 0, 9];
+    // The batch reads the card back for itself.
     let mut ev = FakeSock {
         vf: vec![(2, VF_ADMIN)],
+        fdb: sock2.card_after(2),
         ..Default::default()
     };
     s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
@@ -5242,17 +5255,12 @@ fn a_shed_entry_stops_being_counted() {
         "the silent entry should have been surrendered"
     );
     assert!(
-        !s.carried["nic1"].present.contains(&old),
-        "a surrendered address is still counted as being in the card"
-    );
-    assert!(
         !s.carried["nic1"].quiet.contains(&old),
         "a surrendered address is still offered to the next burst"
     );
     // One out, one in: the count says exactly that.
     assert_eq!(
-        s.carried["nic1"].present.len(),
-        before,
+        s.carried["nic1"].occupancy, before,
         "the occupancy did not follow what the valve did"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -5455,8 +5463,7 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![learned(4, 10, m)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let before = s.carried["nic1"].present.len();
-    assert!(s.carried["nic1"].present.contains(&m));
+    let before = s.carried["nic1"].occupancy;
 
     // It turns up on the wire, so the daemon takes it back out - and the
     // card says it was never there.
@@ -5464,18 +5471,15 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     let mut fail = crate::hash::map();
     fail.insert(m, libc::ENOENT);
     let mut ev = FakeSock {
+        fdb: sock.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         fail_del: fail,
         ..Default::default()
     };
     s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(2, 10, m))])
         .unwrap();
-    assert!(
-        !s.carried["nic1"].present.contains(&m),
-        "an entry the card said it did not have was still counted as present"
-    );
     assert_eq!(
-        s.carried["nic1"].present.len(),
+        s.carried["nic1"].occupancy,
         before - 1,
         "the slot it never occupied was never given back"
     );
@@ -5774,10 +5778,6 @@ fn a_keep_the_card_never_took_frees_no_slot() {
     };
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(s.load_owned("nic1").contains(&phantom), "still noted");
-    assert!(
-        !s.carried["nic1"].present.contains(&phantom),
-        "and not in the card"
-    );
 
     // Now a newcomer arrives with no room. The phantom is the only
     // candidate; surrendering it frees nothing, so the warning has to come.
@@ -5785,6 +5785,7 @@ fn a_keep_the_card_never_took_frees_no_slot() {
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let newcomer: Mac = [0x02, 0xd6, 0, 0, 0, 9];
     let mut ev = FakeSock {
+        fdb: sock2.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -5816,6 +5817,7 @@ fn the_two_capacity_warnings_do_not_clear_each_other() {
     s.max_macs = 5;
     s.remember_vf(vec![2], vec![(2, VF_ADMIN)]);
     let mut ev = FakeSock {
+        fdb: sock.card_after(2),
         vf: vec![(2, VF_ADMIN)],
         ..Default::default()
     };
@@ -5879,7 +5881,7 @@ fn a_pass_records_the_card_not_its_intent() {
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![learned(5, 10, stale), learned(4, 10, live)]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
-    let both = s.carried["nic1"].present.len();
+    let both = s.carried["nic1"].occupancy;
 
     // `stale` leaves the bridge AND its port goes, so the pass removes it.
     // `live` stays learnt behind vetha.
@@ -5904,12 +5906,8 @@ fn a_pass_records_the_card_not_its_intent() {
         sock2.removed.iter().any(|(_, m)| *m == stale),
         "the address whose port went should have been removed"
     );
-    assert!(
-        !s.carried["nic1"].present.contains(&stale),
-        "a removed address is still counted as being in the card"
-    );
     assert_eq!(
-        s.carried["nic1"].present.len(),
+        s.carried["nic1"].occupancy,
         both - 1,
         "the count did not follow the removal"
     );

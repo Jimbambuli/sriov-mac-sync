@@ -34,9 +34,10 @@ device behind a physical port in the bridge is blackholed by ageing all the
 same. What bounds the keep is capacity, not time: nearing the filter's limit,
 the entries silent longest are released first, and every fresh learn makes
 an entry young again. The pressure is measured against the card's own
-unicast list, read back each pass — foreign entries occupy real slots and
-count — and the event path carries that count between passes, surrendering
-the longest-silent keep synchronously when a burst would not fit: past its
+unicast list — foreign entries occupy real slots and count — read back by
+every pass and by every batch that has something to register, so the event
+path measures against the card as it is, surrendering the longest-silent keep
+synchronously when a burst would not fit: past its
 limit the card drops arbitrarily, and 200 ms of overflow is 200 ms of
 somebody unreachable. What stays free below the limit is a few slots of
 counting drift, not the blind tenth it once was. The entry also goes when

@@ -813,6 +813,12 @@ mod tests {
                 self.passes.push(self.offset);
                 self.fdb.dump_fdb()
             }
+            fn dump_fdb_of(
+                &mut self,
+                ifindex: u32,
+            ) -> std::io::Result<Vec<crate::netlink::FdbEntry>> {
+                self.fdb.dump_fdb_of(ifindex)
+            }
             fn dump_links(&mut self) -> std::io::Result<Vec<crate::netlink::LinkInfo>> {
                 self.fdb.dump_links()
             }

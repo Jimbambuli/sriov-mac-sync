@@ -64,6 +64,36 @@ pub(crate) struct FakeSock {
     pub(crate) meanwhile_del: Option<(PathBuf, Mac)>,
 }
 
+impl FakeSock {
+    /// What the card at `index` holds after everything this socket saw: its
+    /// `self` entries, plus what was added, minus what was removed. A batch
+    /// reads the card back, so a test hands the pass's card to the batch's
+    /// socket the way the kernel would.
+    pub(crate) fn card_after(&self, index: u32) -> Vec<FdbEntry> {
+        let mut held: Vec<Mac> = self
+            .fdb
+            .iter()
+            .filter(|e| e.is_self() && e.ifindex == index)
+            .map(|e| e.mac)
+            .collect();
+        for (i, m) in &self.added {
+            if *i == index && !held.contains(m) {
+                held.push(*m);
+            }
+        }
+        held.retain(|m| !self.removed.iter().any(|(i, r)| *i == index && r == m));
+        held.into_iter()
+            .map(|mac| FdbEntry {
+                ifindex: index,
+                master: None,
+                mac,
+                state: 0,
+                flags: 0x02, // NTF_SELF
+            })
+            .collect()
+    }
+}
+
 impl FdbWriter for FakeSock {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         Ok(self.fdb.clone())

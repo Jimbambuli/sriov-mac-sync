@@ -794,6 +794,17 @@ impl Socket {
         })
     }
 
+    /// The forwarding entries attached to one interface: for a bridge port,
+    /// the bridge's entries learnt on it and the interface's own `self` list.
+    pub fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>> {
+        let req = fdb_of_request(ifindex);
+        self.dump(&req, RTM_NEWNEIGH, "forwarding database", |payload, out| {
+            if let Some(e) = parse_fdb(payload) {
+                out.push(e);
+            }
+        })
+    }
+
     /// The addresses administratively set on the VFs of the named interfaces.
     ///
     /// Asked by index, one question each: the dump this replaced had the
@@ -998,6 +1009,30 @@ fn link_dump_request() -> Vec<u8> {
     req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
     req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
     put_attr_u32(&mut req, IFLA_EXT_MASK, RTEXT_FILTER_SKIP_STATS);
+    req
+}
+
+/// The request behind `dump_fdb_of`. Shaped as an `ifinfomsg`, not an
+/// `ndmsg`: the kernel reads the interface filter only from that shape
+/// (`valid_fdb_dump_legacy`) and takes an `ndmsg`-sized request as "every
+/// interface" whatever its index says - the shape `bridge fdb show dev X`
+/// sends.
+fn fdb_of_request(ifindex: u32) -> Vec<u8> {
+    let len = NLMSG_HDR + IFINFOMSG_LEN;
+    let mut req = Vec::with_capacity(len);
+    put_nlmsghdr(
+        &mut req,
+        len as u32,
+        RTM_GETNEIGH,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        0, // dump() assigns a fresh sequence number per attempt
+    );
+    req.push(libc::AF_BRIDGE as u8); // ifi_family
+    req.push(0);
+    req.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    req.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+    req.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
     req
 }
 
@@ -2182,6 +2217,24 @@ mod tests {
     /// The link dump skips the statistics too, and must keep skipping the
     /// VF details: the flag mask is the difference between one request and
     /// a firmware question per PF.
+    /// An `ndmsg`-sized dump request means "everything" to the kernel, so
+    /// the one-interface dump has to be `ifinfomsg`-sized with the index in
+    /// ifi_index - or it silently dumps the whole host.
+    #[test]
+    fn the_one_interface_fdb_dump_is_shaped_so_the_kernel_filters_it() {
+        let req = fdb_of_request(42);
+        assert_eq!(req.len(), NLMSG_HDR + IFINFOMSG_LEN);
+        assert_eq!(
+            u32::from_ne_bytes(req[0..4].try_into().unwrap()) as usize,
+            req.len()
+        );
+        assert_eq!(
+            u16::from_ne_bytes(req[4..6].try_into().unwrap()),
+            RTM_GETNEIGH
+        );
+        assert_eq!(i32::from_ne_bytes(req[20..24].try_into().unwrap()), 42);
+    }
+
     #[test]
     fn the_link_dump_asks_for_no_statistics_and_no_vf_details() {
         let req = link_dump_request();

@@ -190,12 +190,6 @@ pub enum Urgency {
 struct Registered {
     /// Addresses this call put into the card.
     put: Vec<Mac>,
-    /// Addresses the card is now known to hold because of this call: taken,
-    /// or refused with EEXIST. An address a hard error left out must NOT be
-    /// recorded as present - the grow-gate reads owned-and-present as
-    /// "re-learning grows nothing" and would skip the fresh driver question
-    /// that keeps a VF's own address out of the filter (invariant 2).
-    held: Vec<Mac>,
     /// What went wrong, for a caller that reports.
     failures: Vec<String>,
 }
@@ -203,12 +197,11 @@ struct Registered {
 /// What one pass left behind about an uplink's filter.
 #[derive(Default)]
 struct Carried {
-    /// WHICH addresses the card holds, foreign entries included; its length
-    /// is the occupancy. The note is no substitute: it says what is ours,
-    /// this what is in the card. A driver that cleared its list on link-down
-    /// leaves addresses noted but absent, and putting one back is a growth
-    /// that must ask the driver afresh.
-    present: Set<Mac>,
+    /// How many entries the card's list held when it was last read back -
+    /// by the pass, or by a batch with something to register - corrected by
+    /// what this process put in or took out since. A heuristic only (the
+    /// pass rate under an ageing burst); every decision reads the card.
+    occupancy: usize,
     /// The addresses the pass decided to keep. The one pool BOTH valves
     /// surrender from, so the event path can reach nothing the pass would
     /// not: by construction free of pinned EXTRA addresses, anything still
@@ -274,6 +267,15 @@ pub struct Detail {
 /// records what would be written and answers what a test injects.
 pub trait FdbWriter {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>>;
+    /// The entries attached to one interface. The kernel filters the dump;
+    /// a fake filters its table.
+    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>> {
+        Ok(self
+            .dump_fdb()?
+            .into_iter()
+            .filter(|e| e.ifindex == ifindex)
+            .collect())
+    }
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>>;
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>>;
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()>;
@@ -282,6 +284,9 @@ pub trait FdbWriter {
 impl FdbWriter for Socket {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         Socket::dump_fdb(self)
+    }
+    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>> {
+        Socket::dump_fdb_of(self, ifindex)
     }
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
         Socket::dump_links(self)
@@ -1246,7 +1251,6 @@ impl Syncer {
         macs: &[Mac],
     ) -> Option<Registered> {
         let mut put: Vec<Mac> = Vec::new();
-        let mut held: Vec<Mac> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         let refused = self.locked(dev, || {
             let Some(fresh) = self.append_owned_locked(dev, macs) else {
@@ -1256,20 +1260,13 @@ impl Syncer {
             let mut unclaim: Vec<Mac> = Vec::new();
             for mac in macs {
                 match sock.set_self_fdb(index, mac, true) {
-                    Ok(()) => {
-                        put.push(*mac);
-                        held.push(*mac);
-                    }
+                    Ok(()) => put.push(*mac),
                     // The dump a moment ago said absent, so somebody else - a
                     // --once in a second terminal - put it there in between.
                     // Claiming it would mean deleting their entry later, so
                     // this call's intent comes back out; a line that predates
                     // it was ours all along.
                     Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                        // Somebody else's entry, but an entry: it fills a
-                        // slot, and the next batch must not read it as
-                        // room.
-                        held.push(*mac);
                         if fresh.contains(mac) {
                             unclaim.push(*mac);
                         }
@@ -1296,11 +1293,7 @@ impl Syncer {
         if refused {
             return None;
         }
-        Some(Registered {
-            put,
-            held,
-            failures,
-        })
+        Some(Registered { put, failures })
     }
 
     /// How full the fullest uplink's filter is, as the last pass measured it
@@ -1321,42 +1314,51 @@ impl Syncer {
     pub fn fullest_filter(&self) -> usize {
         self.carried
             .values()
-            .map(|c| c.present.len())
+            .map(|c| c.occupancy)
             .max()
             .unwrap_or(0)
     }
 
-    /// The card is now known to hold these. Idempotent. Only ever called with
-    /// what the card really took or really had - an address a hard error left
-    /// out must not count as present, or the grow-gate skips the fresh driver
-    /// question (invariant 2).
-    fn card_now_holds(&mut self, dev: &str, macs: impl IntoIterator<Item = Mac>) {
-        let c = self.carried.entry(dev.to_string()).or_default();
-        for mac in macs {
-            c.present.insert(mac);
-        }
-    }
-
-    /// The card no longer holds these - taken out, or never had. Both free
-    /// the slot: a slot the count still claims is one the next burst will not
-    /// use, and the valve would shed one guest per burst while the card never
-    /// gets emptier. Surrendered is no longer kept either, or a second batch
-    /// counts the room twice.
-    fn card_no_longer_holds(&mut self, dev: &str, macs: &[Mac]) {
+    /// The card let these go - taken out, or never had. Surrendered is no
+    /// longer kept either, or a second batch counts the room twice.
+    fn card_let_go(&mut self, dev: &str, macs: &[Mac]) {
         let Some(c) = self.carried.get_mut(dev) else {
             return;
         };
         for mac in macs {
-            c.present.remove(mac);
             c.quiet.remove(mac);
         }
+        c.occupancy = c.occupancy.saturating_sub(macs.len());
     }
 
-    /// Surrender up to `need` kept addresses, longest-silent first - card,
-    /// note and memory together, under the note's lock. The fast path's arm
-    /// of the valve: a burst that would overflow the card cannot wait for a
-    /// pass, because past its limit the card drops arbitrarily. Returns how
-    /// many slots were really freed.
+    /// The uplink's own list as the card holds it now, read once per batch
+    /// and only for uplinks with something to register: the count the room
+    /// is measured against, and what makes a re-learn free.
+    fn read_back<'a>(
+        sock: &mut dyn FdbWriter,
+        pairs: &[FastPair],
+        dev: &str,
+        cache: &'a mut Map<String, Set<Mac>>,
+    ) -> io::Result<&'a Set<Mac>> {
+        if !cache.contains_key(dev) {
+            let mut held = crate::hash::set();
+            if let Some(fp) = pairs.iter().find(|f| f.dev == dev) {
+                for e in sock.dump_fdb_of(fp.index)? {
+                    if e.is_self() && e.ifindex == fp.index && e.is_unicast() {
+                        held.insert(e.mac);
+                    }
+                }
+            }
+            cache.insert(dev.to_string(), held);
+        }
+        Ok(&cache[dev])
+    }
+
+    /// Surrender up to `need` kept addresses, longest-silent first - card, note
+    /// and memory together, under the note's lock. The fast path's arm of the
+    /// valve: a burst that would overflow the card cannot wait for a pass,
+    /// because past its limit the card drops arbitrarily. Returns how many
+    /// slots were really freed, judged against `present`, the list as read.
     fn shed_keeps(
         &mut self,
         sock: &mut dyn FdbWriter,
@@ -1364,6 +1366,7 @@ impl Syncer {
         index: u32,
         need: usize,
         topo: &Topology,
+        present: &Set<Mac>,
     ) -> usize {
         // An unreadable note is a device to leave alone, as on every removal
         // path. Asked by reading, not by the mark: the mark is set only once
@@ -1421,19 +1424,17 @@ impl Syncer {
             }
         }
         self.save_ports(dev, topo, passed_at);
-        // Counted BEFORE the bookkeeping is told: how many slots this really
-        // freed. Candidates come from the note, which deliberately keeps an
-        // address whose registration failed - deleting it frees nothing, and
-        // reporting it freed let the caller skip the over-limit warning.
+        // How many slots this really freed: candidates come from the note,
+        // which deliberately keeps an address whose registration failed -
+        // deleting it frees nothing, and reporting it freed let the caller
+        // skip the over-limit warning.
         //
         // Still deleted, all of them: filtering against what the card holds
         // would make an address the card never took unsheddable for ever -
         // re-registered by every pass while the valve surrenders real keeps
         // for a slot nobody occupies.
-        let freed = self.carried.get(dev).map_or(0, |c| {
-            dropped.iter().filter(|m| c.present.contains(*m)).count()
-        });
-        self.card_no_longer_holds(dev, &dropped);
+        let freed = dropped.iter().filter(|m| present.contains(*m)).count();
+        self.card_let_go(dev, &dropped);
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
              address(es) [pressure]",
@@ -1942,10 +1943,6 @@ impl Syncer {
             let mut removed = 0usize;
             let mut foreign = 0usize;
 
-            // What the card holds because of this pass's additions - taken,
-            // or refused as already there. What a hard error left out is
-            // absent.
-            let mut landed: Vec<Mac> = Vec::new();
             let mut to_add: Vec<Mac> = Vec::new();
             for mac in &want {
                 if present.contains(mac) {
@@ -1970,7 +1967,6 @@ impl Syncer {
                     Some(mut r) => {
                         added = r.put.len();
                         owned.extend(r.put);
-                        landed = r.held;
                         timings.failures.append(&mut r.failures);
                     }
                     None => {
@@ -2114,21 +2110,13 @@ impl Syncer {
                     self.said.borrow_mut().tight.remove(&pair.dev);
                 }
             }
-            // What the fast path counts from until the next pass: `want` plus
-            // the foreign entries nobody here may touch.
-            // What the card holds when this pass is done, observed: the dump,
-            // plus the additions that really landed, minus the removals that
-            // really took. An address a hard error left out stays absent -
-            // the grow-gate must ask the driver afresh when it comes back.
-            let mut holds: Set<Mac> = present.iter().copied().collect();
-            holds.extend(landed);
-            for mac in &dropped {
-                holds.remove(mac);
-            }
             self.carried.insert(
                 pair.dev.clone(),
                 Carried {
-                    present: holds,
+                    // The list as read, plus what this pass put in, less what
+                    // it took out: the next batch's ground until it reads
+                    // back itself.
+                    occupancy: (present.len() + added).saturating_sub(dropped.len()),
                     quiet: kept.clone(),
                     // A pass that could not read its note refreshed no stamp,
                     // so it must not advance the ground either: every live
@@ -2392,7 +2380,7 @@ impl Syncer {
                 // ENOENT as much as Ok: an entry the card says it does not
                 // have occupies nothing, and leaving it counted made the next
                 // burst measure against a free slot.
-                self.card_no_longer_holds(&fp.dev, &dropped);
+                self.card_let_go(&fp.dev, &dropped);
                 // And out of the written-down memory: an eviction only in RAM
                 // could come back through the file after a crash once the
                 // wire evidence has aged, re-registering the address this
@@ -2425,6 +2413,8 @@ impl Syncer {
         // healed by the next pass; growing on it sends a guest's traffic past
         // it for up to the whole interval. Price: one driver question per
         // growing batch - ~0.9 ms on mlx5, ~0.01 ms on Intel and mlx4.
+        // The card's list as it is now, per uplink that has a candidate.
+        let mut present_of: Map<String, Set<Mac>> = crate::hash::map();
         if vf_carried {
             let mut would: Map<String, Vec<(Mac, u32)>> = crate::hash::map();
             for (kind, entry) in events {
@@ -2433,17 +2423,18 @@ impl Syncer {
                 }
                 self.fast_add(topo, entry, &pairs, &mut would, FastPhase::Decide);
             }
-            // Ours AND still in the card was vetted by the fresh answer that
-            // let it in; re-learning it grows nothing - without this the tail
-            // of a burst bought one driver question per re-learn. Owned alone
-            // is not enough: a driver that cleared its list on link-down
-            // leaves addresses noted but gone, and putting one back IS a
-            // growth that must ask, or a VF that meanwhile claimed the
-            // address gets it registered past its guest.
+            // Ours AND in the card was vetted by the fresh answer that let it
+            // in; re-learning it grows nothing - without this the tail of a
+            // burst bought one driver question per re-learn. Owned alone is
+            // not enough: a driver that cleared its list on link-down leaves
+            // addresses noted but gone, and putting one back IS a growth that
+            // must ask, or a VF that meanwhile claimed the address gets it
+            // registered past its guest. "In the card" is read back, not
+            // remembered.
             for (dev, macs) in would.iter_mut() {
-                let present = self.carried.get(dev).map(|c| &c.present);
+                let present = Self::read_back(sock, &pairs, dev, &mut present_of)?;
                 self.with_owned(dev, |o| {
-                    macs.retain(|(m, _)| !(o.contains(m) && present.is_some_and(|p| p.contains(m))))
+                    macs.retain(|(m, _)| !(o.contains(m) && present.contains(m)))
                 });
             }
             would.retain(|_, macs| !macs.is_empty());
@@ -2535,17 +2526,18 @@ impl Syncer {
                     Self::note_seen(ports, *mac, learnt_on.get(mac).copied(), now);
                 }
             }
+            let present = Self::read_back(sock, &pairs, &dev, &mut present_of)?;
             let allowed = self.limit_of(&dev).saturating_sub(CAPACITY_HEADROOM);
-            let est = self.carried.get(&dev).map_or(0, |c| c.present.len());
-            // Only what would take a NEW slot. An address the card already
-            // holds costs nothing to re-register - counting it would shed
-            // keeps to make room for something that is already in.
-            let fresh_slots = match self.carried.get(&dev) {
-                Some(c) => macs.iter().filter(|m| !c.present.contains(*m)).count(),
-                None => macs.len(),
+            // Only what would take a NEW slot: an address the card already
+            // holds costs nothing to re-register.
+            let fresh_slots = macs.iter().filter(|m| !present.contains(*m)).count();
+            let over = (present.len() + fresh_slots).saturating_sub(allowed);
+            let freed = if over > 0 {
+                self.shed_keeps(sock, &dev, fp.index, over, topo, present)
+            } else {
+                0
             };
-            let over = (est + fresh_slots).saturating_sub(allowed);
-            if over > 0 && self.shed_keeps(sock, &dev, fp.index, over, topo) < over {
+            if over > 0 && freed < over {
                 // The one moment the daemon knowingly writes past the
                 // filter's limit. Said once per stay: past the limit the card
                 // drops silently, and an operator who never hears looks for
@@ -2563,8 +2555,8 @@ impl Syncer {
                 }
             }
             self.note_index(&dev, fp.index);
-            let held = match self.register_batch_locked(sock, &dev, fp.index, &macs) {
-                Some(r) => r.held,
+            let put = match self.register_batch_locked(sock, &dev, fp.index, &macs) {
+                Some(r) => r.put.len(),
                 None => {
                     // A batch of ours already bought the pass, which says
                     // the held-back count out loud and retries.
@@ -2573,14 +2565,12 @@ impl Syncer {
                          ownership note has to take them first and could not",
                         macs.len()
                     );
-                    Vec::new()
+                    0
                 }
             };
-            // Only what the card is KNOWN to hold: taken, or refused as
-            // already there. An address a hard error left out must not count
-            // as present, or the grow-gate skips the fresh driver question
-            // (invariant 2). The next pass's read-back corrects drift.
-            self.card_now_holds(&dev, held);
+            // The next batch's ground until it reads back itself.
+            self.carried.entry(dev.clone()).or_default().occupancy =
+                present.len().saturating_sub(freed) + put;
         }
         Ok(urgency)
     }
