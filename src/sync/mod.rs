@@ -58,6 +58,79 @@ use crate::topology::{Anatomy, Learn, Reach, Topology};
 
 pub type Mac = [u8; 6];
 
+/// Everything said once, per device. One place, so a device that leaves
+/// or is renamed loses every mark in one call: review eight found the
+/// orphan sweep had forgotten two of these, review nine tended the rest
+/// by hand. A new mark goes here, and `forget` and `rename` take it up -
+/// the test holds `forget` to leaving nothing behind.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Said {
+    /// a virtual function whose address cannot be known
+    pub unknown_vf: Set<String>,
+    /// pinned addresses that could not be registered, per device
+    pub extra: Map<String, Set<Mac>>,
+    /// the filter is over its limit
+    pub over: Set<String>,
+    /// a batch found no room
+    pub tight: Set<String>,
+    /// which addresses are being kept quiet, per device
+    pub quiet: Map<String, Set<Mac>>,
+    /// the note could not be read
+    pub unreadable: Set<String>,
+    /// the note's lock could not be taken
+    pub lock: Set<String>,
+    /// the port memory could not be written
+    pub ports: Set<String>,
+}
+
+impl Said {
+    /// A device that stopped being an uplink: a return announces afresh.
+    pub fn forget(&mut self, dev: &str) {
+        let Said {
+            unknown_vf,
+            extra,
+            over,
+            tight,
+            quiet,
+            unreadable,
+            lock,
+            ports,
+        } = self;
+        unknown_vf.remove(dev);
+        extra.remove(dev);
+        over.remove(dev);
+        tight.remove(dev);
+        quiet.remove(dev);
+        unreadable.remove(dev);
+        lock.remove(dev);
+        ports.remove(dev);
+    }
+
+    /// A device renamed: what was said stays said under the new name.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        let Said {
+            unknown_vf,
+            extra,
+            over,
+            tight,
+            quiet,
+            unreadable,
+            lock,
+            ports,
+        } = self;
+        for set in [unknown_vf, over, tight, unreadable, lock, ports] {
+            if set.remove(old) {
+                set.insert(new.to_string());
+            }
+        }
+        for map in [extra, quiet] {
+            if let Some(v) = map.remove(old) {
+                map.insert(new.to_string(), v);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Pair {
     pub dev: String,
@@ -300,20 +373,6 @@ pub struct Syncer {
     pub orphan_grace: Duration,
     /// When each noted device was first seen to be missing.
     absent_since: Map<String, Instant>,
-    /// Uplinks already told about, so the warning appears when the situation
-    /// arises rather than once per pass for ever.
-    warned_unknown_vf: Set<String>,
-    /// Devices whose note could not be read. Not "owns nothing" - nothing may
-    /// overwrite or unlink one of these.
-    unreadable: std::cell::RefCell<Set<String>>,
-    /// Devices whose lock file could not be opened, already said once. The
-    /// note is still written, unlocked; what this stops is a line about it on
-    /// every address of every burst.
-    lock_warned: std::cell::RefCell<Set<String>>,
-    /// Devices whose quiet-keep memory could not be written, already said
-    /// once - the keeps still work in this process, they just will not
-    /// outlive it, and that is one warning, not one per pass.
-    ports_warned: std::cell::RefCell<Set<String>>,
     /// Whether an unlistable state directory has been said out loud. Once:
     /// the list is asked for on every batch, and the condition does not
     /// come and go.
@@ -324,11 +383,6 @@ pub struct Syncer {
     /// umask that let it through wide open, leaves it that way for this run
     /// to write into. Looked at once, on the first write.
     dir_checked: std::cell::Cell<bool>,
-    /// Pinned addresses already warned about, per uplink, so the warning
-    /// appears when the situation arises and not once per pass forever -
-    /// seventeen thousand identical journal lines a day teach an operator
-    /// to stop reading warnings.
-    warned_extra: Map<String, Set<Mac>>,
     /// The notes as they were last read, so reading them again costs a stat
     /// rather than an open-read-close. The file stays the truth: the copy is
     /// used only while identity, size and timestamp all say the file has not
@@ -382,6 +436,8 @@ pub struct Syncer {
     /// filter slots, and past its capacity the card drops entries silently -
     /// so keeps are the first surrendered as the list nears this limit.
     /// The value for anything the card did not report a number for.
+    /// Everything said once per device - see `Said`.
+    pub(super) said: std::cell::RefCell<Said>,
     pub max_macs: usize,
     /// Which interface holds the filter an uplink writes into, filled by
     /// each pass from the picture it read. The event path has no topology
@@ -394,10 +450,9 @@ pub struct Syncer {
     /// larger one for nothing. Empty until devlink answers, which on ixgbe,
     /// i40e and mlx4 is never - hence the fallback above.
     pub max_macs_je_karte: Map<String, usize>,
-    /// Which addresses each uplink was last said to be keeping, so the
-    /// quiet-keep is announced once per entry into that state rather than
-    /// once per pass forever.
-    noted_quiet: Map<String, Set<Mac>>,
+    /// Whether the last capacity question reached every configured device
+    /// and got an answer - read by the daemon to stop asking.
+    pub capacity_settled: bool,
     /// What the last pass measured about each uplink's filter, carried
     /// between passes so the event path can be capacity-aware without
     /// paying a dump per batch. Corrected against the read-back every
@@ -413,18 +468,6 @@ pub struct Syncer {
     /// predecessor when it has to be - at most a millisecond of drift,
     /// gone again the moment real time catches up.
     last_pass_at: u64,
-    /// Uplinks already warned about exceeding the filter capacity, re-armed
-    /// when the count drops back under: an overloaded bridge buys passes at
-    /// the event rate, and the same warning five times a second is how an
-    /// operator learns to stop reading exactly the journal that matters.
-    warned_over: Set<String>,
-    /// The fast path's own say-once mark. Separate from `warned_over` on
-    /// purpose: the two speak at different thresholds - the pass at "past
-    /// max_macs", the batch at "past max_macs minus the headroom" - so one
-    /// shared mark meant the pass cleared, in the four-slot band between
-    /// them, exactly what the batch had just set, and "once per uplink per
-    /// stay" became once per batch.
-    warned_tight: Set<String>,
 }
 
 /// Where a pass spent its time, and what it found on the way.
@@ -555,25 +598,19 @@ impl Syncer {
             vf_stale: true,
             orphan_grace: Duration::ZERO,
             absent_since: crate::hash::map(),
-            warned_unknown_vf: crate::hash::set(),
-            unreadable: std::cell::RefCell::new(crate::hash::set()),
-            lock_warned: std::cell::RefCell::new(crate::hash::set()),
-            ports_warned: std::cell::RefCell::new(crate::hash::set()),
             dir_checked: std::cell::Cell::new(false),
             dir_list_warned: std::cell::Cell::new(false),
             carried_wire: crate::hash::map(),
             carried_ports: crate::hash::map(),
             ports_loaded: crate::hash::set(),
             ports_written: crate::hash::map(),
+            said: std::cell::RefCell::new(Said::default()),
             max_macs: DEFAULT_MAX_MACS,
             karte_von: crate::hash::map(),
             max_macs_je_karte: crate::hash::map(),
-            noted_quiet: crate::hash::map(),
+            capacity_settled: false,
             last_pass_at: 0,
-            warned_over: crate::hash::set(),
-            warned_tight: crate::hash::set(),
             carried: crate::hash::map(),
-            warned_extra: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
             indices: std::cell::RefCell::new(crate::hash::map()),
         }
@@ -709,23 +746,14 @@ impl Syncer {
                             self.ports_loaded.remove(&dev);
                             self.ports_written.remove(&dev);
                             self.ports_written.remove(&new_name);
-                            // The said-once mark travels too, or the same keeps
-                            // are announced a second time under the new name.
-                            if let Some(said) = self.noted_quiet.remove(&dev) {
-                                self.noted_quiet.insert(new_name.clone(), said);
-                            }
                             // The wire set follows for the same reason: the fast
                             // path would otherwise judge the renamed uplink
                             // against an empty set - or the old name's set
                             // against whoever inherits it.
+                            // Every said-once mark in one call - see Said.
+                            self.said.borrow_mut().rename(&dev, &new_name);
                             if let Some(wire) = self.carried_wire.remove(&dev) {
                                 self.carried_wire.insert(new_name.clone(), wire);
-                            }
-                            if self.warned_over.remove(&dev) {
-                                self.warned_over.insert(new_name.clone());
-                            }
-                            if self.warned_tight.remove(&dev) {
-                                self.warned_tight.insert(new_name.clone());
                             }
                             // The capacity arithmetic follows too. Usually
                             // moot - the pass that migrates the note also
@@ -741,12 +769,6 @@ impl Syncer {
                             // warning from being repeated every pass - but a
                             // rename made the daemon say both again, once, for
                             // a device that had not changed.
-                            if self.warned_unknown_vf.remove(&dev) {
-                                self.warned_unknown_vf.insert(new_name.clone());
-                            }
-                            if let Some(said) = self.warned_extra.remove(&dev) {
-                                self.warned_extra.insert(new_name.clone(), said);
-                            }
                             // And onto disk under the new name at once: the old
                             // file went with the old note, and a crash before
                             // the pair's next pass would otherwise forget the
@@ -829,12 +851,10 @@ impl Syncer {
             // pair records afresh from its first dump. The said-once mark
             // goes with it, so a return also announces afresh.
             self.carried_ports.remove(&dev);
-            self.noted_quiet.remove(&dev);
+            self.said.borrow_mut().forget(&dev);
             // Neither a month-old wire set nor a stale capacity warning
             // greets a device that returns.
             self.carried_wire.remove(&dev);
-            self.warned_over.remove(&dev);
-            self.warned_tight.remove(&dev);
             self.carried.remove(&dev);
             // remove_note took the file; a device that returns as a pair
             // reads afresh rather than believing this run's leftovers.
@@ -846,8 +866,6 @@ impl Syncer {
             // a suppressed one-time warning on a device that came back;
             // named here so the next field added to the Syncer finds the
             // complete list in one place.
-            self.warned_unknown_vf.remove(&dev);
-            self.warned_extra.remove(&dev);
         }
     }
 
@@ -1006,10 +1024,10 @@ impl Syncer {
             // situation, not once per process. It used to be set on the
             // way past this point, and an uplink whose first pass was
             // harmless could then never warn at all.
-            self.warned_unknown_vf.remove(dev);
+            self.said.borrow_mut().unknown_vf.remove(dev);
             return;
         }
-        if self.warned_unknown_vf.insert(dev.to_string()) {
+        if self.said.borrow_mut().unknown_vf.insert(dev.to_string()) {
             eprintln!(
                 "warning: {}: {} of {}'s {} virtual function(s) have no address set \
                  from this host and no interface here, so their addresses cannot be \
@@ -2034,7 +2052,7 @@ impl Syncer {
             // the last pass kept, so anything kept now and not in it has
             // just gone quiet. Between entries the timed refresh bounds
             // the window.
-            let newly_quiet = match self.noted_quiet.get(&pair.dev) {
+            let newly_quiet = match self.said.borrow().quiet.get(&pair.dev) {
                 Some(said) => kept.iter().any(|m| !said.contains(m)),
                 None => !kept.is_empty(),
             };
@@ -2064,7 +2082,8 @@ impl Syncer {
                 .filter(|m| !want.contains(*m))
                 .copied()
                 .collect();
-            let warned = self.warned_extra.entry(pair.dev.clone()).or_default();
+            let mut said = self.said.borrow_mut();
+            let warned = said.extra.entry(pair.dev.clone()).or_default();
             for m in &unpinned {
                 if !warned.contains(m) {
                     eprintln!(
@@ -2076,6 +2095,7 @@ impl Syncer {
                 }
             }
             *warned = unpinned;
+            drop(said);
 
             self.carried_wire.insert(pair.dev.clone(), wire);
 
@@ -2166,7 +2186,8 @@ impl Syncer {
             // forever - ageing comes in bursts, and seventeen thousand
             // identical journal lines a day teach an operator to stop
             // reading.
-            let said = self.noted_quiet.entry(pair.dev.clone()).or_default();
+            let mut marks = self.said.borrow_mut();
+            let said = marks.quiet.entry(pair.dev.clone()).or_default();
             let fresh_quiet = kept.iter().filter(|m| !said.contains(*m)).count();
             if apply && fresh_quiet > 0 {
                 note!(
@@ -2176,6 +2197,7 @@ impl Syncer {
                 );
             }
             *said = kept.clone();
+            drop(marks);
 
             let mut owned = owned_before.clone();
             let mut added = 0usize;
@@ -2350,7 +2372,7 @@ impl Syncer {
             // journal line.
             if apply {
                 if occupied > limit {
-                    if self.warned_over.insert(pair.dev.clone()) {
+                    if self.said.borrow_mut().over.insert(pair.dev.clone()) {
                         eprintln!(
                             "warning: {}: {} unicast entries against the {} the \
                              vport list holds - some will be dropped silently, \
@@ -2359,14 +2381,14 @@ impl Syncer {
                         );
                     }
                 } else {
-                    self.warned_over.remove(&pair.dev);
+                    self.said.borrow_mut().over.remove(&pair.dev);
                 }
                 // The tight-fit mark re-arms only once the list is back
                 // under the headroom the batch measures against, or the
                 // pass would clear it while the batch is still in the band
                 // that set it.
                 if occupied + CAPACITY_HEADROOM <= limit {
-                    self.warned_tight.remove(&pair.dev);
+                    self.said.borrow_mut().tight.remove(&pair.dev);
                 }
             }
             // What the fast path counts from until the next pass corrects
@@ -2865,7 +2887,7 @@ impl Syncer {
                 // limit the card drops silently and arbitrarily, and an
                 // operator who never hears about it looks for the fault in
                 // the guest.
-                if self.warned_tight.insert(dev.clone()) {
+                if self.said.borrow_mut().tight.insert(dev.clone()) {
                     eprintln!(
                         "warning: {dev}: no room for {} new address(es) and no \
                          quiet ones left to release - the list is within {} \

@@ -157,7 +157,7 @@ impl Syncer {
     pub(super) fn write_ports(&self, dev: &str, lines: &[String]) -> bool {
         let text = format!("{PORTS_FORMAT}\n{}\n", lines.join("\n"));
         if let Err(e) = self.put_file(&self.ports_path(dev), &text) {
-            if self.ports_warned.borrow_mut().insert(dev.to_string()) {
+            if self.said.borrow_mut().ports.insert(dev.to_string()) {
                 eprintln!(
                     "warning: cannot write the quiet-keep memory for {dev}: {e} - \
                      addresses held while their port lives will be forgotten if \
@@ -470,7 +470,7 @@ impl Syncer {
                 // read again on every look for as long as it cannot be read -
                 // that is what stops one bad moment becoming permanent - and
                 // a look happens per batch of learning.
-                if self.unreadable.borrow_mut().insert(dev.to_string()) {
+                if self.said.borrow_mut().unreadable.insert(dev.to_string()) {
                     eprintln!(
                         "warning: cannot read {}: {e} - leaving that device alone \
                          until it can be read",
@@ -480,7 +480,7 @@ impl Syncer {
                 return set;
             }
         }
-        if self.unreadable.borrow_mut().remove(dev) {
+        if self.said.borrow_mut().unreadable.remove(dev) {
             note!(
                 "{}: readable again, {dev} is back in the reckoning",
                 self.state_path(dev).display()
@@ -492,7 +492,7 @@ impl Syncer {
     /// Whether the note for this device could be read at all. Everything that
     /// would replace or unlink it has to ask first.
     pub(super) fn note_is_readable(&self, dev: &str) -> bool {
-        !self.unreadable.borrow().contains(dev)
+        !self.said.borrow().unreadable.contains(dev)
     }
 
     /// Hold the note against everybody else while it is rewritten.
@@ -547,7 +547,7 @@ impl Syncer {
             // takes, and a line per batch would bury the one that matters.
             // A permission or a read-only filesystem does not come and go.
             Err(e) => {
-                if self.lock_warned.borrow_mut().insert(dev.to_string()) {
+                if self.said.borrow_mut().lock.insert(dev.to_string()) {
                     eprintln!(
                         "warning: cannot lock {}: {e} - writing the ownership \
                          note for {dev} unlocked, so a --once or --flush run by \
@@ -572,7 +572,7 @@ impl Syncer {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            if self.lock_warned.borrow_mut().insert(dev.to_string()) {
+            if self.said.borrow_mut().lock.insert(dev.to_string()) {
                 eprintln!(
                     "warning: cannot take the lock on {}: {e} - writing the \
                      ownership note for {dev} unlocked, so a --once or --flush \
@@ -621,6 +621,7 @@ impl Syncer {
     /// whole set any more - the pass and the reflection both write
     /// differences, so a parallel writer's lines survive - but the tests
     /// build their starting states this way.
+    #[cfg(test)]
     #[cfg(test)]
     pub(super) fn save_owned(&self, dev: &str, set: &Set<Mac>) {
         if self.dry_run {

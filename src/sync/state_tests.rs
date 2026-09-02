@@ -176,7 +176,7 @@ fn a_lock_that_cannot_be_taken_is_said_once_and_the_note_still_written() {
         "the note was not written, so what was registered has no owner"
     );
     assert!(
-        s.lock_warned.borrow().contains("nic1"),
+        s.said.borrow().lock.contains("nic1"),
         "the note was written unlocked and nothing said so"
     );
 
@@ -184,7 +184,7 @@ fn a_lock_that_cannot_be_taken_is_said_once_and_the_note_still_written() {
     // reasons an open fails do not come and go.
     set.insert(BEHIND_GUEST);
     s.save_owned("nic1", &set);
-    assert_eq!(s.lock_warned.borrow().len(), 1);
+    assert_eq!(s.said.borrow().lock.len(), 1);
     assert_eq!(s.load_owned("nic1"), set);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1390,25 +1390,25 @@ fn the_unknowable_vf_warning_fires_when_the_situation_arises() {
     // Pass one: the single VF has an address, nothing is unknowable.
     s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
     assert!(
-        !s.warned_unknown_vf.contains("nic1"),
+        !s.said.borrow().unknown_vf.contains("nic1"),
         "a pass with nothing to warn about must not use up the warning"
     );
 
     // Pass two: the address is gone - a guest took the VF. Now it warns.
     s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
     assert!(
-        s.warned_unknown_vf.contains("nic1"),
+        s.said.borrow().unknown_vf.contains("nic1"),
         "the situation arose and the warning did not fire"
     );
 
     // While it persists: once was enough (the set held it).
     s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
-    assert!(s.warned_unknown_vf.contains("nic1"));
+    assert!(s.said.borrow().unknown_vf.contains("nic1"));
 
     // It clears, and a later return deserves a fresh warning.
     s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
     assert!(
-        !s.warned_unknown_vf.contains("nic1"),
+        !s.said.borrow().unknown_vf.contains("nic1"),
         "a situation that ended has to re-arm its warning"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -2426,12 +2426,12 @@ fn an_unknowable_virtual_function_is_reported_once() {
     );
 
     assert!(
-        !s.warned_unknown_vf.contains("pf0"),
+        !s.said.borrow().unknown_vf.contains("pf0"),
         "nothing said before it is looked at"
     );
     s.warn_about_unknowable_vfs(&topo, "pf0", &[]);
     assert!(
-        s.warned_unknown_vf.contains("pf0"),
+        s.said.borrow().unknown_vf.contains("pf0"),
         "and once looked at, not looked at again every pass for ever"
     );
 
@@ -2446,7 +2446,7 @@ fn an_unknowable_virtual_function_is_reported_once() {
         "pf0",
         &[(2, [0x02, 0, 0, 0, 0, 9]), (2, [0x02, 0, 0, 0, 0, 10])],
     );
-    assert!(!quiet.warned_unknown_vf.contains("pf0"));
+    assert!(!quiet.said.borrow().unknown_vf.contains("pf0"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -3467,6 +3467,60 @@ fn a_port_folded_under_the_uplink_ends_the_keep() {
 
 /// The valve opens exactly when the measured occupancy no longer fits
 /// above the headroom, and not one slot earlier: off by one in either
+/// Every mark for a device goes in one call, and a mark added later
+/// cannot be forgotten by mistake: the test fills every field of `Said`
+/// for one device and holds `forget` to leaving the default behind. A new
+/// field fails this until `forget` takes it up.
+#[test]
+fn forgetting_a_device_leaves_no_mark_behind() {
+    let mut said = Said::default();
+    let d = "nic1".to_string();
+    said.unknown_vf.insert(d.clone());
+    said.extra.insert(d.clone(), [mac(1)].into_iter().collect());
+    said.over.insert(d.clone());
+    said.tight.insert(d.clone());
+    said.quiet.insert(d.clone(), [mac(2)].into_iter().collect());
+    said.unreadable.insert(d.clone());
+    said.lock.insert(d.clone());
+    said.ports.insert(d.clone());
+    let mut voll = Said::default();
+    voll.rename("x", "y"); // ein Leerlauf, damit der Typ vollstaendig genutzt ist
+    said.forget("nic1");
+    assert_eq!(said, voll, "a mark survived forget()");
+}
+
+/// A rename carries every mark to the new name and leaves none under the
+/// old - the same structural guarantee, from the other side.
+#[test]
+fn renaming_a_device_carries_every_mark() {
+    let mut said = Said::default();
+    said.unknown_vf.insert("a".into());
+    said.extra
+        .insert("a".into(), [mac(1)].into_iter().collect());
+    said.over.insert("a".into());
+    said.tight.insert("a".into());
+    said.quiet
+        .insert("a".into(), [mac(2)].into_iter().collect());
+    said.unreadable.insert("a".into());
+    said.lock.insert("a".into());
+    said.ports.insert("a".into());
+    said.rename("a", "b");
+    let mut erwartet = Said::default();
+    erwartet.unknown_vf.insert("b".into());
+    erwartet
+        .extra
+        .insert("b".into(), [mac(1)].into_iter().collect());
+    erwartet.over.insert("b".into());
+    erwartet.tight.insert("b".into());
+    erwartet
+        .quiet
+        .insert("b".into(), [mac(2)].into_iter().collect());
+    erwartet.unreadable.insert("b".into());
+    erwartet.lock.insert("b".into());
+    erwartet.ports.insert("b".into());
+    assert_eq!(said, erwartet);
+}
+
 /// A host whose virtual function reaches two bridges through two VLAN
 /// interfaces. Both uplinks write into ONE filter - the one of nic1 below
 /// them - so whoever counts how full the card is has to ask nic1.
@@ -4704,7 +4758,7 @@ fn the_over_capacity_warning_counts_the_card_and_says_it_once() {
     let mut sock = kernel(fdb1);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
     assert!(
-        s.warned_over.contains("nic1"),
+        s.said.borrow().over.contains("nic1"),
         "the card is over its limit and nothing said so"
     );
 
@@ -4713,14 +4767,14 @@ fn the_over_capacity_warning_counts_the_card_and_says_it_once() {
     fdb2.extend(foreign);
     let mut sock2 = kernel(fdb2);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
-    assert!(s.warned_over.contains("nic1"), "the mark must stand");
+    assert!(s.said.borrow().over.contains("nic1"), "the mark must stand");
 
     // The foreign entries go: back under the limit, and the warning is
     // armed again for the next time.
     let mut sock3 = kernel(vec![learned(4, 10, mine)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
-        !s.warned_over.contains("nic1"),
+        !s.said.borrow().over.contains("nic1"),
         "back under the limit has to re-arm the warning"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -5779,7 +5833,7 @@ fn a_keep_the_card_never_took_frees_no_slot() {
     s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(4, 10, newcomer))])
         .unwrap();
     assert!(
-        s.warned_tight.contains("nic1"),
+        s.said.borrow().tight.contains("nic1"),
         "the valve reported a slot it did not free, so the warning stayed silent"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -5814,7 +5868,7 @@ fn the_two_capacity_warnings_do_not_clear_each_other() {
     )
     .unwrap();
     assert!(
-        s.warned_tight.contains("nic1"),
+        s.said.borrow().tight.contains("nic1"),
         "the batch should have said it"
     );
 
@@ -5824,7 +5878,7 @@ fn the_two_capacity_warnings_do_not_clear_each_other() {
     let mut sock2 = kernel(vec![learned(4, 10, old)]);
     s.reconcile(&mut sock2, true, &topo, Dur::ZERO).unwrap();
     assert!(
-        s.warned_tight.contains("nic1"),
+        s.said.borrow().tight.contains("nic1"),
         "the pass cleared a mark set at a threshold it does not measure"
     );
 
@@ -5833,7 +5887,7 @@ fn the_two_capacity_warnings_do_not_clear_each_other() {
     let mut sock3 = kernel(vec![learned(4, 10, old)]);
     s.reconcile(&mut sock3, true, &topo, Dur::ZERO).unwrap();
     assert!(
-        !s.warned_tight.contains("nic1"),
+        !s.said.borrow().tight.contains("nic1"),
         "with the list well under the limit the warning has to re-arm"
     );
     let _ = fs::remove_dir_all(&dir);

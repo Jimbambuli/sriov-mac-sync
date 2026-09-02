@@ -582,13 +582,7 @@ fn run_pass<W: World>(
             // number for the rest of its life. The operator's --max still
             // wins; the gate is the same one.
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
-                let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-                let answers =
-                    world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
-                for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
-                    syncer.max_macs_je_karte.insert(karte, wert);
-                }
-                if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
+                if let Some(v) = ask_the_cards(world, syncer, picture, opts.verbose) {
                     // One number, one home: the warning threshold and the
                     // quiet-keep's pressure valve read the same field. The
                     // operator's --max never moves - the max_macs_set gate
@@ -612,36 +606,11 @@ fn run_pass<W: World>(
         // Non-empty by construction: capacity_pending is only set when the
         // operator wrote pairs down, and resolve_pairs keeps every one of
         // them even before its interface exists.
-        let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-        {
-            let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
-            // Settled when every written-down device was there to be asked
-            // and gave an answer - and "the card says nothing" is an
-            // answer. On ixgbe, i40e and mlx4 it is the only one there will
-            // ever be, and waiting for a number from a card that has none
-            // meant re-asking on every reloaded pass for the life of the
-            // process: a fresh generic-netlink socket, a family resolve and
-            // a dump of every devlink parameter on the box, measured at 21
-            // dumps for 20 link batches against 1 when a card answers.
-            //
-            // Still ALL of them, not any: the first card's answer must not
-            // orphan a second, later-appearing one - possibly the smaller
-            // filter - for the process's life. That is what the interface
-            // has to exist for; a device the picture does not know was
-            // never asked, whatever the devlink layer said about it.
-            let all_present = picture
-                .held
-                .as_ref()
-                .is_some_and(|t| devs.iter().all(|d| t.index_of(d).is_some()));
-            if all_present && answers.iter().all(|(_, a)| a.is_ok()) {
-                state.capacity_pending = false;
-            }
-            for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
-                syncer.max_macs_je_karte.insert(karte, wert);
-            }
-            if let Some(v) = adopt_reported_capacity(answers, opts.verbose, syncer.max_macs) {
-                syncer.max_macs = v;
-            }
+        if let Some(v) = ask_the_cards(world, syncer, picture, opts.verbose) {
+            syncer.max_macs = v;
+        }
+        if syncer.capacity_settled {
+            state.capacity_pending = false;
         }
     }
     if syncer.pairs.is_empty() && !state.said_empty {
@@ -807,6 +776,30 @@ pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAn
 ///
 /// `None` means the assumed threshold stands. The `--max`/`MAX_MACS` gate
 /// lives at the call sites: an operator's instruction is never moved.
+/// Ask the cards behind the pairs what their filters hold: fills the
+/// per-card table, returns the assumed number for everything that reported
+/// none, and records on the syncer whether every configured device was
+/// there to be asked and answered - "the card says nothing" being an
+/// answer. Two call sites used to spell this out side by side.
+fn ask_the_cards<W: World>(
+    world: &mut W,
+    syncer: &mut Syncer,
+    picture: &Picture,
+    verbose: bool,
+) -> Option<usize> {
+    let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
+    let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
+    let all_present = picture
+        .held
+        .as_ref()
+        .is_some_and(|t| devs.iter().all(|d| t.index_of(d).is_some()));
+    syncer.capacity_settled = all_present && answers.iter().all(|(_, a)| a.is_ok());
+    for (karte, wert) in reported_capacities(answers.clone(), false, syncer.max_macs) {
+        syncer.max_macs_je_karte.insert(karte, wert);
+    }
+    adopt_reported_capacity(answers, verbose, syncer.max_macs)
+}
+
 /// Die Namen der Interfaces, die die Filter der Uplinks wirklich halten.
 /// Fuer alles Ungestapelte ist das der Uplink selbst; ein VLAN-Interface
 /// reicht an das Interface darunter weiter, und nur dieses hat eine
