@@ -267,15 +267,10 @@ pub struct Detail {
 /// records what would be written and answers what a test injects.
 pub trait FdbWriter {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>>;
-    /// The entries attached to one interface. The kernel filters the dump;
-    /// a fake filters its table.
-    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>> {
-        Ok(self
-            .dump_fdb()?
-            .into_iter()
-            .filter(|e| e.ifindex == ifindex)
-            .collect())
-    }
+    /// The entries attached to one interface, filtered by the kernel. No
+    /// default body on purpose: a forwarder that forgot this one silently
+    /// dumped the whole table per batch.
+    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>>;
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>>;
     fn vf_macs_of(&mut self, indices: &[u32]) -> io::Result<Vec<(u32, Mac)>>;
     fn set_self_fdb(&mut self, ifindex: u32, mac: &Mac, add: bool) -> io::Result<()>;
@@ -396,11 +391,11 @@ pub struct Syncer {
     /// Which interface holds the filter an uplink writes into, filled by each
     /// pass from the picture: the event path has no topology, and a burst on
     /// a VLAN uplink measures against the card below.
-    karte_von: Map<String, String>,
+    card_of: Map<String, String>,
     /// What each card holds by the driver table, by the interface holding the
     /// filter. Two cards in one host can differ, and taking the smaller
     /// number for both sheds keeps on the larger for nothing.
-    pub max_macs_je_karte: Map<String, usize>,
+    pub max_macs_per_card: Map<String, usize>,
     /// What the last pass measured about each uplink's filter, carried so the
     /// event path is capacity-aware without a dump per batch; corrected
     /// against the read-back every pass.
@@ -536,8 +531,8 @@ impl Syncer {
             ports_written: crate::hash::map(),
             said: std::cell::RefCell::new(Said::default()),
             max_macs: DEFAULT_MAX_MACS,
-            karte_von: crate::hash::map(),
-            max_macs_je_karte: crate::hash::map(),
+            card_of: crate::hash::map(),
+            max_macs_per_card: crate::hash::map(),
             last_pass_at: 0,
             carried: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),
@@ -1299,19 +1294,20 @@ impl Syncer {
     /// the assumed number where it reported nothing (ixgbe, i40e and mlx4:
     /// every card there is).
     pub fn limit_of(&self, dev: &str) -> usize {
-        let karte = self.karte_von.get(dev).map(String::as_str).unwrap_or(dev);
-        self.max_macs_je_karte
-            .get(karte)
+        let card = self.card_of.get(dev).map(String::as_str).unwrap_or(dev);
+        self.max_macs_per_card
+            .get(card)
             .copied()
             .unwrap_or(self.max_macs)
     }
 
-    pub fn fullest_filter(&self) -> usize {
+    /// Whether any uplink's list is within a tenth of its own card's limit -
+    /// the pacing rule for ageing bursts, judged per card, never against the
+    /// smallest card in the host.
+    pub fn any_filter_filling(&self) -> bool {
         self.carried
-            .values()
-            .map(|c| c.occupancy)
-            .max()
-            .unwrap_or(0)
+            .iter()
+            .any(|(dev, c)| c.occupancy * 10 >= self.limit_of(dev) * 9)
     }
 
     /// The card let these go - taken out, or never had. Surrendered is no
@@ -1874,9 +1870,9 @@ impl Syncer {
             let mut occupied = want.len() + foreign_extra;
             if let Some(n) = topo.name_of(carrier) {
                 if n != pair.dev {
-                    self.karte_von.insert(pair.dev.clone(), n.to_string());
+                    self.card_of.insert(pair.dev.clone(), n.to_string());
                 } else {
-                    self.karte_von.remove(&pair.dev);
+                    self.card_of.remove(&pair.dev);
                 }
             }
             let limit = self.limit_of(&pair.dev);

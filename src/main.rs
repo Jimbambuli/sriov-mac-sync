@@ -770,6 +770,15 @@ fn resync() -> Result<bool, String> {
         .trim()
         .parse()
         .map_err(|_| format!("{}: not a pid: {text:?}", path.display()))?;
+    // A pid file can outlive its daemon (SIGKILL, OOM, a crash), and the
+    // number can then belong to anybody: SIGHUP's default action kills.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    if comm.trim() != "sriov-mac-sync" {
+        return Err(format!(
+            "pid {pid} from {} is not sriov-mac-sync (stale pid file?)",
+            path.display()
+        ));
+    }
     if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
         let e = std::io::Error::last_os_error();
         return Err(format!("cannot signal pid {pid}: {e}"));
@@ -819,8 +828,13 @@ fn run() -> Result<bool, String> {
     // daemon applies it itself, every pass. Only when the operator has not
     // said: a number from the driver's source beats this program's constant
     // and loses to an instruction.
-    if !opts.max_macs_set && matches!(opts.mode, Mode::Once | Mode::Status) {
-        apply_card_limits(&mut syncer, &topo, &mut crate::hash::set());
+    if matches!(opts.mode, Mode::Once | Mode::Status) {
+        apply_card_limits(
+            &mut syncer,
+            &topo,
+            opts.max_macs_set,
+            &mut crate::hash::set(),
+        );
     }
     // The lists merge CLI values and conf-file values, so the label names
     // both homes - a tab-mangled EXCLUDE= line must not send its operator

@@ -72,6 +72,9 @@ impl sync::FdbWriter for Live {
     fn dump_fdb(&mut self) -> std::io::Result<Vec<netlink::FdbEntry>> {
         self.sock.dump_fdb()
     }
+    fn dump_fdb_of(&mut self, ifindex: u32) -> std::io::Result<Vec<netlink::FdbEntry>> {
+        self.sock.dump_fdb_of(ifindex)
+    }
     fn dump_links(&mut self) -> std::io::Result<Vec<netlink::LinkInfo>> {
         self.sock.dump_links()
     }
@@ -131,19 +134,44 @@ impl World for Live {
         self.mon.recv_events()
     }
     fn pause(&mut self, wait: Duration) {
-        // A poll on the stop pipe rather than a sleep: SIGTERM during the
-        // wait-failure brake must not wait the brake out.
-        let Some(stop_rx) = &self.stop_rx else {
-            std::thread::sleep(wait);
-            return;
-        };
-        let mut pfd = libc::pollfd {
-            fd: stop_rx.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let millis = wait.as_millis().min(i32::MAX as u128) as i32;
-        unsafe { libc::poll(&mut pfd, 1, millis) };
+        // A poll on the stop pipe rather than a sleep, so SIGTERM during the
+        // wait-failure brake does not wait the brake out. The brake is used
+        // when poll itself may be what fails, so a failing poll falls back
+        // to sleeping, and a byte that is not a stop (SIGHUP) is drained
+        // and the wait goes on - or the brake would be void exactly when it
+        // is needed.
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let Some(stop_rx) = &self.stop_rx else {
+                std::thread::sleep(left);
+                return;
+            };
+            let mut pfd = libc::pollfd {
+                fd: stop_rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = left.as_millis().min(i32::MAX as u128) as i32;
+            let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+            if rc < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                std::thread::sleep(left);
+                return;
+            }
+            if rc > 0 {
+                let mut sink = [0u8; 16];
+                while unsafe { libc::read(pfd.fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+                if crate::stopping() {
+                    return;
+                }
+            }
+        }
     }
     fn read_topology(&mut self) -> Result<Topology, String> {
         read_topology(&mut self.sock)
@@ -237,7 +265,12 @@ fn read_picture<W: World>(world: &mut W) -> Result<(Topology, Duration), String>
 /// and nothing about it can go stale. The world arrives as a parameter so the
 /// tests can hand in a scripted one.
 pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
-    let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
+    let interval = Duration::from_secs(opts.interval);
+    let mut schedule = Schedule::new(world.now(), interval);
+    // When the driver's VF answer was last read fresh. A carried answer is
+    // good for one interval, whatever the passes were called: on a busy
+    // host no pass is ever "timed", and staleness has to be a matter of age.
+    let mut vf_fresh = world.now();
     // The previous reading, kept for one question only: what a link message
     // was about. An interface that has just gone is in no fresh reading.
     let mut last: Option<Topology> = None;
@@ -256,14 +289,18 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
             syncer.vf_stale = true;
             schedule.at_once(world.now(), "operator");
         }
-        // The timer fired, which means an interval of silence: the carried
-        // driver answer is old enough to be asked afresh.
-        if schedule.pass_due(world.now()) && schedule.trigger == "timed" {
+        let now = world.now();
+        if now.saturating_duration_since(vf_fresh) >= interval {
             syncer.vf_stale = true;
         }
-        if schedule.pass_due(world.now()) {
+        if schedule.pass_due(now) {
             match run_pass(world, syncer, &mut last, opts, schedule.trigger, &mut state) {
-                Pass::Done => schedule.completed(world.now()),
+                Pass::Done => {
+                    if !syncer.timings.vf_carried {
+                        vf_fresh = now;
+                    }
+                    schedule.completed(world.now())
+                }
                 Pass::Refused => {
                     schedule.retry_soon(world.now());
                     continue;
@@ -330,10 +367,8 @@ enum Pass {
     Refused,
 }
 
-/// One full pass: read the picture if it can no longer be believed, work out
-/// the pairs, reconcile every one against the kernel.
-/// The loop's say-once and adoption state, threaded through the passes as one
-/// thing because it lives exactly as long as the loop.
+/// The loop's say-once marks, threaded through the passes as one thing
+/// because they live exactly as long as the loop.
 struct LoopState {
     said_empty: bool,
     /// Cards whose limit has been said.
@@ -377,10 +412,8 @@ fn run_pass<W: World>(
         }
     }
     // Every pass, because it is map lookups: a card that appears later
-    // gets its number when it does. The operator's --max still wins.
-    if !opts.max_macs_set {
-        apply_card_limits(syncer, &topo, &mut state.said_cards);
-    }
+    // gets its number when it does.
+    apply_card_limits(syncer, &topo, opts.max_macs_set, &mut state.said_cards);
     if syncer.pairs.is_empty() && !state.said_empty {
         note!("waiting for an SR-IOV interface to appear in a bridge");
         state.said_empty = true;
@@ -477,12 +510,10 @@ fn handle_batch<W: World>(
     //
     // Registrations and interface changes get the ordinary bound; a
     // deletions-only batch waits longer, because an ageing table produces
-    // those by the hundred and each would buy a whole-table dump - unless the
+    // those by the hundred and each would buy a whole-table dump - unless a
     // filter is filling up, when entries that should be gone take room from
-    // entries that should be there. Asked of the occupancy the last pass
-    // measured against the card, not of the notes, which miss every foreign
-    // entry.
-    let filling = syncer.fullest_filter() * 10 >= syncer.max_macs * 9;
+    // entries that should be there.
+    let filling = syncer.any_filter_filling();
     let wait = if urgency == sync::Urgency::Now || filling {
         Duration::from_millis(200)
     } else {
@@ -493,11 +524,8 @@ fn handle_batch<W: World>(
 
 /// The interfaces that really hold the uplinks' filters: the uplink itself,
 /// or for a VLAN the interface below - the only one with a list of its own.
-pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<String> {
-    let Some(topo) = topo else {
-        return devs.to_vec();
-    };
-    let mut aus: Vec<String> = Vec::new();
+pub(crate) fn filter_carriers(devs: &[String], topo: &Topology) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for d in devs {
         let name = topo
             .index_of(d)
@@ -505,82 +533,148 @@ pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<S
             .and_then(|c| topo.name_of(c))
             .unwrap_or(d)
             .to_string();
-        if !aus.contains(&name) {
-            aus.push(name);
+        if !out.contains(&name) {
+            out.push(name);
         }
     }
-    aus
+    out
+}
+
+/// The driver behind an interface, and what the table says about it. A
+/// bond has no driver: its list is copied to every member, so the members
+/// answer, and the smallest of them binds.
+fn card_filter(
+    topo: &Topology,
+    link: &crate::topology::Link,
+) -> (Option<String>, Option<drivers::Filter>) {
+    let vf = link.is_vf || link.physfn.is_some();
+    if let Some(d) = link.driver.as_deref() {
+        return (Some(d.to_string()), drivers::filter_of(d, vf));
+    }
+    if link.is_bridge || link.slaves.is_empty() {
+        return (None, None);
+    }
+    let mut stack: Vec<u32> = link.slaves.clone();
+    let mut seen = crate::hash::set();
+    let mut best: Option<(String, drivers::Filter)> = None;
+    while let Some(i) = stack.pop() {
+        if !seen.insert(i) {
+            continue;
+        }
+        let Some(l) = topo.at(i) else { continue };
+        match l.driver.as_deref() {
+            Some(d) => {
+                if let Some(f) = drivers::filter_of(d, l.is_vf || l.physfn.is_some()) {
+                    let smaller = match &best {
+                        None => true,
+                        Some((_, b)) => {
+                            f.holds.unwrap_or(usize::MAX) < b.holds.unwrap_or(usize::MAX)
+                        }
+                    };
+                    if smaller {
+                        best = Some((format!("{d} behind {}", link.name), f));
+                    }
+                }
+            }
+            None => {
+                stack.extend(l.slaves.iter().copied());
+                stack.extend(l.filter_below);
+            }
+        }
+    }
+    match best {
+        Some((d, f)) => (Some(d), Some(f)),
+        None => (None, None),
+    }
 }
 
 /// What each card holds, by the interface holding the filter: what the
 /// kernel source says its driver does (see `drivers`), the assumed number
 /// where it names none. Applied to the syncer as the per-card limit and, as
-/// the smallest of them, the number to warn at. Each card is said once; a
-/// driver that never programs the list on this role is a warning, because
-/// nothing registered there takes effect.
+/// the smallest of them, the number to warn at - unless the operator set
+/// --max, which the numbers yield to and the warnings do not. A card absent
+/// from this reading keeps its last number. Each card is said once, when its
+/// driver is known; a driver that never programs the list on this role is a
+/// warning, because nothing registered there takes effect.
 pub(crate) fn apply_card_limits(
     syncer: &mut Syncer,
     topo: &Topology,
+    max_set: bool,
     said: &mut crate::hash::Set<String>,
 ) {
     let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-    let mut limit = sync::DEFAULT_MAX_MACS;
-    syncer.max_macs_je_karte.clear();
-    for card in filter_carriers(&devs, Some(topo)) {
+    let assumed = sync::DEFAULT_MAX_MACS;
+    let mut limits: crate::hash::Map<String, usize> = crate::hash::map();
+    for card in filter_carriers(&devs, topo) {
         let Some(link) = topo.index_of(&card).and_then(|i| topo.at(i)) else {
-            continue; // not there yet; asked again next pass
+            if let Some(n) = syncer.max_macs_per_card.get(&card) {
+                limits.insert(card, *n);
+            }
+            continue;
         };
-        let known = link
-            .driver
-            .as_deref()
-            .and_then(|d| drivers::filter_of(d, link.physfn.is_some()).map(|f| (d, f)));
-        let first = said.insert(card.clone());
-        match known {
-            Some((driver, f)) if f.past == drivers::Past::Ignored => {
-                if first {
-                    eprintln!(
-                        "warning: {card}: the {driver} driver never programs a unicast \
-                         list on this interface - nothing registered here takes effect"
-                    );
-                }
-            }
-            Some((driver, f)) => {
-                let past = match f.past {
-                    drivers::Past::Drops => "drops silently",
-                    drivers::Past::Promisc => "goes unicast-promiscuous",
-                    drivers::Past::Hashes => "falls back to a hash filter",
-                    drivers::Past::Ignored => unreachable!(),
-                };
-                match f.holds {
-                    Some(n) => {
-                        if first {
-                            note!(
-                                "{card}: the {driver} driver holds {n} addresses by the \
-                                 kernel source and {past} past that"
-                            );
-                        }
-                        syncer.max_macs_je_karte.insert(card, n);
-                        limit = limit.min(n);
+        let (driver, filter) = card_filter(topo, link);
+        let first = driver.is_some() && said.insert(card.clone());
+        let mut holds = assumed;
+        match (driver, filter) {
+            (Some(d), Some(f)) => match f.past {
+                drivers::Past::Ignored => {
+                    if first {
+                        eprintln!(
+                            "warning: {card}: the {d} driver never programs a unicast \
+                             list on this interface - nothing registered here takes effect"
+                        );
                     }
-                    None if first => note!(
-                        "{card}: the {driver} driver's limit lives in firmware; assuming \
-                         {}, and it {past} past its real one",
-                        sync::DEFAULT_MAX_MACS
-                    ),
-                    None => {}
                 }
+                drivers::Past::PromiscFromFirst => {
+                    if first {
+                        note!(
+                            "{card}: the {d} driver has no unicast filter - the kernel makes \
+                             the interface promiscuous at the first entry, traffic flows and \
+                             the list is moot"
+                        );
+                    }
+                }
+                _ => {
+                    let past = match f.past {
+                        drivers::Past::Drops => "drops silently",
+                        drivers::Past::Promisc => "goes unicast-promiscuous",
+                        drivers::Past::Hashes => "falls back to a hash filter",
+                        _ => unreachable!(),
+                    };
+                    match f.holds {
+                        Some(n) => {
+                            holds = n;
+                            if first {
+                                note!(
+                                    "{card}: the {d} driver holds {n} addresses by the kernel \
+                                     source and {past} past that"
+                                );
+                            }
+                        }
+                        None if first => note!(
+                            "{card}: the {d} driver's limit lives in firmware; assuming \
+                             {assumed}, and it {past} past its real one"
+                        ),
+                        None => {}
+                    }
+                }
+            },
+            (Some(d), None) if first => {
+                note!("{card}: the {d} driver is not in the table; assuming {assumed} addresses");
             }
-            None if first => note!(
-                "{card}: no driver this program knows; assuming {} addresses",
-                sync::DEFAULT_MAX_MACS
-            ),
-            None => {}
+            _ => {} // no driver known in this reading: the next may know
         }
+        limits.insert(card, holds);
     }
+    if max_set {
+        return; // the operator's number governs every card
+    }
+    let limit = limits.values().copied().min().unwrap_or(assumed);
+    syncer.max_macs_per_card = limits;
     if limit != syncer.max_macs {
         note!(
-            "warning above {limit} addresses, and releasing quiet addresses as a \
-             list comes near its card's limit"
+            "the number to warn at is {limit} addresses; quiet addresses are released \
+             as a list comes near its card's limit"
         );
         syncer.max_macs = limit;
     }
@@ -628,22 +722,36 @@ mod tests {
     }
 
     /// The kernel source answers for each card by driver and role; the
-    /// smallest number is the one to warn at; a driver that ignores the list
-    /// sets no limit; a card not in the reading is left for the next pass.
+    /// smallest number is the one to warn at; a card the table cannot number
+    /// keeps the assumed number rather than inheriting the smallest card's;
+    /// a card absent from a reading keeps its last number; a bond answers
+    /// with its smallest member; the operator's --max leaves every number
+    /// alone.
     #[test]
     fn the_driver_table_sets_the_limits() {
         use crate::topology::fixture::{mac, Builder};
         let topo = Builder::new()
-            .add("bx", 2, Some(mac(1)))
-            .driver("bnxt_en")
-            .add("bxv", 3, Some(mac(2)))
-            .driver("bnxt_en")
-            .physfn("bx")
-            .add("mx", 4, Some(mac(3)))
-            .driver("mlx5_core")
+            .add("be", 2, Some(mac(1)))
+            .driver("be2net")
+            .add("bev", 3, Some(mac(2)))
+            .driver("be2net")
+            .physfn("be")
+            .add("i40", 4, Some(mac(3)))
+            .driver("i40e")
             .add("ena0", 5, Some(mac(4)))
             .driver("ena")
             .add("veth", 6, Some(mac(5)))
+            .add("av0", 7, Some(mac(6)))
+            .driver("iavf")
+            .physfn("i40")
+            .master("bond0")
+            .add("av1", 8, Some(mac(7)))
+            .driver("iavf")
+            .physfn("i40")
+            .master("bond0")
+            .add("bond0", 9, Some(mac(6)))
+            .lower("av0")
+            .lower("av1")
             .build();
         let pair = |d: &str| Pair {
             dev: d.into(),
@@ -652,31 +760,67 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("sriov-mac-sync-limits-{}", std::process::id()));
         let mut syncer = Syncer::new(
-            vec![pair("mx"), pair("ena0"), pair("veth"), pair("later")],
+            vec![pair("i40"), pair("ena0"), pair("veth"), pair("later")],
             dir.clone(),
         );
         let mut said = crate::hash::set();
-        apply_card_limits(&mut syncer, &topo, &mut said);
+        apply_card_limits(&mut syncer, &topo, false, &mut said);
         assert_eq!(
             syncer.max_macs, 128,
-            "mlx5 holds 128; ena and veth set nothing"
+            "firmware-limited, ignored and unknown cards set no number"
         );
-        assert_eq!(syncer.max_macs_je_karte.get("mx"), Some(&128));
-        assert!(!syncer.max_macs_je_karte.contains_key("ena0"));
+        assert_eq!(
+            syncer.max_macs_per_card.get("i40"),
+            Some(&128),
+            "the assumed number, per card"
+        );
+        assert_eq!(syncer.max_macs_per_card.get("ena0"), Some(&128));
         assert!(
             !said.contains("later"),
             "an absent card is not said, it is asked again"
         );
 
-        syncer.pairs = vec![pair("bx"), pair("bxv"), pair("mx")];
-        apply_card_limits(&mut syncer, &topo, &mut said);
-        assert_eq!(syncer.max_macs, 4, "the smallest card governs the warning");
-        assert_eq!(syncer.max_macs_je_karte.get("bxv"), Some(&4));
+        // Roles: the PF and the VF of one driver hold different numbers.
+        syncer.pairs = vec![pair("be"), pair("bev"), pair("i40")];
+        apply_card_limits(&mut syncer, &topo, false, &mut said);
+        assert_eq!(syncer.max_macs_per_card.get("be"), Some(&30));
         assert_eq!(
-            syncer.max_macs_je_karte.get("mx"),
-            Some(&128),
-            "per card, the card's own"
+            syncer.max_macs_per_card.get("bev"),
+            Some(&2),
+            "the VF role, by physfn"
         );
+        assert_eq!(syncer.max_macs, 2, "the smallest card governs the warning");
+        assert_eq!(
+            syncer.limit_of("i40"),
+            128,
+            "a card without a number keeps the assumed one, not the smallest card's"
+        );
+
+        // A bond of VFs answers with its smallest member.
+        syncer.pairs = vec![pair("bond0")];
+        apply_card_limits(&mut syncer, &topo, false, &mut said);
+        assert_eq!(
+            syncer.max_macs_per_card.get("bond0"),
+            Some(&12),
+            "iavf behind the bond"
+        );
+
+        // A card that drops out of one reading keeps its number.
+        let bare = Builder::new().add("lo", 1, None).build();
+        apply_card_limits(&mut syncer, &bare, false, &mut said);
+        assert_eq!(
+            syncer.max_macs_per_card.get("bond0"),
+            Some(&12),
+            "kept while absent"
+        );
+
+        // --max: the numbers are the operator's, the table only warns.
+        let mut fixed = Syncer::new(vec![pair("bev")], dir.clone());
+        fixed.max_macs = 200;
+        apply_card_limits(&mut fixed, &topo, true, &mut crate::hash::set());
+        assert_eq!(fixed.max_macs, 200);
+        assert!(fixed.max_macs_per_card.is_empty());
+        assert_eq!(fixed.limit_of("bev"), 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -901,10 +1045,8 @@ mod tests {
         }
 
         /// A bridge built at runtime is adopted by the prompt pass its own
-        /// link event buys, not by the next timed pass. The batch reads the
-        /// fresh picture *before* the pass, so needs_reading() cannot tell;
-        /// replaced_since_pass carries the news. Without it a runtime pair
-        /// waited out the whole interval.
+        /// link event buys, not by the next timed pass: autodetection runs
+        /// on every pass's own reading.
         #[test]
         fn a_pair_appearing_at_runtime_is_adopted_by_the_prompt_pass() {
             let mut opts = Options {

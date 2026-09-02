@@ -98,6 +98,18 @@ impl FdbWriter for FakeSock {
     fn dump_fdb(&mut self) -> io::Result<Vec<FdbEntry>> {
         Ok(self.fdb.clone())
     }
+    /// The card remembers what this socket added and removed, the way the
+    /// kernel would answer a batch that reads it back.
+    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<FdbEntry>> {
+        let mut out: Vec<FdbEntry> = self
+            .fdb
+            .iter()
+            .filter(|e| e.ifindex == ifindex && !e.is_self())
+            .cloned()
+            .collect();
+        out.extend(self.card_after(ifindex));
+        Ok(out)
+    }
     fn dump_links(&mut self) -> io::Result<Vec<crate::netlink::LinkInfo>> {
         Ok(self.links.clone())
     }
@@ -235,6 +247,7 @@ pub(crate) fn desired_named(
         port,
         card,
         functions: topo.physical_functions(card),
+        siblings: Vec::new(),
     };
     let (want, stacked, wire, _) = s.desired(topo, &anat, fdb, vf_macs);
     (want, stacked, wire)

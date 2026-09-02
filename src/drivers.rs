@@ -18,6 +18,9 @@ pub enum Past {
     Promisc,
     /// a hash filter takes over: accepted, imperfectly
     Hashes,
+    /// the interface has no unicast filter at all: the kernel makes it
+    /// promiscuous at the first entry - traffic flows, every entry is moot
+    PromiscFromFirst,
     /// the driver never programs the list on this role at all - every entry
     /// this daemon adds is a no-op there
     Ignored,
@@ -41,8 +44,12 @@ enum Role {
 use Past::*;
 use Role::*;
 
-/// Driver name as `/sys/class/net/X/device/driver` spells it. Numbers are
-/// the conservative end where a table is shared or model-dependent.
+/// Driver name as `/sys/class/net/X/device/driver` spells it. The number
+/// is the list size as the driver counts it, the interface's own address
+/// included where the driver includes it - the headroom pays for that. Where
+/// a table is shared or model-dependent it is the conservative end that a
+/// common host reaches (ixgbevf: the pool of 112 minus 16 VFs; iavf: 18
+/// filters less its own address, broadcast and a few multicast groups).
 const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     // Intel
     ("igb", Pf, Some(16), Promisc), // RAR table, 16 on the smallest models
@@ -77,22 +84,22 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     // Solarflare
     ("sfc", Pf, Some(32), Promisc), // EFX_EF10_FILTER_DEV_UC_MAX
     ("sfc", Vf, Some(32), Drops),
-    ("sfc_ef100", Any, None, Promisc), // promiscuous from the first entry
-    ("sfc_siena", Any, None, Promisc),
+    ("sfc_ef100", Any, None, PromiscFromFirst),
+    ("sfc_siena", Any, None, PromiscFromFirst),
     // Netronome
-    ("nfp", Any, None, Promisc), // promiscuous from the first entry
+    ("nfp", Any, None, PromiscFromFirst),
     // Marvell / Cavium
     ("rvu_nicpf", Pf, Some(4), Promisc), // devlink unicast_filter_count
     ("rvu_nicvf", Vf, None, Ignored),    // untrusted VF
     ("octeon_ep", Any, None, Ignored),
     ("octeon_ep_vf", Any, None, Ignored),
-    ("LiquidIO", Pf, None, Promisc),
+    ("LiquidIO", Pf, None, PromiscFromFirst),
     ("LiquidIO_VF", Vf, Some(32), Drops),
-    ("nicvf", Any, None, Promisc), // ThunderX: promiscuous for the whole LMAC
+    ("nicvf", Any, None, PromiscFromFirst), // ThunderX: the whole LMAC, every VF on it
     // HiSilicon / Huawei
     ("hns3", Pf, None, Promisc),
     ("hns3", Vf, None, Drops), // untrusted VF
-    ("hinic", Pf, None, Promisc),
+    ("hinic", Pf, None, PromiscFromFirst),
     ("hinic", Vf, None, Drops),
     ("hinic3", Any, None, Promisc),
     // Cloud and others
@@ -150,7 +157,10 @@ mod tests {
         for (i, (name, role, holds, past)) in TABLE.iter().enumerate() {
             if let Some(n) = holds {
                 assert!(*n >= 1 && *n <= 1 << 20, "{name}: {n}");
-                assert_ne!(*past, Ignored, "{name}: ignored lists hold nothing");
+                assert!(
+                    !matches!(past, Ignored | PromiscFromFirst),
+                    "{name}: a list nobody programs, or that is moot, holds no number"
+                );
             }
             for (other, orole, _, _) in &TABLE[i + 1..] {
                 if other == name {

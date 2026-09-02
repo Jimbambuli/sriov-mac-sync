@@ -3223,6 +3223,13 @@ struct FlipSock {
     heal: Option<PathBuf>,
 }
 impl FdbWriter for FlipSock {
+    fn dump_fdb_of(&mut self, ifindex: u32) -> io::Result<Vec<crate::netlink::FdbEntry>> {
+        Ok(self
+            .dump_fdb()?
+            .into_iter()
+            .filter(|e| e.ifindex == ifindex)
+            .collect())
+    }
     fn dump_fdb(&mut self) -> io::Result<Vec<crate::netlink::FdbEntry>> {
         self.inner.dump_fdb()
     }

@@ -56,6 +56,9 @@ pub struct Link {
     /// and this is the lowest-numbered of them - readdir order is not
     /// promised, and this is a key elsewhere; `pf_netdevs` holds them all.
     pub physfn: Option<u32>,
+    /// whether a PCI `physfn` stands behind this interface - a VF, whether
+    /// or not its PF has a netdev in this namespace
+    pub is_vf: bool,
     /// every PF netdev of this VF's PCI function - several on a multiport
     /// card sharing one function, where each port's netdev reports only its
     /// own VF addresses. The exclusion set must take them all, or a sibling
@@ -130,6 +133,10 @@ pub struct Anatomy {
     pub port: u32,
     pub card: u32,
     pub functions: Vec<u32>,
+    /// Other ports of this bridge, or of a bridge stacked on it, that face
+    /// the same eSwitch: a sibling VF, the PF, a VLAN of either. What a
+    /// bridge learns there came off the same cable and is wire (invariant 1).
+    pub siblings: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -169,20 +176,38 @@ fn link_target_name(path: impl AsRef<Path>) -> Option<String> {
 /// boot, so these are read once per index - three file operations per card
 /// that every batch would otherwise pay again. What can change (`numvfs`,
 /// the VF netdevs) is read every time.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Debug)]
 struct DeviceFacts {
     driver: Option<String>,
+    /// PF netdev NAMES - the one thing a rename changes, which is why the
+    /// entry is checked against the reading before it is believed
     pf_netdevs: Vec<String>,
+    is_vf: bool,
 }
 
-fn device_facts(index: u32, read: impl FnOnce() -> DeviceFacts) -> DeviceFacts {
+/// The cached facts for `index`, re-read when `stale` says the entry no
+/// longer fits the reading (a PF netdev name that does not resolve any more)
+/// or when there is none. `read` answers `None` when the directory moved
+/// under the reading, and nothing is cached then.
+fn device_facts(
+    index: u32,
+    stale: impl Fn(&DeviceFacts) -> bool,
+    read: impl FnOnce() -> Option<DeviceFacts>,
+) -> Option<DeviceFacts> {
     use std::sync::{Mutex, OnceLock};
     static FACTS: OnceLock<Mutex<Map<u32, DeviceFacts>>> = OnceLock::new();
     let mut facts = FACTS
         .get_or_init(|| Mutex::new(crate::hash::map()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    facts.entry(index).or_insert_with(read).clone()
+    if let Some(f) = facts.get(&index) {
+        if !stale(f) {
+            return Some(f.clone());
+        }
+    }
+    let fresh = read()?;
+    facts.insert(index, fresh.clone());
+    Some(fresh)
 }
 
 impl Topology {
@@ -219,7 +244,7 @@ impl Topology {
                 master: link_target_name(base.join("master")),
                 ..Default::default()
             };
-            let link = Link {
+            let mut link = Link {
                 name: name.clone(),
                 index,
                 mac: read_trim(base.join("address"))
@@ -258,6 +283,7 @@ impl Topology {
             if has_dev {
                 // read_dir on a missing directory fails by itself; asking
                 // twice was one syscall per interface for nothing.
+                link.is_vf = dev.join("physfn").exists();
                 if let Ok(rd) = fs::read_dir(dev.join("physfn/net")) {
                     for e in rd.flatten() {
                         names
@@ -409,19 +435,39 @@ impl Topology {
             };
 
             if has_device {
-                let facts = device_facts(l.index, || DeviceFacts {
-                    driver: link_target_name(base.join("device/driver")),
-                    pf_netdevs: fs::read_dir(base.join("device/physfn/net"))
-                        .map(|rd| {
-                            rd.flatten()
-                                .filter_map(|e| e.file_name().to_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                });
+                // A cached PF name that no longer resolves - the PF was
+                // renamed - or a VF whose PF list came back empty (the PF
+                // may have been `eth0` at the time) is read again; the
+                // reading is what the names have to fit.
+                let facts = device_facts(
+                    l.index,
+                    |f| {
+                        f.pf_netdevs.iter().any(|n| !by_name.contains_key(n))
+                            || (f.is_vf && f.pf_netdevs.is_empty())
+                    },
+                    || {
+                        let facts = DeviceFacts {
+                            driver: link_target_name(base.join("device/driver")),
+                            pf_netdevs: fs::read_dir(base.join("device/physfn/net"))
+                                .map(|rd| {
+                                    rd.flatten()
+                                        .filter_map(|e| e.file_name().to_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            is_vf: base.join("device/physfn").exists(),
+                        };
+                        // The directory has to answer for this index after
+                        // the reads as well as before, or a rename in
+                        // between just read another card's facts.
+                        (read_trim(base.join("ifindex")).and_then(|s| s.parse::<u32>().ok())
+                            == Some(l.index))
+                        .then_some(facts)
+                    },
+                )
+                .unwrap_or_default();
                 link.driver = facts.driver;
-                // Resolved per reading: names are stable, indices are the
-                // reading's business.
+                link.is_vf = facts.is_vf;
                 link.pf_netdevs = facts
                     .pf_netdevs
                     .iter()
@@ -632,8 +678,10 @@ impl Topology {
             } else if !l.is_bridge {
                 // A bond spreads its entries over its members; a bridge does
                 // not, and looking through one made every vnet VLAN on it an
-                // uplink candidate (seen on pve2: vmbr1.100:DMZ100).
+                // uplink candidate (seen on pve2: vmbr1.100:DMZ100). A VLAN
+                // member of a bond leads on to its card.
                 stack.extend(l.slaves.iter().copied());
+                stack.extend(l.filter_below);
             }
         }
         out.sort_unstable();
@@ -668,12 +716,31 @@ impl Topology {
     pub fn anatomy(&self, dev: u32, bridge: u32) -> Option<Anatomy> {
         let port = self.uplink_port(dev, bridge)?;
         let card = self.filter_carrier(dev);
+        let functions = self.physical_functions(card);
+        let reach = self.reach(bridge);
+        let mut siblings: Vec<u32> = self
+            .links
+            .values()
+            .filter(|l| l.index != port && l.index != dev)
+            .filter(|l| {
+                l.master == Some(bridge)
+                    || l.master.is_some_and(|m| reach.stacked_bridges.contains(&m))
+            })
+            .filter(|l| {
+                self.physical_functions(self.filter_carrier(l.index))
+                    .iter()
+                    .any(|f| functions.contains(f))
+            })
+            .map(|l| l.index)
+            .collect();
+        siblings.sort_unstable();
         Some(Anatomy {
             dev,
             bridge,
             port,
             card,
-            functions: self.physical_functions(card),
+            functions,
+            siblings,
         })
     }
 
@@ -739,6 +806,14 @@ impl Topology {
     /// one eSwitch must not both claim a bridge's addresses, and which is the
     /// port is arbitrary, so the first in name order wins and the rest are
     /// reported.
+    /// Whether two bridges are one segment: the same, or one stacked on the
+    /// other through a VLAN or the like.
+    fn stacked_related(&self, a: u32, b: u32) -> bool {
+        a == b
+            || self.reach(a).stacked_bridges.contains(&b)
+            || self.reach(b).stacked_bridges.contains(&a)
+    }
+
     pub fn autodetect(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut taken: Vec<(Vec<u32>, u32, String)> = Vec::new(); // functions, bridge, by
@@ -762,14 +837,16 @@ impl Topology {
                 continue;
             };
             let br_name = self.name_of(br).unwrap_or_default().to_string();
-            // A PF that itself carries this bridge, on any of its ports: the
-            // bridge's addresses already have a vport, and a VF taking it
-            // too would claim them twice on one eSwitch.
-            if let Some(pf) = anat
-                .functions
-                .iter()
-                .find(|&&pf| pf != link.index && self.bridge_above(pf).map(|(b, _)| b) == Some(br))
-            {
+            // A PF that itself carries this bridge, on any of its ports - or a
+            // bridge stacked above or below it, which shares its segment: the
+            // bridge's addresses already have a vport, and a VF taking it too
+            // would claim them twice on one eSwitch, one bridge level up.
+            if let Some(pf) = anat.functions.iter().find(|&&pf| {
+                pf != link.index
+                    && self
+                        .bridge_above(pf)
+                        .is_some_and(|(b, _)| self.stacked_related(b, br))
+            }) {
                 skipped.push(format!(
                     "skip {}: {} already carries {br_name}",
                     link.name,
@@ -777,10 +854,9 @@ impl Topology {
                 ));
                 continue;
             }
-            if let Some((_, _, by)) = taken
-                .iter()
-                .find(|(f, b, _)| *b == br && f.iter().any(|x| anat.functions.contains(x)))
-            {
+            if let Some((_, _, by)) = taken.iter().find(|(f, b, _)| {
+                self.stacked_related(*b, br) && f.iter().any(|x| anat.functions.contains(x))
+            }) {
                 skipped.push(format!(
                     "skip {}: {by} of the same function already carries {br_name} - two \
                      vports of one eSwitch cannot both claim the same addresses",
@@ -952,6 +1028,7 @@ pub(crate) mod fixture {
                     l.pf_netdevs.sort_unstable();
                     if let Some(&first) = l.pf_netdevs.first() {
                         l.physfn = Some(first);
+                        l.is_vf = true;
                     }
                     l.vf_netdevs = n.vf_netdevs.iter().filter_map(idx).collect();
                     l
@@ -1598,24 +1675,127 @@ mod tests {
         );
     }
 
-    /// The facts sysfs cannot change for a living index are read once: a
-    /// second reading for the same index asks nothing.
+    /// The facts are read once per index and believed until the reading
+    /// says they no longer fit - then read again; a reading that refuses
+    /// (the directory moved) caches nothing.
     #[test]
-    fn device_facts_are_read_once_per_index() {
+    fn device_facts_are_read_once_and_re_read_when_stale() {
         let reads = std::cell::Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            super::DeviceFacts {
-                driver: Some("t".into()),
-                pf_netdevs: vec!["p".into()],
+        let read = |name: &'static str| {
+            let reads = &reads;
+            move || {
+                reads.set(reads.get() + 1);
+                Some(super::DeviceFacts {
+                    driver: Some("t".into()),
+                    pf_netdevs: vec![name.into()],
+                    is_vf: true,
+                })
             }
         };
         let index = 0xfeed_0000 + std::process::id() % 1000;
-        let a = super::device_facts(index, read);
-        let b = super::device_facts(index, read);
+        let a = super::device_facts(index, |_| false, read("eth0")).unwrap();
+        let b = super::device_facts(index, |_| false, read("nic1")).unwrap();
         assert_eq!(reads.get(), 1, "the second reading came from the cache");
-        assert_eq!(a.driver, b.driver);
-        assert_eq!(b.pf_netdevs, vec!["p".to_string()]);
+        assert_eq!(a, b);
+        // The PF was renamed: the cached name does not fit any more.
+        let c = super::device_facts(index, |f| f.pf_netdevs[0] == "eth0", read("nic1")).unwrap();
+        assert_eq!(reads.get(), 2, "a stale entry is read again");
+        assert_eq!(c.pf_netdevs, vec!["nic1".to_string()]);
+        // A refused read leaves the good entry alone.
+        let d = super::device_facts(index, |_| true, || None);
+        assert!(d.is_none());
+        let e = super::device_facts(index, |_| false, read("zzz")).unwrap();
+        assert_eq!(
+            e.pf_netdevs,
+            vec!["nic1".to_string()],
+            "nothing was cached from the refusal"
+        );
+    }
+
+    /// A bond of VLAN interfaces leads on to the cards below the VLANs:
+    /// named by hand as an uplink, its exclusions must reach them.
+    #[test]
+    fn a_bond_of_vlans_still_finds_its_cards() {
+        let topo = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(1)
+            .add("nic2", 3, Some(mac(2)))
+            .vfs(1)
+            .add("nic1.100", 4, Some(mac(1)))
+            .vlan_on("nic1")
+            .master("bond0")
+            .add("nic2.100", 5, Some(mac(2)))
+            .vlan_on("nic2")
+            .master("bond0")
+            .add("bond0", 6, Some(mac(1)))
+            .lower("nic1.100")
+            .lower("nic2.100")
+            .master("br0")
+            .add("br0", 10, Some(mac(3)))
+            .bridge()
+            .lower("bond0")
+            .build();
+        assert_eq!(topo.physical_functions(6), vec![2, 3]);
+        let anat = topo.anatomy(6, 10).expect("bond0 sits under br0");
+        assert_eq!(anat.functions, vec![2, 3]);
+    }
+
+    /// A sibling vport of the pair's own card - the PF beside a VF, a VLAN
+    /// of either - in the pair's bridge or one stacked on it faces the same
+    /// cable: the anatomy names it, and autodetection does not make a second
+    /// pair of it one bridge level up.
+    #[test]
+    fn a_sibling_vport_faces_the_same_cable() {
+        // PF nic1 carries vmbr1; vmbr1.44 sits in IOT; the VF nic1v0 is in IOT.
+        let topo = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(1)
+            .master("vmbr1")
+            .add("nic1v0", 3, Some(mac(2)))
+            .physfn("nic1")
+            .master("IOT")
+            .add("vmbr1", 10, Some(mac(3)))
+            .bridge()
+            .lower("nic1")
+            .add("vmbr1.44", 11, Some(mac(3)))
+            .vlan_on("vmbr1")
+            .master("IOT")
+            .add("IOT", 20, Some(mac(4)))
+            .bridge()
+            .lower("vmbr1.44")
+            .lower("nic1v0")
+            .build();
+        let anat = topo.anatomy(2, 10).expect("nic1 sits under vmbr1");
+        assert_eq!(
+            anat.siblings,
+            vec![3],
+            "the VF in the stacked bridge is a sibling"
+        );
+        let (pairs, skipped) = topo.autodetect();
+        assert_eq!(pairs, vec![("nic1".to_string(), "vmbr1".to_string())]);
+        assert!(
+            skipped.iter().any(|s| s.starts_with("skip nic1v0:")),
+            "the VF one level up is not a second uplink: {skipped:?}"
+        );
+        // Hand-named PF and VF in ONE bridge: siblings both ways.
+        let same = Builder::new()
+            .add("nic1", 2, Some(mac(1)))
+            .vfs(2)
+            .master("vmbr1")
+            .add("nic1v0", 3, Some(mac(2)))
+            .physfn("nic1")
+            .master("vmbr1")
+            .add("nic1v1", 4, Some(mac(5)))
+            .physfn("nic1")
+            .master("vmbr1")
+            .add("vmbr1", 10, Some(mac(3)))
+            .bridge()
+            .lower("nic1")
+            .lower("nic1v0")
+            .lower("nic1v1")
+            .build();
+        assert_eq!(same.anatomy(3, 10).unwrap().siblings, vec![2, 4]);
+        assert_eq!(same.anatomy(2, 10).unwrap().siblings, vec![3, 4]);
     }
 
     /// Of the stacked kinds only a VLAN writes into the filter below it - a
