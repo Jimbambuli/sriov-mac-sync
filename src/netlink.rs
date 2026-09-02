@@ -69,8 +69,10 @@ const IFLA_VF_INFO: u16 = 1;
 const IFLA_VF_MAC: u16 = 1;
 /// `struct ifla_vf_trust { __u32 vf; __u32 setting; }` - whether the PF
 /// trusts the function, which is what several VF drivers make their
-/// unicast list depend on (drivers.rs).
-const IFLA_VF_TRUST: u16 = 12;
+/// unicast list depend on (drivers.rs). Nine, after SPOOFCHK, LINK_STATE,
+/// RATE, RSS_QUERY_EN and STATS: a first draft said twelve, which is the
+/// VLAN list, whose first bytes read as "not trusted" on every kernel.
+const IFLA_VF_TRUST: u16 = 9;
 const RTEXT_FILTER_VF: u32 = 1;
 /// Asking for virtual function details also fetches their traffic counters,
 /// which come out of the hardware. This says not to.
@@ -1988,6 +1990,13 @@ mod tests {
             attr_u32(&[1, 0, 0]),
             None,
             "a short attribute costs only itself"
+        );
+        // The numbers themselves, against include/uapi/linux/if_link.h: a
+        // wrong one reads another attribute as the flag and never fails a
+        // test built on the same constant.
+        assert_eq!(
+            (IFLA_VFINFO_LIST, IFLA_VF_INFO, IFLA_VF_MAC, IFLA_VF_TRUST),
+            (22, 1, 1, 9)
         );
     }
 
