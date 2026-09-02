@@ -249,7 +249,9 @@ pub(crate) fn desired_named(
         functions: topo.physical_functions(card),
         siblings: Vec::new(),
     };
-    let (want, stacked, wire, _) = s.desired(topo, &anat, fdb, vf_macs);
+    let skip = s.exclusions(topo, &anat, vf_macs);
+    let reach = topo.reach(anat.bridge);
+    let (want, stacked, wire, _) = s.desired(topo, &anat, &reach, &skip, fdb);
     (want, stacked, wire)
 }
 

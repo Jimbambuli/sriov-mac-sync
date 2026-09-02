@@ -1377,25 +1377,35 @@ fn the_unknowable_vf_warning_fires_when_the_situation_arises() {
     let mut s = ready_syncer(&dir);
 
     // Pass one: the single VF has an address, nothing is unknowable.
-    s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
+    s.warn_about_unknowable_vfs(
+        &topo,
+        "nic1",
+        &anat_of(&topo, "nic1", "vmbr1"),
+        &[(2, VF_ADMIN)],
+    );
     assert!(
         !s.said.borrow().unknown_vf.contains("nic1"),
         "a pass with nothing to warn about must not use up the warning"
     );
 
     // Pass two: the address is gone - a guest took the VF. Now it warns.
-    s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
+    s.warn_about_unknowable_vfs(&topo, "nic1", &anat_of(&topo, "nic1", "vmbr1"), &[]);
     assert!(
         s.said.borrow().unknown_vf.contains("nic1"),
         "the situation arose and the warning did not fire"
     );
 
     // While it persists: once was enough (the set held it).
-    s.warn_about_unknowable_vfs(&topo, "nic1", &[]);
+    s.warn_about_unknowable_vfs(&topo, "nic1", &anat_of(&topo, "nic1", "vmbr1"), &[]);
     assert!(s.said.borrow().unknown_vf.contains("nic1"));
 
     // It clears, and a later return deserves a fresh warning.
-    s.warn_about_unknowable_vfs(&topo, "nic1", &[(2, VF_ADMIN)]);
+    s.warn_about_unknowable_vfs(
+        &topo,
+        "nic1",
+        &anat_of(&topo, "nic1", "vmbr1"),
+        &[(2, VF_ADMIN)],
+    );
     assert!(
         !s.said.borrow().unknown_vf.contains("nic1"),
         "a situation that ended has to re-arm its warning"
@@ -2402,7 +2412,7 @@ fn an_unknowable_virtual_function_is_reported_once() {
         !s.said.borrow().unknown_vf.contains("pf0"),
         "nothing said before it is looked at"
     );
-    s.warn_about_unknowable_vfs(&topo, "pf0", &[]);
+    s.warn_about_unknowable_vfs(&topo, "pf0", &anat_of(&topo, "pf0", "br0"), &[]);
     assert!(
         s.said.borrow().unknown_vf.contains("pf0"),
         "and once looked at, not looked at again every pass for ever"
@@ -2417,6 +2427,7 @@ fn an_unknowable_virtual_function_is_reported_once() {
     quiet.warn_about_unknowable_vfs(
         &topo,
         "pf0",
+        &anat_of(&topo, "pf0", "br0"),
         &[(2, [0x02, 0, 0, 0, 0, 9]), (2, [0x02, 0, 0, 0, 0, 10])],
     );
     assert!(!quiet.said.borrow().unknown_vf.contains("pf0"));
@@ -2505,6 +2516,15 @@ fn fdb_without(mac: Mac) -> Vec<crate::netlink::FdbEntry> {
 
 /// A `self` entry as the card would report it: the address is in the
 /// uplink's own filter list.
+/// The anatomy of a pair named by interface and bridge, as the pass computes it.
+fn anat_of(topo: &crate::topology::Topology, dev: &str, bridge: &str) -> crate::topology::Anatomy {
+    topo.anatomy(
+        topo.index_of(dev).expect("fixture: no such device"),
+        topo.index_of(bridge).expect("fixture: no such bridge"),
+    )
+    .expect("fixture: the device sits under the bridge")
+}
+
 fn card_holds(dev: u32, mac: Mac) -> crate::netlink::FdbEntry {
     crate::netlink::FdbEntry {
         ifindex: dev,
@@ -3480,6 +3500,7 @@ fn renaming_a_device_carries_every_mark() {
     said.unreadable.insert("a".into());
     said.lock.insert("a".into());
     said.ports.insert("a".into());
+    said.index.insert("a".into());
     said.rename("a", "b");
     let mut erwartet = Said::default();
     erwartet.unknown_vf.insert("b".into());
@@ -3494,6 +3515,7 @@ fn renaming_a_device_carries_every_mark() {
     erwartet.unreadable.insert("b".into());
     erwartet.lock.insert("b".into());
     erwartet.ports.insert("b".into());
+    erwartet.index.insert("b".into());
     assert_eq!(said, erwartet);
 }
 
@@ -5456,14 +5478,11 @@ fn a_deletion_dates_only_the_bridge_it_came_from() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// An entry the card says it never had frees its slot too.
-///
-/// A reflection removes an address the wire has taken over. The card can
-/// answer ENOENT - it is already gone - and that is a slot free just as
-/// much as a successful removal. Counting it as occupied made the next
-/// burst measure its room against a slot that was not there.
+/// An entry the card says it never had was not occupying a slot, so its
+/// removal frees none: the carried count comes down only for what the card
+/// really let go. The reflection still settles the note.
 #[test]
-fn a_removal_that_was_already_gone_still_frees_its_slot() {
+fn a_removal_that_was_already_gone_frees_no_counted_slot() {
     let dir = scratch("enoent-frees-slot");
     let m: Mac = [0x02, 0xc3, 0, 0, 0, 1];
     let topo = small_host();
@@ -5486,9 +5505,9 @@ fn a_removal_that_was_already_gone_still_frees_its_slot() {
     s.fast_apply(&mut ev, &topo, &[(RTM_NEWNEIGH, learned(2, 10, m))])
         .unwrap();
     assert_eq!(
-        s.carried["nic1"].occupancy,
-        before - 1,
-        "the slot it never occupied was never given back"
+        s.carried["nic1"].occupancy, before,
+        "an entry the card never had freed no slot; the count is a heuristic \
+         the next read-back corrects, not something to guess at"
     );
     let _ = fs::remove_dir_all(&dir);
 }

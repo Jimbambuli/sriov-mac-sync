@@ -165,14 +165,23 @@ impl Syncer {
         // Atomic like every other writer here: a second process's
         // renamed_target reading a torn index record would fail to follow
         // exactly the rename the record exists for.
-        let wrote = self.put_file(&self.index_path(dev), &format!("{index}\n"));
-        if let Err(e) = wrote {
-            eprintln!(
-                "warning: cannot record which interface {dev} is: {e} - \
-                 a rename of it would not be followed"
-            );
+        // Remembered only when it is really on disk: a failed write cached
+        // as done would never be retried, and a note without a record is
+        // one the orphan sweep cannot tell a rename from a departure by.
+        match self.put_file(&self.index_path(dev), &format!("{index}\n")) {
+            Ok(()) => {
+                self.indices.borrow_mut().insert(dev.to_string(), index);
+                self.said.borrow_mut().index.remove(dev);
+            }
+            Err(e) => {
+                if self.said.borrow_mut().index.insert(dev.to_string()) {
+                    eprintln!(
+                        "warning: cannot record which interface {dev} is: {e} - \
+                         a rename of it would not be followed until it can be"
+                    );
+                }
+            }
         }
-        self.indices.borrow_mut().insert(dev.to_string(), index);
     }
 
     /// The index recorded for a device's note, if any run recorded one. Read
@@ -546,7 +555,6 @@ impl Syncer {
     /// set any more - pass and reflection write differences so a parallel
     /// writer's lines survive; the tests build starting states this way.
     #[cfg(test)]
-    #[cfg(test)]
     pub(super) fn save_owned(&self, dev: &str, set: &Set<Mac>) {
         if self.dry_run {
             return;
@@ -714,10 +722,6 @@ impl Syncer {
         self.locked(dev, || self.append_owned_locked(dev, added).is_some())
     }
 
-    /// The addresses actually appended - only a line this call added may be
-    /// taken back out when the card refuses the address as somebody else's.
-    /// `None` when the note could not take them; the caller then writes none
-    /// of them into the card.
     /// Cut back a line a previous write did not finish, before adding to it.
     ///
     /// This is the one writer working in place; everything else goes through
@@ -751,6 +755,10 @@ impl Syncer {
         f.set_len(keep as u64)
     }
 
+    /// Add to a note under the caller's lock. Returns the addresses actually
+    /// appended - only a line this call added may be taken back out when the
+    /// card refuses the address as somebody else's - or `None` when the note
+    /// could not take them; the caller then writes none of them into the card.
     pub(super) fn append_owned_locked(&self, dev: &str, added: &[Mac]) -> Option<Vec<Mac>> {
         use std::io::Write;
         let mut set = self.load_owned(dev);
@@ -883,10 +891,13 @@ impl Syncer {
                     self.remove_note(old);
                     return true;
                 }
+                // The record before the note: a crash between the two would
+                // otherwise leave the new note without a record, and a later
+                // rename of THAT name would read as a departure.
+                self.note_index(new, index);
                 if self.append_owned_locked(new, &macs).is_none() {
                     return false; // the new note would not take them; keep the old
                 }
-                self.note_index(new, index);
                 self.remove_note(old);
                 true
             })

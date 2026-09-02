@@ -74,6 +74,9 @@ pub(super) struct Said {
     pub lock: Set<String>,
     /// the port memory could not be written
     pub ports: Set<String>,
+    /// the interface record could not be written, or is missing where it
+    /// would tell a rename from a departure
+    pub index: Set<String>,
 }
 
 impl Said {
@@ -88,6 +91,7 @@ impl Said {
             unreadable,
             lock,
             ports,
+            index,
         } = self;
         unknown_vf.remove(dev);
         extra.remove(dev);
@@ -97,6 +101,28 @@ impl Said {
         unreadable.remove(dev);
         lock.remove(dev);
         ports.remove(dev);
+        index.remove(dev);
+    }
+
+    /// A device that stopped being an uplink but whose note is still on
+    /// disk: what was said about the uplink is over, what was said about
+    /// the note (unreadable, unlockable, unrecordable) stands - the file
+    /// did not change, and saying it again every pass is the noise the
+    /// marks exist against.
+    pub fn retire(&mut self, dev: &str) {
+        let Said {
+            unknown_vf,
+            extra,
+            over,
+            tight,
+            quiet,
+            ..
+        } = self;
+        unknown_vf.remove(dev);
+        extra.remove(dev);
+        over.remove(dev);
+        tight.remove(dev);
+        quiet.remove(dev);
     }
 
     /// A device renamed: what was said stays said under the new name.
@@ -110,8 +136,9 @@ impl Said {
             unreadable,
             lock,
             ports,
+            index,
         } = self;
-        for set in [unknown_vf, over, tight, unreadable, lock, ports] {
+        for set in [unknown_vf, over, tight, unreadable, lock, ports, index] {
             if set.remove(old) {
                 set.insert(new.to_string());
             }
@@ -130,8 +157,6 @@ pub struct Pair {
     pub bridge: String,
 }
 
-/// One pair as the fast path needs it: the structural questions answered once
-/// per batch, which describes a single moment.
 /// The two halves of fast_apply's grow-only driver refresh. Deciding collects
 /// what would be registered - stale carried VF exclusions included - so the
 /// fresh driver question is paid only when something would grow; committing
@@ -143,15 +168,13 @@ enum FastPhase {
     Commit,
 }
 
+/// One pair as the fast path needs it: the structural questions answered once
+/// per batch, which describes a single moment.
 struct FastPair {
     anat: Anatomy,
     reach: Reach,
     /// kept for the messages a person reads
     dev: String,
-    /// the interface of the bridge this uplink is enslaved through
-    port: u32,
-    /// the uplink's own interface index, which the filter is written to
-    index: u32,
     /// addresses that may not be registered for this uplink: the host's own,
     /// the virtual functions', the configured exclusions
     skip: Set<Mac>,
@@ -186,6 +209,17 @@ pub enum Urgency {
     Now,
 }
 
+/// What a locked removal achieved.
+#[derive(Default)]
+struct Retired {
+    /// out of the card and off the note: removed now, or found absent
+    dropped: Vec<Mac>,
+    /// the share of `dropped` the card really let go - the slots freed
+    removed: Vec<Mac>,
+    /// still in the card and still on the note, with the card's reason
+    failed: Vec<(Mac, io::Error)>,
+}
+
 /// What a registration attempt actually achieved.
 struct Registered {
     /// Addresses this call put into the card.
@@ -197,10 +231,13 @@ struct Registered {
 /// What one pass left behind about an uplink's filter.
 #[derive(Default)]
 struct Carried {
-    /// How many entries the card's list held when it was last read back -
-    /// by the pass, or by a batch with something to register - corrected by
-    /// what this process put in or took out since. A heuristic only (the
-    /// pass rate under an ageing burst); every decision reads the card.
+    /// The interface holding the filter this uplink writes into - the uplink
+    /// itself, or the card below a VLAN. Names the limit.
+    card: String,
+    /// How many entries the CARD's list held when it was last read back - by
+    /// the pass, or by a batch with something to register - less what this
+    /// process took out since. A heuristic only (the pass rate under an
+    /// ageing burst); every decision reads the card.
     occupancy: usize,
     /// The addresses the pass decided to keep. The one pool BOTH valves
     /// surrender from, so the event path can reach nothing the pass would
@@ -220,10 +257,42 @@ struct Carried {
 /// and the help text both read it.
 pub const DEFAULT_MAX_MACS: usize = 128;
 
-/// Slots left free below `max_macs`: an allowance for counting drift (a
+/// Slots left free below a card's limit: an allowance for counting drift (a
 /// parallel writer's entries between two passes, an add in flight while a
-/// batch decides), not a working reserve.
+/// batch decides), not a working reserve. Never the whole table: four of
+/// four would leave nothing to register and warn on every batch, so a small
+/// table keeps one slot usable.
 const CAPACITY_HEADROOM: usize = 4;
+
+fn headroom(limit: usize) -> usize {
+    CAPACITY_HEADROOM.min(limit.saturating_sub(1))
+}
+
+/// The card's own list out of a dump: its `self` entries, unicast only.
+fn self_list(entries: &[FdbEntry], ifindex: u32) -> Set<Mac> {
+    entries
+        .iter()
+        .filter(|e| e.is_self() && e.ifindex == ifindex && e.is_unicast())
+        .map(|e| e.mac)
+        .collect()
+}
+
+/// What a pass decided an uplink's filter should hold, asked twice per pass:
+/// up front, and again against the fresh driver answer after a grow-refresh.
+/// Three of the five are sets of addresses; named, so the second asking
+/// cannot transpose them.
+struct Wanted {
+    /// what belongs in the filter, the keeps folded in
+    want: Set<Mac>,
+    /// the bridges stacked on this one, for the report
+    stacked: Vec<String>,
+    /// what the pass saw on the wire (invariant 1)
+    wire: Set<Mac>,
+    /// where each learnt address was seen
+    learnt_at: Map<Mac, u32>,
+    /// the owned addresses kept through their silence
+    kept: Set<Mac>,
+}
 
 pub struct Report {
     pub dev: String,
@@ -384,21 +453,16 @@ pub struct Syncer {
     ports_written: Map<String, Vec<String>>,
     /// Everything said once per device - see `Said`.
     pub(super) said: std::cell::RefCell<Said>,
-    /// The filter capacity the quiet-keep must respect, for any card that
-    /// did not report a number: past it the card drops entries silently, so
-    /// keeps are the first surrendered as the list nears the limit.
+    /// The number to warn at: the operator's --max, else the smallest card's
+    /// limit. Per-card limits are in `max_macs_per_card`; this is what a
+    /// card no pass has placed yet falls back to.
     pub max_macs: usize,
-    /// Which interface holds the filter an uplink writes into, filled by each
-    /// pass from the picture: the event path has no topology, and a burst on
-    /// a VLAN uplink measures against the card below.
-    card_of: Map<String, String>,
     /// What each card holds by the driver table, by the interface holding the
     /// filter. Two cards in one host can differ, and taking the smaller
     /// number for both sheds keeps on the larger for nothing.
     pub max_macs_per_card: Map<String, usize>,
-    /// What the last pass measured about each uplink's filter, carried so the
-    /// event path is capacity-aware without a dump per batch; corrected
-    /// against the read-back every pass.
+    /// What the last pass left behind about each uplink's filter: the keeps
+    /// the batch valve may surrender, the pass stamp, the card's occupancy.
     carried: Map<String, Carried>,
     /// The stamp the last pass wrote. Two passes must never share one -
     /// "quiet" means "stamped before the last pass" - and milliseconds cannot
@@ -531,7 +595,6 @@ impl Syncer {
             ports_written: crate::hash::map(),
             said: std::cell::RefCell::new(Said::default()),
             max_macs: DEFAULT_MAX_MACS,
-            card_of: crate::hash::map(),
             max_macs_per_card: crate::hash::map(),
             last_pass_at: 0,
             carried: crate::hash::map(),
@@ -607,6 +670,20 @@ impl Syncer {
             // re-uses; two interfaces swapping names in one breath is the
             // residual case.
             if topo.get(&dev).is_none() {
+                // Gone, or renamed? Only the interface record can tell, and
+                // without one "gone" is a guess that would unlink the note of
+                // a live interface - the permanent orphan. Left alone, said
+                // once.
+                if self.noted_index(&dev).is_none() && !self.load_owned(&dev).is_empty() {
+                    if self.said.borrow_mut().index.insert(dev.clone()) {
+                        eprintln!(
+                            "warning: {dev}: no interface record beside its note, so a \
+                             rename cannot be told from a departure - leaving its \
+                             addresses on record"
+                        );
+                    }
+                    continue;
+                }
                 if let Some((index, new_name)) = self.renamed_target(&dev, topo) {
                     if !apply || self.dry_run {
                         note!("{dev}: now called {new_name}; its note would follow");
@@ -702,7 +779,7 @@ impl Syncer {
             // Under the note's lock, for the same reason flush works under
             // it: between reading the note and unlinking it, somebody else's
             // append would otherwise vanish with the file.
-            self.locked(&dev, || {
+            let note_gone = self.locked(&dev, || {
                 let owned = self.load_owned(&dev);
                 if owned.is_empty() {
                     // Empty because it says so, or because it could not be
@@ -711,8 +788,9 @@ impl Syncer {
                     // card - the orphan the notes exist to prevent.
                     if self.note_is_readable(&dev) {
                         self.remove_note(&dev);
+                        return true;
                     }
-                    return;
+                    return false;
                 }
                 let (gone, kept) = match topo.get(&dev) {
                     Some(link) => self.unregister_all(sock, &dev, link.index, &owned),
@@ -724,6 +802,7 @@ impl Syncer {
                 if kept.is_empty() && self.note_is_readable(&dev) {
                     note!("{dev}: no longer an uplink, removed {gone} address(es)");
                     self.remove_note(&dev);
+                    true
                 } else {
                     // What could not be removed is still in the card;
                     // forgetting it here is how a registration becomes
@@ -740,14 +819,23 @@ impl Syncer {
                         "{dev}: {} orphaned address(es) could not be removed",
                         kept.len()
                     ));
-                    let _ = self.write_owned(&dev, &kept);
+                    if !self.write_owned(&dev, &kept) {
+                        failures.push(format!("{dev}: the note could not be rewritten"));
+                    }
+                    false
                 }
             });
             // The port memory of a device that stopped being an uplink is
-            // over; one that returns records afresh. The said-once mark goes
-            // with it, so a return also announces afresh.
+            // over; one that returns records afresh. The said-once marks go
+            // with it, so a return also announces afresh - except what was
+            // said about a note that is still there (unreadable, unlockable):
+            // the file did not change, and the mark exists so it is said once.
             self.carried_ports.remove(&dev);
-            self.said.borrow_mut().forget(&dev);
+            if note_gone {
+                self.said.borrow_mut().forget(&dev);
+            } else {
+                self.said.borrow_mut().retire(&dev);
+            }
             // Neither a month-old wire set nor a stale capacity warning
             // greets a device that returns.
             self.carried_wire.remove(&dev);
@@ -873,29 +961,35 @@ impl Syncer {
     /// learn that address on another port, the guest's own address gets
     /// registered and its traffic sent past it. Not fixable here, so the
     /// operator is told once, with the two ways to close it.
-    fn warn_about_unknowable_vfs(&mut self, topo: &Topology, dev: &str, vf_macs: &[(u32, Mac)]) {
-        let Some(pfs) = topo
-            .index_of(dev)
-            .map(|d| topo.physical_functions(topo.filter_carrier(d)))
-        else {
-            return;
-        };
-        // numvfs and host-bound netdevs are device-level - the same on every
-        // port netdev of a shared function - so the first PF answers for them;
-        // only the set addresses are per-port, and are counted across them all.
-        // `topo.at` cannot fail for an index this topology produced; what
-        // this really guards is the empty list, a device with no functions.
-        let Some(pf_link) = pfs.first().and_then(|&pf| topo.at(pf)) else {
-            return;
-        };
-        // An address of all zeroes is the driver saying "nobody set one".
-        let named = vf_macs
-            .iter()
-            .filter(|(index, mac)| pfs.contains(index) && *mac != [0u8; 6])
-            .count();
-        let here = pf_link.vf_netdevs.len();
-        let unknowable = pf_link.numvfs as usize > named.max(here);
-        if !unknowable {
+    fn warn_about_unknowable_vfs(
+        &mut self,
+        topo: &Topology,
+        dev: &str,
+        anat: &Anatomy,
+        vf_macs: &[(u32, Mac)],
+    ) {
+        // Judged per physical function: a bond of two cards, or the two
+        // ports of a shared mlx4 function, each report their own VFs and
+        // their own set addresses. An address of all zeroes is the driver
+        // saying "nobody set one".
+        let mut unknowable: Vec<(String, usize, u32)> = Vec::new();
+        for &pf in &anat.functions {
+            let Some(pf_link) = topo.at(pf) else { continue };
+            let named = vf_macs
+                .iter()
+                .filter(|(index, mac)| *index == pf && *mac != [0u8; 6])
+                .count();
+            let here = pf_link.vf_netdevs.len();
+            let known = named.max(here);
+            if pf_link.numvfs as usize > known {
+                unknowable.push((
+                    pf_link.name.clone(),
+                    pf_link.numvfs as usize - known,
+                    pf_link.numvfs,
+                ));
+            }
+        }
+        if unknowable.is_empty() {
             // Nothing unknowable right now, including no functions at all:
             // the mark comes off, so a situation that arises later or again
             // warns again - "once" is per situation, not per process.
@@ -903,18 +997,15 @@ impl Syncer {
             return;
         }
         if self.said.borrow_mut().unknown_vf.insert(dev.to_string()) {
-            eprintln!(
-                "warning: {}: {} of {}'s {} virtual function(s) have no address set \
-                 from this host and no interface here, so their addresses cannot be \
-                 excluded - a guest holding one would have its own traffic sent past \
-                 it if this bridge ever learns that address. Set them with \
-                 `ip link set {} vf N mac ...`, or list them in EXCLUDE.",
-                dev,
-                pf_link.numvfs as usize - named.max(here),
-                pf_link.name,
-                pf_link.numvfs,
-                pf_link.name
-            );
+            for (pf, missing, numvfs) in unknowable {
+                eprintln!(
+                    "warning: {dev}: {missing} of {pf}'s {numvfs} virtual function(s) have no \
+                     address set from this host and no interface here, so their addresses \
+                     cannot be excluded - a guest holding one would have its own traffic \
+                     sent past it if this bridge ever learns that address. Set them with \
+                     `ip link set {pf} vf N mac ...`, or list them in EXCLUDE."
+                );
+            }
         }
     }
 
@@ -1286,15 +1377,11 @@ impl Syncer {
         Some(Registered { put, failures })
     }
 
-    /// How full the fullest uplink's filter is, as the last pass measured it
-    /// against the card. The limit applies per card, so the fullest list
-    /// counts, not the total - and foreign entries take real slots, which
-    /// counting the notes missed.
-    /// The capacity of the card this uplink writes into: what it reported, or
-    /// the assumed number where it reported nothing (ixgbe, i40e and mlx4:
-    /// every card there is).
-    pub fn limit_of(&self, dev: &str) -> usize {
-        let card = self.card_of.get(dev).map(String::as_str).unwrap_or(dev);
+    /// The limit of the card that holds a filter: the driver table's number
+    /// for it, else the number to warn at. Asked with the CARD's name - the
+    /// uplink itself, or the interface below a VLAN uplink - because three
+    /// VLANs of one function are three uplinks but one list of slots.
+    pub fn limit_of(&self, card: &str) -> usize {
         self.max_macs_per_card
             .get(card)
             .copied()
@@ -1306,43 +1393,59 @@ impl Syncer {
     /// smallest card in the host.
     pub fn any_filter_filling(&self) -> bool {
         self.carried
-            .iter()
-            .any(|(dev, c)| c.occupancy * 10 >= self.limit_of(dev) * 9)
+            .values()
+            .any(|c| c.occupancy * 10 >= self.limit_of(&c.card) * 9)
     }
 
-    /// The card let these go - taken out, or never had. Surrendered is no
-    /// longer kept either, or a second batch counts the room twice.
-    fn card_let_go(&mut self, dev: &str, macs: &[Mac]) {
-        let Some(c) = self.carried.get_mut(dev) else {
-            return;
-        };
-        for mac in macs {
-            c.quiet.remove(mac);
+    /// These are no longer kept - taken out, or given up on - so a second
+    /// batch cannot surrender them again. The occupancy is not touched here:
+    /// only what the card really let go frees a slot, and the callers know.
+    fn no_longer_kept(&mut self, dev: &str, macs: &[Mac]) {
+        if let Some(c) = self.carried.get_mut(dev) {
+            for mac in macs {
+                c.quiet.remove(mac);
+            }
         }
-        c.occupancy = c.occupancy.saturating_sub(macs.len());
     }
 
-    /// The uplink's own list as the card holds it now, read once per batch
-    /// and only for uplinks with something to register: the count the room
-    /// is measured against, and what makes a re-learn free.
+    /// One interface's `self` list as the kernel holds it now, read once per
+    /// batch per interface and only where something would register: the
+    /// uplink's own list says whether a re-learn is free, the card's list
+    /// (the same interface, or the one below a VLAN uplink) is what the room
+    /// is measured against.
     fn read_back<'a>(
         sock: &mut dyn FdbWriter,
-        pairs: &[FastPair],
-        dev: &str,
-        cache: &'a mut Map<String, Set<Mac>>,
+        index: u32,
+        cache: &'a mut Map<u32, Set<Mac>>,
     ) -> io::Result<&'a Set<Mac>> {
-        if !cache.contains_key(dev) {
-            let mut held = crate::hash::set();
-            if let Some(fp) = pairs.iter().find(|f| f.dev == dev) {
-                for e in sock.dump_fdb_of(fp.index)? {
-                    if e.is_self() && e.ifindex == fp.index && e.is_unicast() {
-                        held.insert(e.mac);
+        if let std::collections::hash_map::Entry::Vacant(v) = cache.entry(index) {
+            let held = self_list(&sock.dump_fdb_of(index)?, index);
+            v.insert(held);
+        }
+        Ok(&cache[&index])
+    }
+
+    /// Take addresses out of the card and off the note, under the note's
+    /// lock: card first, and the note settled only for what the card let go
+    /// (Ok, or ENOENT - it was not there) so a removal that failed keeps its
+    /// line and is retried. The one spelling of the removal ordering that
+    /// the pass's stale loop, the reflection and the shedder share.
+    fn retire(&self, sock: &mut dyn FdbWriter, dev: &str, index: u32, macs: &[Mac]) -> Retired {
+        let mut out = Retired::default();
+        self.locked(dev, || {
+            for mac in macs {
+                match sock.set_self_fdb(index, mac, false) {
+                    Ok(()) => {
+                        out.removed.push(*mac);
+                        out.dropped.push(*mac);
                     }
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => out.dropped.push(*mac),
+                    Err(e) => out.failed.push((*mac, e)),
                 }
             }
-            cache.insert(dev.to_string(), held);
-        }
-        Ok(&cache[dev])
+            self.forget_locked(dev, &out.dropped);
+        });
+        out
     }
 
     /// Surrender up to `need` kept addresses, longest-silent first - card, note
@@ -1357,7 +1460,7 @@ impl Syncer {
         index: u32,
         need: usize,
         topo: &Topology,
-        present: &Set<Mac>,
+        on_card: &Set<Mac>,
     ) -> usize {
         // An unreadable note is a device to leave alone, as on every removal
         // path. Asked by reading, not by the mark: the mark is set only once
@@ -1392,25 +1495,19 @@ impl Syncer {
         if cands.is_empty() {
             return 0;
         }
-        let mut dropped: Vec<Mac> = Vec::new();
-        self.locked(dev, || {
-            for (_, mac) in &cands {
-                match sock.set_self_fdb(index, mac, false) {
-                    Ok(()) => dropped.push(*mac),
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => dropped.push(*mac),
-                    Err(e) => eprintln!(
-                        "warning: {dev}: cannot release quiet {}: {e}",
-                        format_mac(mac)
-                    ),
-                }
-            }
-            self.forget_locked(dev, &dropped);
-        });
-        if dropped.is_empty() {
+        let macs: Vec<Mac> = cands.iter().map(|(_, m)| *m).collect();
+        let retired = self.retire(sock, dev, index, &macs);
+        for (mac, e) in &retired.failed {
+            eprintln!(
+                "warning: {dev}: cannot release quiet {}: {e}",
+                format_mac(mac)
+            );
+        }
+        if retired.dropped.is_empty() {
             return 0;
         }
         if let Some(ports) = self.carried_ports.get_mut(dev) {
-            for mac in &dropped {
+            for mac in &retired.dropped {
                 ports.remove(mac);
             }
         }
@@ -1424,23 +1521,29 @@ impl Syncer {
         // would make an address the card never took unsheddable for ever -
         // re-registered by every pass while the valve surrenders real keeps
         // for a slot nobody occupies.
-        let freed = dropped.iter().filter(|m| present.contains(*m)).count();
-        self.card_let_go(dev, &dropped);
+        let freed = retired
+            .dropped
+            .iter()
+            .filter(|m| on_card.contains(*m))
+            .count();
+        self.no_longer_kept(dev, &retired.dropped);
+        let card = self
+            .carried
+            .get(dev)
+            .map(|c| c.card.clone())
+            .unwrap_or_default();
         note!(
             "{dev}: filter nearing its {} limit, released {} quiet \
              address(es) [pressure]",
-            self.limit_of(dev),
-            dropped.len()
+            self.limit_of(&card),
+            retired.dropped.len()
         );
         freed
     }
 
     /// One spelling of "what the filter should hold": the desired set with
-    /// the quiet survivors folded in. Asked twice per pass - up front, and
-    /// against the fresh driver answer after a grow-refresh. Returns (want,
-    /// stacked, wire, learnt_at, kept).
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::too_many_arguments)]
+    /// the quiet survivors folded in. The exclusion set and the bridge's
+    /// reach are computed once here and handed to both halves.
     fn wanted_with_keeps(
         &self,
         topo: &Topology,
@@ -1448,11 +1551,19 @@ impl Syncer {
         fdb: &[FdbEntry],
         vf_macs: &[(u32, Mac)],
         owned_before: &Set<Mac>,
-    ) -> (Set<Mac>, Vec<String>, Set<Mac>, Map<Mac, u32>, Set<Mac>) {
-        let (mut want, stacked, wire, learnt_at) = self.desired(topo, anat, fdb, vf_macs);
-        let kept = self.quiet_survivors(topo, anat, &want, &wire, vf_macs, owned_before);
+    ) -> Wanted {
+        let skip = self.exclusions(topo, anat, vf_macs);
+        let reach = topo.reach(anat.bridge);
+        let (mut want, stacked, wire, learnt_at) = self.desired(topo, anat, &reach, &skip, fdb);
+        let kept = self.quiet_survivors(topo, anat, &reach, &skip, &want, &wire, owned_before);
         want.extend(kept.iter().copied());
-        (want, stacked, wire, learnt_at, kept)
+        Wanted {
+            want,
+            stacked,
+            wire,
+            learnt_at,
+            kept,
+        }
     }
 
     /// The owned addresses that aged out of the bridge but should stay: those
@@ -1473,9 +1584,10 @@ impl Syncer {
         &self,
         topo: &Topology,
         anat: &Anatomy,
+        reach: &Reach,
+        skip: &Set<Mac>,
         want: &Set<Mac>,
         wire: &Set<Mac>,
-        vf_macs: &[(u32, Mac)],
         owned_before: &Set<Mac>,
     ) -> Set<Mac> {
         let mut kept = crate::hash::set();
@@ -1488,14 +1600,13 @@ impl Syncer {
         if ports.is_empty() {
             return kept;
         }
-        // The one canonical exclusion set, asked again rather than re-spelt.
-        let skip = self.exclusions(topo, anat, vf_macs);
         // Everything under the uplink port is the wire's side, the port
         // included: a learn-port later re-enslaved beneath the uplink (two
         // NICs folded into a bond uplink) now leads out, and keeping its
-        // addresses would steer wire traffic into the bridge.
-        let wireward = topo.subtree_of(&[anat.port]);
-        let reach = topo.reach(anat.bridge);
+        // addresses would steer wire traffic into the bridge. So is a
+        // sibling vport of the same card.
+        let mut wireward = topo.subtree_of(&[anat.port]);
+        wireward.extend(anat.siblings.iter().copied());
         for m in owned_before {
             if want.contains(m) || wire.contains(m) || skip.contains(m) {
                 continue;
@@ -1531,8 +1642,9 @@ impl Syncer {
         &self,
         topo: &Topology,
         anat: &Anatomy,
+        reach: &Reach,
+        skip: &Set<Mac>,
         fdb: &[FdbEntry],
-        vf_macs: &[(u32, Mac)],
     ) -> (Set<Mac>, Vec<String>, Set<Mac>, Map<Mac, u32>) {
         let bridge = anat.bridge;
         let Some(bridge_link) = topo.at(bridge) else {
@@ -1543,13 +1655,6 @@ impl Syncer {
                 crate::hash::map(),
             );
         };
-
-        // Which interfaces sit on top of the uplink bridge: one walk up from
-        // the bridge instead of asking every interface whether it leads down.
-        // A busy host has thousands of forwarding entries, and asking the
-        // structural question per entry is what made this daemon show up in
-        // `top`.
-        let reach = topo.reach(bridge);
 
         let mut wire: Set<Mac> = crate::hash::set();
         let mut want: Set<Mac> = crate::hash::set();
@@ -1564,6 +1669,12 @@ impl Syncer {
                 continue;
             }
             let Some(master) = e.master else { continue };
+            // A sibling vport of the same card faces the same cable: what a
+            // bridge learns there is wire, on this bridge or one above it.
+            if anat.siblings.contains(&e.ifindex) {
+                wire.insert(e.mac);
+                continue;
+            }
             match reach.classify(e.ifindex, master, anat.port) {
                 // out on the wire: registering it would divert its traffic
                 // to the bridge, which cannot send it back out of the port
@@ -1594,17 +1705,14 @@ impl Syncer {
             }
         }
 
-        // Everything the host owns on this side of the uplink, plus what the
-        // wire already carries.
-        let mut skip: Set<Mac> = self.exclusions(topo, anat, vf_macs);
-        skip.extend(wire.iter().copied());
-
         // Addresses pinned by configuration are registered even when nothing
         // has been heard from them yet - for a device that never speaks first,
         // or to close the gap before a guest's first frame.
         want.extend(self.extra.iter().copied());
 
-        want.retain(|m| !skip.contains(m) && is_registerable(m));
+        // Everything the host owns on this side of the uplink, plus what the
+        // wire already carries, stays out.
+        want.retain(|m| !skip.contains(m) && !wire.contains(m) && is_registerable(m));
 
         let mut stacked: Vec<String> = reach
             .stacked_bridges()
@@ -1771,14 +1879,9 @@ impl Syncer {
             // descends from the could-not-tell empty set, and pruning against
             // that would erase the memory the gate protects.
             let owned_was_readable = self.note_is_readable(&pair.dev);
-            let (mut want, mut stacked, mut wire, mut learnt_at, mut kept) =
-                self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
+            let mut w = self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
 
-            let present: Set<Mac> = fdb
-                .iter()
-                .filter(|e| e.is_self() && e.ifindex == dev_index && e.is_unicast())
-                .map(|e| e.mac)
-                .collect();
+            let present = self_list(&fdb, dev_index);
 
             // Same rule as the fast path: a carried answer decides nothing
             // that grows a filter. Additions reach a pass in real flows - a
@@ -1794,10 +1897,10 @@ impl Syncer {
             // into the state: the say-once set is what the last pass kept, so
             // anything kept now and not in it has just gone quiet.
             let newly_quiet = match self.said.borrow().quiet.get(&pair.dev) {
-                Some(said) => kept.iter().any(|m| !said.contains(m)),
-                None => !kept.is_empty(),
+                Some(said) => w.kept.iter().any(|m| !said.contains(m)),
+                None => !w.kept.is_empty(),
             };
-            if vf_carried && (newly_quiet || want.iter().any(|m| !present.contains(m))) {
+            if vf_carried && (newly_quiet || w.want.iter().any(|m| !present.contains(m))) {
                 // If the question fails, the next pass must not trust the
                 // carried answer either; remember_vf clears this on success.
                 self.vf_stale = true;
@@ -1811,10 +1914,16 @@ impl Syncer {
                 timings.vf_addresses = vf_macs.len();
                 // The same asking again, against the fresh answer: an
                 // address the driver now calls a VF's own must not be kept.
-                let again = self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
-                (want, stacked, wire, learnt_at, kept) = again;
+                w = self.wanted_with_keeps(topo, &anat, &fdb, &vf_macs, &owned_before);
             }
-            self.warn_about_unknowable_vfs(topo, &pair.dev, &vf_macs);
+            let Wanted {
+                mut want,
+                stacked,
+                wire,
+                learnt_at,
+                mut kept,
+            } = w;
+            self.warn_about_unknowable_vfs(topo, &pair.dev, &anat, &vf_macs);
 
             // Pinned addresses that did not make it, said once per change.
             let unpinned: Set<Mac> = self
@@ -1858,25 +1967,17 @@ impl Syncer {
             let on_card: Set<Mac> = if carrier == dev_index {
                 present.clone()
             } else {
-                fdb.iter()
-                    .filter(|e| e.is_self() && e.ifindex == carrier && e.is_unicast())
-                    .map(|e| e.mac)
-                    .collect()
+                self_list(&fdb, carrier)
             };
             let foreign_extra = on_card
                 .iter()
                 .filter(|m| !want.contains(*m) && !owned_before.contains(*m))
                 .count();
             let mut occupied = want.len() + foreign_extra;
-            if let Some(n) = topo.name_of(carrier) {
-                if n != pair.dev {
-                    self.card_of.insert(pair.dev.clone(), n.to_string());
-                } else {
-                    self.card_of.remove(&pair.dev);
-                }
-            }
-            let limit = self.limit_of(&pair.dev);
-            if !kept.is_empty() && occupied + CAPACITY_HEADROOM > limit {
+            let card = topo.name_of(carrier).unwrap_or(&pair.dev).to_string();
+            let limit = self.limit_of(&card);
+            let reserve = headroom(limit);
+            if !kept.is_empty() && occupied + reserve > limit {
                 // Ordered by the RAW stamp, as shed_keeps orders - one
                 // spelling for both valves. Not by `silence_of`: that view
                 // clamps a stamp ahead of the pass mark to "just now" for
@@ -1892,7 +1993,7 @@ impl Syncer {
                 order.sort_unstable();
                 let mut shed = 0usize;
                 for (_, m) in order {
-                    if occupied + CAPACITY_HEADROOM <= limit {
+                    if occupied + reserve <= limit {
                         break;
                     }
                     // A shed keep leaves `want`; the stale loop below takes
@@ -1988,60 +2089,33 @@ impl Syncer {
             // THIS pass's reading, so a line appended meanwhile survives.
             // Outlives the block: what the card really let go decides the
             // next batch's room.
-            let mut dropped: Vec<Mac> = Vec::new();
             if apply && !self.dry_run && !stale.is_empty() {
-                let mut evict: Vec<Mac> = Vec::new();
-                let mut failures: Vec<String> = Vec::new();
-                self.locked(&pair.dev, || {
-                    for mac in &stale {
-                        removed += 1;
-                        // Forgetting the note while the entry is still in the
-                        // card makes an orphan nothing will ever take out.
-                        // Keep the note when the removal fails; the next pass
-                        // retries.
-                        match sock.set_self_fdb(dev_index, mac, false) {
-                            Ok(()) => {
-                                owned.remove(mac);
-                                dropped.push(*mac);
-                            }
-                            // Already gone - a driver that cleared its list
-                            // on link-down, or a second process's flush.
-                            // Warning about it every pass forever trains the
-                            // operator to stop reading warnings.
-                            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                                owned.remove(mac);
-                                dropped.push(*mac);
-                            }
-                            Err(e) => {
-                                // The note stays for the retry, the memory
-                                // must not: with its port memory alive the
-                                // address would be re-adopted by the quiet
-                                // keep once its wire evidence fades, and a
-                                // one-off EBUSY would harden into a permanent
-                                // keep.
-                                evict.push(*mac);
-                                eprintln!(
-                                    "warning: {}: cannot unregister {}: {e}",
-                                    pair.dev,
-                                    format_mac(mac)
-                                );
-                                failures.push(format!(
-                                    "{}: unregister {}: {e}",
-                                    pair.dev,
-                                    format_mac(mac)
-                                ));
-                                removed -= 1;
-                            }
-                        }
-                    }
-                    self.forget_locked(&pair.dev, &dropped);
-                });
+                let retired = self.retire(sock, &pair.dev, dev_index, &stale);
+                removed += retired.dropped.len();
+                for mac in &retired.dropped {
+                    owned.remove(mac);
+                }
+                // The note stays for the retry, the memory must not: with its
+                // port memory alive the address would be re-adopted by the
+                // quiet keep once its wire evidence fades, and a one-off EBUSY
+                // would harden into a permanent keep.
                 if let Some(ports) = self.carried_ports.get_mut(&pair.dev) {
-                    for mac in &evict {
+                    for (mac, _) in &retired.failed {
                         ports.remove(mac);
                     }
                 }
-                timings.failures.extend(failures);
+                for (mac, e) in &retired.failed {
+                    eprintln!(
+                        "warning: {}: cannot unregister {}: {e}",
+                        pair.dev,
+                        format_mac(mac)
+                    );
+                    timings.failures.push(format!(
+                        "{}: unregister {}: {e}",
+                        pair.dev,
+                        format_mac(mac)
+                    ));
+                }
             } else {
                 // A pass that may not touch the card still counts what a
                 // real one would have removed, so dry-run reports stay
@@ -2051,8 +2125,9 @@ impl Syncer {
 
             // Only when this pass changed something beyond the locked removal
             // above: the merge takes the lock and reads past the stat cache,
-            // which an idle pass need not pay. What this records is the
-            // EEXIST un-claims from the addition loop. Failing to record is
+            // which an idle pass need not pay. Ordinarily a no-op - the
+            // additions and removals are already on the note - and so a
+            // retry of a `forget_locked` write that failed. Failing again is
             // the safe direction: the note then still names entries out of
             // the card, settled later through ENOENT.
             if apply && owned != owned_before {
@@ -2086,7 +2161,7 @@ impl Syncer {
                     if self.said.borrow_mut().over.insert(pair.dev.clone()) {
                         eprintln!(
                             "warning: {}: {} unicast entries against the {} the \
-                             vport list holds - some will be dropped silently, \
+                             card holds - some will be dropped silently, \
                              and not by choice",
                             pair.dev, occupied, limit
                         );
@@ -2097,17 +2172,17 @@ impl Syncer {
                 // The tight-fit mark re-arms only once the list is back under
                 // the headroom the batch measures against, or the pass would
                 // clear it while the batch is still in the band that set it.
-                if occupied + CAPACITY_HEADROOM <= limit {
+                if occupied + reserve <= limit {
                     self.said.borrow_mut().tight.remove(&pair.dev);
                 }
             }
             self.carried.insert(
                 pair.dev.clone(),
                 Carried {
-                    // The list as read, plus what this pass put in, less what
-                    // it took out: the next batch's ground until it reads
-                    // back itself.
-                    occupancy: (present.len() + added).saturating_sub(dropped.len()),
+                    card,
+                    // What this pass leaves on the card: the next batch's
+                    // ground until it reads back itself.
+                    occupancy: occupied,
                     quiet: kept.clone(),
                     // A pass that could not read its note refreshed no stamp,
                     // so it must not advance the ground either: every live
@@ -2255,8 +2330,6 @@ impl Syncer {
                 Some(FastPair {
                     reach,
                     dev: p.dev.clone(),
-                    index: dev,
-                    port: anat.port,
                     skip,
                     reflected: crate::hash::set(),
                     // Only the carried path reads this: it turns a learn of a
@@ -2282,7 +2355,7 @@ impl Syncer {
                 continue;
             }
             for fp in &pairs {
-                if e.ifindex == fp.port {
+                if e.ifindex == fp.anat.port || fp.anat.siblings.contains(&e.ifindex) {
                     reflected.entry(fp.dev.clone()).or_default().insert(e.mac);
                 }
             }
@@ -2307,71 +2380,55 @@ impl Syncer {
             // move could re-add the entry between delete and note write - the
             // permanent orphan. Only what THIS process owned before the
             // window is touched; a line appended meanwhile survives.
+            // Only ever our own registrations. An address somebody else put
+            // in the filter is theirs to remove, on the wire or not.
             let owned_here = self.load_owned(&fp.dev);
-            let mut evict: Vec<Mac> = Vec::new();
-            let mut taken_back: Vec<Mac> = Vec::new();
-            let mut dropped: Vec<Mac> = Vec::new();
-            self.locked(&fp.dev, || {
-                for mac in macs {
-                    // Only ever our own registrations. An address somebody
-                    // else put in the filter is theirs to remove, on the
-                    // wire or not.
-                    if !owned_here.contains(mac) {
-                        continue;
-                    }
-                    // The port memory goes with the entry - mandatory: should
-                    // the note write fail, the address stays on the note, and
-                    // a later pass whose dump no longer shows the wire entry
-                    // would keep alive the address this reflection took out.
-                    // In the Err arm the eviction re-arms the retry: with the
-                    // memory alive, a one-off failure would harden into a
-                    // permanent keep.
-                    match sock.set_self_fdb(fp.index, mac, false) {
-                        Ok(()) => {
-                            dropped.push(*mac);
-                            evict.push(*mac);
-                            urgency = Urgency::Now;
-                            taken_back.push(*mac);
-                            note!(
-                                "{}: {} moved out onto the wire, unregistered [reflection]",
-                                fp.dev,
-                                format_mac(mac)
-                            );
-                        }
-                        // Already gone. The point was for it not to be there.
-                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                            dropped.push(*mac);
-                            evict.push(*mac);
-                        }
-                        // Keep the note - an entry in the card nothing owns
-                        // is the orphan. And buy a pass: the guest's traffic
-                        // is misdirected right now, and a batch of only this
-                        // failure would otherwise end quiet and retry
-                        // nothing.
-                        Err(e) => {
-                            evict.push(*mac);
-                            urgency = Urgency::Now;
-                            eprintln!(
-                                "warning: {}: cannot unregister {}: {e}",
-                                fp.dev,
-                                format_mac(mac)
-                            );
-                        }
-                    }
-                }
-                self.forget_locked(&fp.dev, &dropped);
-            });
-            if !evict.is_empty() {
+            let ours: Vec<Mac> = macs
+                .iter()
+                .filter(|m| owned_here.contains(*m))
+                .copied()
+                .collect();
+            let retired = self.retire(sock, &fp.dev, fp.anat.dev, &ours);
+            for mac in &retired.removed {
+                note!(
+                    "{}: {} moved out onto the wire, unregistered [reflection]",
+                    fp.dev,
+                    format_mac(mac)
+                );
+            }
+            for (mac, e) in &retired.failed {
+                // Keep the note - an entry in the card nothing owns is the
+                // orphan. And buy a pass: the guest's traffic is misdirected
+                // right now, and a batch of only this failure would otherwise
+                // end quiet and retry nothing.
+                eprintln!(
+                    "warning: {}: cannot unregister {}: {e}",
+                    fp.dev,
+                    format_mac(mac)
+                );
+            }
+            if !retired.removed.is_empty() || !retired.failed.is_empty() {
+                urgency = Urgency::Now;
+            }
+            if !ours.is_empty() {
+                // The port memory goes with the entry - mandatory: should the
+                // note write fail, the address stays on the note, and a later
+                // pass whose dump no longer shows the wire entry would keep
+                // alive the address this reflection took out. For a failed
+                // removal the eviction is what re-arms the retry: with the
+                // memory alive, a one-off failure would harden into a
+                // permanent keep. Neither is kept any more.
                 if let Some(ports) = self.carried_ports.get_mut(&fp.dev) {
-                    for mac in &evict {
+                    for mac in &ours {
                         ports.remove(mac);
                     }
                 }
-                // Every slot this really freed leaves the carried count -
-                // ENOENT as much as Ok: an entry the card says it does not
-                // have occupies nothing, and leaving it counted made the next
-                // burst measure against a free slot.
-                self.card_let_go(&fp.dev, &dropped);
+                self.no_longer_kept(&fp.dev, &ours);
+                // Only what the card really let go frees a slot: an ENOENT
+                // was never occupying one.
+                if let Some(c) = self.carried.get_mut(&fp.dev) {
+                    c.occupancy = c.occupancy.saturating_sub(retired.removed.len());
+                }
                 // And out of the written-down memory: an eviction only in RAM
                 // could come back through the file after a crash once the
                 // wire evidence has aged, re-registering the address this
@@ -2384,11 +2441,11 @@ impl Syncer {
             // every wire address would grow without bound: only a full pass
             // replaces this set, and wire-side learning no longer schedules
             // one.
-            if !taken_back.is_empty() {
+            if !retired.removed.is_empty() {
                 self.carried_wire
                     .entry(fp.dev.clone())
                     .or_default()
-                    .extend(taken_back);
+                    .extend(retired.removed);
             }
         }
 
@@ -2401,11 +2458,13 @@ impl Syncer {
         // moment to catch the change is before an addition: decided first
         // with the carried answer, and only a batch that would register
         // something asks afresh and decides again. Shrinking on stale news is
-        // healed by the next pass; growing on it sends a guest's traffic past
-        // it for up to the whole interval. Price: one driver question per
-        // growing batch - ~0.9 ms on mlx5, ~0.01 ms on Intel and mlx4.
-        // The card's list as it is now, per uplink that has a candidate.
-        let mut present_of: Map<String, Set<Mac>> = crate::hash::map();
+        // healed by the next growth, or by the age rule that asks afresh once
+        // per interval; growing on it sends a guest's traffic past it for up
+        // to the whole interval. Price: one driver question per growing batch
+        // - ~0.6 ms for two functions on mlx5, ~0.01 ms on Intel and mlx4.
+        // The lists as they are now, per interface that has a candidate: the
+        // uplink's own, and the card's below a VLAN uplink.
+        let mut present_of: Map<u32, Set<Mac>> = crate::hash::map();
         if vf_carried {
             let mut would: Map<String, Vec<(Mac, u32)>> = crate::hash::map();
             for (kind, entry) in events {
@@ -2423,7 +2482,10 @@ impl Syncer {
             // registered past its guest. "In the card" is read back, not
             // remembered.
             for (dev, macs) in would.iter_mut() {
-                let present = Self::read_back(sock, &pairs, dev, &mut present_of)?;
+                let Some(fp) = pairs.iter().find(|f| &f.dev == dev) else {
+                    continue;
+                };
+                let present = Self::read_back(sock, fp.anat.dev, &mut present_of)?;
                 self.with_owned(dev, |o| {
                     macs.retain(|(m, _)| !(o.contains(m) && present.contains(m)))
                 });
@@ -2500,12 +2562,12 @@ impl Syncer {
             let Some(fp) = pairs.iter().find(|f| f.dev == dev) else {
                 continue;
             };
-            // The batch counts against the occupancy the last pass measured
-            // plus this process's own effect since. A burst that would not
-            // fit surrenders keeps first - new learns outrank the quiet. A
-            // guest that speaks is stamped now, or one that spoke seconds ago
-            // still wears its last silence and the shedder would name it
-            // first, deleting what the next line puts back.
+            // The batch measures its room against the card as it is, read
+            // back. A burst that would not fit surrenders keeps first - new
+            // learns outrank the quiet. A guest that speaks is stamped now, or
+            // one that spoke seconds ago still wears its last silence and the
+            // shedder would name it first, deleting what the next line puts
+            // back.
             let now = Self::boot_millis();
             // Only once the file has been consulted for this uplink: a map
             // made earlier would look to `load_ports` like memory already
@@ -2517,14 +2579,21 @@ impl Syncer {
                     Self::note_seen(ports, *mac, learnt_on.get(mac).copied(), now);
                 }
             }
-            let present = Self::read_back(sock, &pairs, &dev, &mut present_of)?;
-            let allowed = self.limit_of(&dev).saturating_sub(CAPACITY_HEADROOM);
+            // The card's list is what the room is measured against - the
+            // uplink itself, or the interface below a VLAN uplink, where
+            // three VLANs of one function share ONE list of slots.
+            let card = topo.name_of(fp.anat.card).unwrap_or(&dev).to_string();
+            let on_card = Self::read_back(sock, fp.anat.card, &mut present_of)?;
+            let limit = self.limit_of(&card);
+            let allowed = limit.saturating_sub(headroom(limit));
             // Only what would take a NEW slot: an address the card already
             // holds costs nothing to re-register.
-            let fresh_slots = macs.iter().filter(|m| !present.contains(*m)).count();
-            let over = (present.len() + fresh_slots).saturating_sub(allowed);
+            let fresh_slots = macs.iter().filter(|m| !on_card.contains(*m)).count();
+            let over = (on_card.len() + fresh_slots).saturating_sub(allowed);
+            let occupancy = on_card.len();
             let freed = if over > 0 {
-                self.shed_keeps(sock, &dev, fp.index, over, topo, present)
+                let on_card = on_card.clone();
+                self.shed_keeps(sock, &dev, fp.anat.dev, over, topo, &on_card)
             } else {
                 0
             };
@@ -2540,13 +2609,13 @@ impl Syncer {
                          of the {} the card holds, and past that it drops \
                          silently",
                         fresh_slots,
-                        CAPACITY_HEADROOM,
-                        self.limit_of(&dev)
+                        headroom(limit),
+                        limit
                     );
                 }
             }
-            self.note_index(&dev, fp.index);
-            let put = match self.register_batch_locked(sock, &dev, fp.index, &macs) {
+            self.note_index(&dev, fp.anat.dev);
+            let put = match self.register_batch_locked(sock, &dev, fp.anat.dev, &macs) {
                 Some(r) => r.put.len(),
                 None => {
                     // A batch of ours already bought the pass, which says
@@ -2560,8 +2629,9 @@ impl Syncer {
                 }
             };
             // The next batch's ground until it reads back itself.
-            self.carried.entry(dev.clone()).or_default().occupancy =
-                present.len().saturating_sub(freed) + put;
+            let c = self.carried.entry(dev.clone()).or_default();
+            c.card = card;
+            c.occupancy = occupancy.saturating_sub(freed) + put;
         }
         Ok(urgency)
     }
@@ -2593,6 +2663,11 @@ impl Syncer {
         }
         let mut ours = false;
         for fp in pairs {
+            // A sibling vport of the same card is the wire, whichever bridge
+            // learnt it (invariant 1); the reflection above had its say.
+            if fp.anat.siblings.contains(&entry.ifindex) {
+                continue;
+            }
             if fp.skip.contains(&entry.mac) {
                 // A hit owed only to the carried driver answer may be stale -
                 // a VF address freed without a link message. In the decide
@@ -2630,7 +2705,7 @@ impl Syncer {
                 ours = true;
                 continue;
             }
-            match fp.reach.classify(entry.ifindex, master, fp.port) {
+            match fp.reach.classify(entry.ifindex, master, fp.anat.port) {
                 Learn::Wire => continue, // on the wire; handled before any of this
                 Learn::NotOurs => continue,
                 Learn::Behind => {}
