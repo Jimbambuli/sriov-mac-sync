@@ -937,10 +937,7 @@ fn run() -> Result<bool, String> {
             // that a bridge really taken apart is tidied within the interval.
             syncer.orphan_grace = Duration::from_secs(60);
             let mut world = Live { sock, mon, stop_rx };
-            // The reading this process already did, handed over rather than
-            // paid for twice; taken after the subscription opened, so
-            // anything changed since is on its way as an event.
-            daemon_loop(&mut world, &mut syncer, &opts, Some((topo, topo_load)));
+            daemon_loop(&mut world, &mut syncer, &opts);
             let _ = std::fs::remove_file(&pid_path);
 
             // Deliberately without a flush - catch_signals says why. Say how

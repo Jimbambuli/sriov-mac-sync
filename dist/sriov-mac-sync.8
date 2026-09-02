@@ -91,10 +91,9 @@ Uplink and bridge to manage. Repeatable, and skips autodetection entirely.
 .BI \-\-interval " SEC"
 After this many seconds of silence \(em no event, no pass \(em run one full pass
 that trusts nothing it carried (default 3600). This is a safety net, not the
-mechanism: addresses are registered the moment the kernel reports them, and a
-learn that names a port or a bridge the daemon's picture does not know makes
-it read the picture afresh on its own. A timed pass that finds work logs a
-warning: an event should have brought it.
+mechanism: addresses are registered the moment the kernel reports them, and
+every batch and every pass reads the interfaces afresh. A timed pass that
+finds work logs a warning: an event should have brought it.
 .TP
 .B \-\-resync
 Ask the running daemon for such a pass now. The daemon leaves its pid in the

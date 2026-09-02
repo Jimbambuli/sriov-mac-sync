@@ -5,8 +5,8 @@
 Plain rtnetlink, by hand, on top of `libc`. Three operations on `AF_BRIDGE`
 neighbour messages: dump the forwarding database, add or remove an `NTF_SELF`
 entry, and subscribe to `RTNLGRP_NEIGH` *and* `RTNLGRP_LINK` for changes —
-interfaces matter as much as addresses, and the picture-rebuilding below hangs
-on the link subscription. No shelling out to `bridge`, no output parsing, no
+interfaces matter as much as addresses, and a link message is what spends the
+carried driver answer below. No shelling out to `bridge`, no output parsing, no
 async runtime — and real error codes, which is what makes `EEXIST` and
 `ENOSPC` distinguishable instead of guessed at. The one thing outside
 rtnetlink is a single generic-netlink question — the devlink parameter
@@ -95,8 +95,9 @@ device and a carry on, and a file that cannot be read or parsed is simply
 no memory — the daemon then falls back to what every build before the file
 existed did.
 
-The whole picture is rebuilt whenever an interface appears, disappears or is
-reconfigured. What notifications do *not* cover is a VF's address changing
+The interface graph is read afresh for every batch and every pass — 0.4 ms
+on a 38-interface host, and nothing about it is ever carried or can go stale.
+What notifications do *not* cover is a VF's address changing
 silently: a PF that is administratively down announces nothing, and a
 guest-side change runs over the ixgbe/i40e driver mailbox without ever
 reaching rtnetlink — an "up PFs announce" gate built on the opposite
@@ -240,8 +241,9 @@ again on the strength of how sensible they sound:
 * **MAC addresses as integers** — not done. It would work on part of that
   0.35 ms, under 1% of a pass, for a change touching every type in the program.
 * **Keeping the interface graph and updating it from link events** — not done,
-  and now pointless: reading it afresh costs 0.185 ms, and a stale graph is a
-  class of silent error no test would catch.
+  and the cache that believed a graph between link events is gone too: reading
+  afresh costs 0.4 ms cold and under 0.2 ms warm, and a carried graph was the
+  part of the daemon with the longest history of regressions.
 * **`// SAFETY:` tags on the unsafe blocks** — not done, deliberately. Every
   non-trivial block carries its soundness argument as prose where the
   argument belongs; tagging the ~20 trivial libc wrappers as well would bury

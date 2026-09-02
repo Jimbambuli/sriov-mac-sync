@@ -229,156 +229,24 @@ impl Schedule {
     }
 }
 
-/// The topology carried from the last pass, and whether it can still be
-/// believed. A forwarding entry says nothing about which interfaces exist, so
-/// a pass woken by one works from the picture it has; anything touching
-/// interfaces marks it stale, as do lost notifications, a contradicting
-/// witness and the timed pass.
-struct Picture {
-    held: Option<Topology>,
-    stale: bool,
-    /// Whether a read replaced the picture since the last pass consumed one -
-    /// autodetection may have changed. A batch reads the fresh picture
-    /// *before* the pass it buys, so needs_reading() is already false by
-    /// then.
-    replaced_since_pass: bool,
-    /// What reading the picture cost when an event read it, so the pass can
-    /// account for it: otherwise it reports "0.000 ms", which reads as "not
-    /// read at all".
-    carried_load: Duration,
-}
-
-impl Picture {
-    fn new() -> Self {
-        Self {
-            held: None,
-            stale: true,
-            replaced_since_pass: false,
-            carried_load: Duration::ZERO,
-        }
-    }
-
-    /// A picture the caller already read after it started listening. Not
-    /// marked replaced: there was no picture before it. The cost comes with
-    /// it, or the first pass reports `topology 0.000 ms` for its largest
-    /// phase.
-    fn seeded(topo: Topology, cost: Duration) -> Self {
-        Self {
-            held: Some(topo),
-            stale: false,
-            replaced_since_pass: false,
-            carried_load: cost,
-        }
-    }
-
-    fn invalidate(&mut self) {
-        self.stale = true;
-    }
-
-    fn needs_reading(&self) -> bool {
-        self.stale || self.held.is_none()
-    }
-
-    /// The read itself. What it cost, and the picture it replaced.
-    fn read<W: World>(&mut self, world: &mut W) -> Result<(Duration, Option<Topology>), String> {
-        let started = world.now();
-        let fresh = world.read_topology()?;
-        self.stale = false;
-        self.replaced_since_pass = true;
-        // Measured at the World seam like everything else: read from the real
-        // clock, the topology figure saturated to zero under every scripted
-        // world, and no loop test could assert it.
-        Ok((
-            world.now().saturating_duration_since(started),
-            self.held.replace(fresh),
-        ))
-    }
-
-    /// Before a pass, which **fails closed**: a pass on a picture that may be
-    /// wrong is worse than none, so a refused read throws away what was held
-    /// and the caller schedules the retry. The cost reported is the fresh
-    /// read's.
-    fn for_pass<W: World>(&mut self, world: &mut W) -> Duration {
-        let carried = std::mem::take(&mut self.carried_load);
-        let cost = if !self.needs_reading() {
-            carried
-        } else {
-            match self.read(world) {
-                Ok((cost, _)) => cost,
-                Err(e) => {
-                    eprintln!("warning: {e}");
-                    self.held = None;
-                    carried
-                }
-            }
-        };
-        // Cleared after the read, not before: read() marks the picture
-        // replaced, and a pass that read for itself has consumed that in the
-        // same breath. Cleared first, the flag came back up and every
-        // fresh-read pass bought a redundant autodetect on its next event.
-        self.replaced_since_pass = false;
-        cost
-    }
-
-    /// Before the fast path, which **keeps what it had**: answering a batch
-    /// from a picture one link message out of date beats not answering. The
-    /// cost is carried to the pass a few milliseconds later, which works from
-    /// the same reading.
-    fn for_batch<W: World>(&mut self, world: &mut W) -> Look {
-        if !self.needs_reading() {
-            return Look::Current;
-        }
-        match self.read(world) {
-            Ok((cost, previous)) => {
-                self.carried_load += cost;
-                Look::Replaced(previous)
-            }
-            Err(e) => {
-                eprintln!("warning: {e}");
-                Look::Refused
-            }
-        }
-    }
-}
-
-/// What a fast-path look at the topology yielded. Three answers, because a
-/// caller that fails closed cannot do it on two: "nothing was replaced" and
-/// "nothing could be read" are opposite facts.
-enum Look {
-    /// The picture was already current. Nothing was replaced, and what is
-    /// held answers for both sides of the comparison.
-    Current,
-    /// A fresh reading took over from this one.
-    Replaced(Option<Topology>),
-    /// The reading was refused; what is held is known stale.
-    Refused,
-}
-
-/// "Believe nothing carried": the picture and the driver's VF answer go
-/// stale together, always - the history knows exactly the bug where one
-/// of the two was forgotten on one path.
-fn distrust_carried(picture: &mut Picture, syncer: &mut Syncer) {
-    picture.invalidate();
-    syncer.vf_stale = true;
+/// One reading of the interfaces and what it cost, measured at the World
+/// seam so a scripted world can assert the figure.
+fn read_picture<W: World>(world: &mut W) -> Result<(Topology, Duration), String> {
+    let started = world.now();
+    let topo = world.read_topology()?;
+    Ok((topo, world.now().saturating_duration_since(started)))
 }
 
 /// The daemon: answer batches through the fast path, keep the pass rate
-/// bounded, never trust a picture longer than the interval. The world arrives
-/// as a parameter so the tests can hand in a scripted one.
-pub(crate) fn daemon_loop<W: World>(
-    world: &mut W,
-    syncer: &mut Syncer,
-    opts: &Options,
-    seed: Option<(Topology, Duration)>,
-) {
+/// bounded. Every pass and every batch reads the interfaces afresh - 0.4 ms
+/// on a 38-interface host - so nothing about the topology is ever carried,
+/// and nothing about it can go stale. The world arrives as a parameter so the
+/// tests can hand in a scripted one.
+pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &Options) {
     let mut schedule = Schedule::new(world.now(), Duration::from_secs(opts.interval));
-    // A reading the caller already took, if it took one after subscribing:
-    // a daemon start otherwise read the interfaces twice within a
-    // millisecond of itself.
-    let mut picture = match seed {
-        Some((topo, cost)) => Picture::seeded(topo, cost),
-        None => Picture::new(),
-    };
+    // The previous reading, kept for one question only: what a link message
+    // was about. An interface that has just gone is in no fresh reading.
+    let mut last: Option<Topology> = None;
     let mut wait_failures = 0u32;
     let mut state = LoopState {
         said_empty: false,
@@ -392,23 +260,16 @@ pub(crate) fn daemon_loop<W: World>(
         }
         // The operator knocked: now, and believe nothing.
         if world.resync_wanted() {
-            distrust_carried(&mut picture, syncer);
+            syncer.vf_stale = true;
             schedule.at_once(world.now(), "operator");
         }
-        // The timer fired, which means an interval of silence: whatever
-        // was carried through it is old enough to be asked afresh.
+        // The timer fired, which means an interval of silence: the carried
+        // driver answer is old enough to be asked afresh.
         if schedule.pass_due(world.now()) && schedule.trigger == "timed" {
-            distrust_carried(&mut picture, syncer);
+            syncer.vf_stale = true;
         }
         if schedule.pass_due(world.now()) {
-            match run_pass(
-                world,
-                syncer,
-                &mut picture,
-                opts,
-                schedule.trigger,
-                &mut state,
-            ) {
+            match run_pass(world, syncer, &mut last, opts, schedule.trigger, &mut state) {
                 Pass::Done => schedule.completed(world.now()),
                 Pass::Refused => {
                     schedule.retry_soon(world.now());
@@ -439,7 +300,7 @@ pub(crate) fn daemon_loop<W: World>(
                 }
                 wait_failures = wait_failures.saturating_add(1);
                 schedule.at_once(world.now(), "recovery");
-                distrust_carried(&mut picture, syncer);
+                syncer.vf_stale = true;
                 continue;
             }
         };
@@ -456,13 +317,13 @@ pub(crate) fn daemon_loop<W: World>(
             Err(e) => {
                 eprintln!("warning: lost neighbour notifications: {e}");
                 schedule.at_once(world.now(), "lost events");
-                distrust_carried(&mut picture, syncer);
+                syncer.vf_stale = true;
                 continue;
             }
         };
 
         if let Some((due, trigger)) =
-            handle_batch(world, syncer, &mut picture, &events, schedule.last_pass)
+            handle_batch(world, syncer, &mut last, &events, schedule.last_pass)
         {
             schedule.bring_forward(due, trigger);
         }
@@ -489,26 +350,25 @@ struct LoopState {
 fn run_pass<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
-    picture: &mut Picture,
+    last: &mut Option<Topology>,
     opts: &Options,
     trigger: &'static str,
     state: &mut LoopState,
 ) -> Pass {
-    // One reading serves autodetection and reconciliation: they ask about the
-    // same moment. "Reloaded" includes a picture the batch read moments ago -
-    // the batch reads *before* the pass it buys, so needs_reading() alone
-    // would say false and a bridge built at runtime waited for the timer.
-    let reloaded = picture.needs_reading() || picture.replaced_since_pass;
-    let topo_load = picture.for_pass(world);
+    // Nothing to work from fails closed; the caller comes back soon.
+    let (topo, topo_load) = match read_picture(world) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("warning: {e}");
+            return Pass::Refused;
+        }
+    };
 
-    // Autodetection is redone every pass: a NIC that gets its VFs later or a
-    // bridge built after boot must not need a restart, and starting before
-    // the network is up must not crash-loop. It is a pure function of the
-    // picture, so a pass that carried the picture unchanged has the same
-    // answer - a new NIC or bridge arrives as a link message, whose batch
-    // replaces the picture and sets `reloaded`.
-    let auto = opts.pairs.is_empty();
-    if let (true, true, Some(topo)) = (auto, reloaded, picture.held.as_ref()) {
+    // Autodetection is redone every pass - a pure function of the reading,
+    // far cheaper than the reading - so a NIC that gets its VFs later or a
+    // bridge built after boot needs no restart, and starting before the
+    // network is up does not crash-loop.
+    if opts.pairs.is_empty() {
         let found: Vec<Pair> = topo
             .autodetect()
             .0
@@ -526,7 +386,7 @@ fn run_pass<W: World>(
             // that started before its bridges would otherwise warn against
             // the assumed number for life. The operator's --max still wins.
             if !opts.max_macs_set && !syncer.pairs.is_empty() {
-                if let Some(v) = ask_the_cards(world, syncer, picture) {
+                if let Some(v) = ask_the_cards(world, syncer, &topo) {
                     // One number, one home: the warning threshold and the
                     // pressure valve read the same field. The operator's
                     // --max never moves - the max_macs_set gate above
@@ -536,17 +396,12 @@ fn run_pass<W: World>(
             }
         }
     }
-    // The same cure for pairs the operator wrote down: a daemon started
-    // before its configured uplink exists gets no devlink answer at start,
-    // and pairs that never change were never re-asked. Asked again on every
-    // reloaded picture until a card answers; --max still wins.
-    // `capacity_pending` already implies configured pairs and no --max, so it
-    // carries the gate alone.
-    if reloaded && state.capacity_pending {
-        // Non-empty by construction: capacity_pending is only set when the
-        // operator wrote pairs down, and resolve_pairs keeps every one of
-        // them even before its interface exists.
-        if let Some(v) = ask_the_cards(world, syncer, picture) {
+    // Pairs the operator wrote down are asked until every card has answered:
+    // a daemon started before its configured uplink exists gets no devlink
+    // answer at start. `capacity_pending` implies configured pairs and no
+    // --max, so it carries the gate alone.
+    if state.capacity_pending {
+        if let Some(v) = ask_the_cards(world, syncer, &topo) {
             syncer.max_macs = v;
         }
         if syncer.capacity_settled {
@@ -558,11 +413,7 @@ fn run_pass<W: World>(
         state.said_empty = true;
     }
 
-    // Nothing to work from. Fail closed; the caller comes back soon.
-    let Some(topo) = picture.held.as_ref() else {
-        return Pass::Refused;
-    };
-    match syncer.reconcile(world, true, topo, topo_load) {
+    let outcome = match syncer.reconcile(world, true, &topo, topo_load) {
         Ok(reports) => {
             report_changes(&reports, opts.dry_run, trigger);
             if opts.timings {
@@ -574,7 +425,9 @@ fn run_pass<W: World>(
             eprintln!("warning: reconciliation failed: {e}");
             Pass::Refused
         }
-    }
+    };
+    *last = Some(topo);
+    outcome
 }
 
 /// One batch: register what just appeared, before anything else, so the first
@@ -586,49 +439,19 @@ fn run_pass<W: World>(
 fn handle_batch<W: World>(
     world: &mut W,
     syncer: &mut Syncer,
-    picture: &mut Picture,
+    last: &mut Option<Topology>,
     events: &netlink::Events,
     last_pass: Instant,
 ) -> Option<(Instant, &'static str)> {
     if events.fdb.is_empty() && !events.links_changed {
         return None; // something else's neighbour, not a bridge's
     }
-    if events.links_changed {
-        picture.invalidate();
-    }
-    // The invalidation above keys on links_changed, not on this name: a batch
-    // carrying both kinds is called a forwarding change, and keying on the
-    // name would have kept a topology its own link messages just invalidated.
+    // A batch carrying both kinds is called a forwarding change.
     let trigger = if events.fdb.is_empty() {
         "interface change"
     } else {
         "forwarding change"
     };
-
-    // What the batch's link messages were about is judged against the picture
-    // as it stands - before it is read again, because an interface that has
-    // just gone is only in that one.
-    let look = picture.for_batch(world);
-    if !events.changed_links.is_empty() {
-        let may = match look {
-            // Nothing readable to judge with. A link message arrived and
-            // the one thing that could say what it meant is unavailable,
-            // so the carried virtual-function answer is spent.
-            Look::Refused => true,
-            Look::Current => {
-                sync::vf_may_have_changed(None, picture.held.as_ref(), &events.changed_links)
-            }
-            Look::Replaced(previous) => sync::vf_may_have_changed(
-                previous.as_ref(),
-                picture.held.as_ref(),
-                &events.changed_links,
-            ),
-        };
-        if may {
-            syncer.vf_stale = true;
-        }
-    }
-
     // Whether the batch left anything for a pass. A pass dumps the whole
     // forwarding table, so a batch that was entirely somebody else's must not
     // buy one. Link changes always do.
@@ -637,7 +460,25 @@ fn handle_batch<W: World>(
     } else {
         sync::Urgency::Nothing
     };
-    match picture.held.as_ref() {
+
+    // A fresh reading for every batch. What the batch's link messages were
+    // about is judged against the reading before it as well, because an
+    // interface that has just gone is only in that one.
+    let fresh = match read_picture(world) {
+        Ok((topo, _)) => Some(topo),
+        Err(e) => {
+            eprintln!("warning: {e}");
+            None
+        }
+    };
+    if !events.changed_links.is_empty()
+        && (fresh.is_none()
+            || sync::vf_may_have_changed(last.as_ref(), fresh.as_ref(), &events.changed_links))
+    {
+        // Nothing readable to judge with spends the carried answer too.
+        syncer.vf_stale = true;
+    }
+    match &fresh {
         // The whole batch, both kinds; what each means is the fast path's
         // business (see `fast_apply`).
         Some(topo) => match syncer.fast_apply(world, topo, &events.fdb) {
@@ -648,14 +489,10 @@ fn handle_batch<W: World>(
                 urgency = sync::Urgency::Now;
             }
         },
-        None => urgency = sync::Urgency::Now, // no picture to judge it by
+        None => urgency = sync::Urgency::Now, // the pass reads again
     }
-    // A learn that named a port or a bridge the picture does not know is
-    // proof the picture is old - not a guess, a witness. The next pass
-    // reads afresh; this batch worked on what it had.
-    if syncer.disputed.replace(false) {
-        picture.invalidate();
-        urgency = sync::Urgency::Now;
+    if let Some(topo) = fresh {
+        *last = Some(topo);
     }
     if urgency == sync::Urgency::Nothing {
         return None;
@@ -713,13 +550,10 @@ pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAn
 /// table, returns the assumed number for everything that reported none, and
 /// records whether every configured device was there to be asked - "the card
 /// says nothing" being an answer.
-fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, picture: &Picture) -> Option<usize> {
+fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, topo: &Topology) -> Option<usize> {
     let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-    let answers = world.filter_capacities(&filter_carriers(&devs, picture.held.as_ref()));
-    let all_present = picture
-        .held
-        .as_ref()
-        .is_some_and(|t| devs.iter().all(|d| t.index_of(d).is_some()));
+    let answers = world.filter_capacities(&filter_carriers(&devs, Some(topo)));
+    let all_present = devs.iter().all(|d| topo.index_of(d).is_some());
     syncer.capacity_settled = all_present && answers.iter().all(|(_, a)| a.is_ok());
     for (karte, wert) in reported_capacities(answers.clone(), syncer.max_macs) {
         syncer.max_macs_je_karte.insert(karte, wert);
@@ -1125,7 +959,7 @@ mod tests {
         fn a_quiet_host_gets_its_pass_once_per_interval() {
             let (mut syncer, opts, _dir) = setup("cadence", 10);
             let mut world = FakeWorld::new(25);
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 10, 20],
@@ -1157,7 +991,7 @@ mod tests {
                     changed_links: vec![2],
                 }),
             ));
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             let names: Vec<String> = syncer
                 .pairs
                 .iter()
@@ -1174,14 +1008,13 @@ mod tests {
             );
         }
 
-        /// The timed pass believes nothing it was told, and until now nothing
-        /// asserted that it distrusts both carried things: deleting the
-        /// distrust left every loop test green.
+        /// The timed pass believes nothing it was told: the interfaces are
+        /// read afresh as always, and the driver is asked again.
         #[test]
         fn the_timed_refresh_rereads_the_picture_and_reasks_the_driver() {
             let (mut syncer, opts, _dir) = setup("refresh-distrust", 10);
             let mut world = FakeWorld::new(25);
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.topo_calls, 3,
                 "each interval owes the picture a fresh reading"
@@ -1200,7 +1033,7 @@ mod tests {
             let (mut syncer, opts, _dir) = setup("wait-fails", 8);
             let mut world = FakeWorld::new(8);
             world.fail_wait = Some(libc::EINTR);
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.passes.len() >= 2,
                 "the failed wait did not buy a prompt pass: {:?}",
@@ -1239,7 +1072,7 @@ mod tests {
                     changed_links: vec![2],
                 }),
             ));
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 !world.capacity_asks.is_empty(),
                 "the adopted pair was never asked for its capacity"
@@ -1270,7 +1103,7 @@ mod tests {
                     changed_links: vec![2],
                 }),
             ));
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.capacity_asks.is_empty(),
                 "--max was set and the cards were asked anyway"
@@ -1291,7 +1124,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.fdb.added.contains(&(2, guest)),
                 "the guest's address never reached the uplink's filter"
@@ -1317,7 +1150,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 5],
@@ -1339,7 +1172,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.fdb.added.is_empty(),
                 "nothing here was ours to register"
@@ -1357,7 +1190,7 @@ mod tests {
         fn lost_events_cost_a_fresh_picture_and_an_immediate_pass() {
             let (mut syncer, opts, _dir) = setup("lost", 300);
             let mut world = FakeWorld::new(8).at(5, Err(libc::ENOBUFS));
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 5],
@@ -1381,7 +1214,7 @@ mod tests {
             let (mut syncer, opts, _dir) = setup("refused", 300);
             let mut world = FakeWorld::new(12);
             world.topo_fails = true;
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.passes.is_empty(),
                 "a pass ran with no topology to judge by"
@@ -1392,8 +1225,8 @@ mod tests {
             );
         }
 
-        /// An interface change invalidates the picture and the virtual
-        /// functions' addresses with it: the next pass reads both afresh.
+        /// An interface change spends the carried VF answer: the next pass
+        /// asks the driver afresh. The interfaces are read afresh anyway.
         #[test]
         fn an_interface_change_re_reads_the_picture_and_re_asks_the_driver() {
             let (mut syncer, opts, _dir) = setup("links", 300);
@@ -1405,12 +1238,14 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 5]
             );
-            assert_eq!(world.topo_calls, 2, "the picture was not read afresh");
+            // The batch read one, the pass it bought read another: nothing
+            // about the interfaces is ever carried.
+            assert_eq!(world.topo_calls, 3, "batch and pass each read afresh");
             assert_eq!(
                 world.fdb.vf_asked, 2,
                 "a change on an interface with functions has to re-ask the driver"
@@ -1441,7 +1276,7 @@ mod tests {
                     }),
                 ));
             }
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             // Each batch reads the picture for itself (a failed read leaves
             // nothing to carry), so ten of these are the batches; the rest
             // are pass attempts. Measured: 16 with the bound, 21 without.
@@ -1461,7 +1296,7 @@ mod tests {
             let mut world = FakeWorld::new(30);
             world.fail_wait = Some(libc::ENOMEM);
             world.fail_wait_times = 3;
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             // Four failures: the first is prompt, the other three each wait
             // out RETRY_AFTER before their pass.
             assert!(
@@ -1473,57 +1308,6 @@ mod tests {
             assert!(
                 paced.windows(2).skip(1).all(|w| w[1] - w[0] >= 5),
                 "the retry pace was not applied between failures: {paced:?}"
-            );
-        }
-
-        /// A start that brings its own reading does not read again: the
-        /// process dumped the interfaces after subscribing, so every later
-        /// change is announced against that reading.
-        #[test]
-        fn a_seeded_start_does_not_read_the_interfaces_twice() {
-            let (mut syncer, opts, _dir) = setup("seeded-start", 300);
-            let mut world = FakeWorld::new(1);
-            daemon_loop(
-                &mut world,
-                &mut syncer,
-                &opts,
-                Some((host(mac(1)), Duration::from_millis(3))),
-            );
-            assert_eq!(
-                world.topo_calls, 0,
-                "the daemon re-read a picture it was handed"
-            );
-            assert!(!world.passes.is_empty(), "the first pass never ran");
-            // And it reports what that reading cost, rather than 0.000 ms
-            // for a picture it did not pay for itself - the very thing
-            // `carried_load` exists to prevent.
-            assert_eq!(
-                syncer.timings.topology,
-                Duration::from_millis(3),
-                "the seeded start reported a topology cost it was handed as zero"
-            );
-        }
-
-        /// A pass that read for itself does not also buy an autodetect:
-        /// `replaced_since_pass` is cleared AFTER the read, or the flag came
-        /// straight back up - a regression this code has had.
-        #[test]
-        fn a_pass_that_read_for_itself_consumes_the_replacement() {
-            let (_syncer, _opts, _dir) = setup("replaced-flag", 300);
-            let mut world = FakeWorld::new(5);
-            let mut picture = Picture::new();
-            picture.for_pass(&mut world);
-            assert!(
-                !picture.replaced_since_pass,
-                "a pass that did its own read left the replacement flag up"
-            );
-            // But a read an EVENT did is a replacement the pass has not
-            // seen yet, and must survive until one consumes it.
-            picture.stale = true;
-            picture.for_batch(&mut world);
-            assert!(
-                picture.replaced_since_pass,
-                "an event's read did not mark the picture replaced"
             );
         }
 
@@ -1558,7 +1342,7 @@ mod tests {
             let mut world = FakeWorld::new(12);
             // Fail, work, fail again.
             world.wait_fail_calls = vec![1, 3];
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.wait_calls >= 3,
                 "the loop never reached its second failure"
@@ -1568,54 +1352,6 @@ mod tests {
                 "a wait that had recovered was still paced: {:?}",
                 world.paused
             );
-        }
-
-        /// A refused re-read throws the picture away: keeping it means the
-        /// next pass acts on a reading up to an interval old, on a host that
-        /// just said the interfaces changed - entries removed for guests that
-        /// merely moved.
-        #[test]
-        fn a_refused_re_read_leaves_no_picture_behind() {
-            let (mut syncer, _opts, _dir) = setup("picture-fail-closed", 300);
-            let mut world = FakeWorld::new(5);
-            let mut picture = Picture::new();
-            picture.held = Some(host(mac(1)));
-            picture.stale = true;
-            world.topo_fails = true;
-            picture.for_pass(&mut world);
-            assert!(
-                picture.held.is_none(),
-                "a refused re-read kept a picture the daemon knows is stale"
-            );
-            let _ = &mut syncer;
-        }
-
-        /// The topology figure is measured, not guessed: a pass whose picture
-        /// an event already read reports that event's cost rather than zero.
-        #[test]
-        fn the_topology_cost_is_measured_at_the_world_seam() {
-            let (mut syncer, _opts, _dir) = setup("topo-cost", 300);
-            let mut world = FakeWorld::new(5);
-            let mut picture = Picture::new();
-            // The scripted world's clock only moves when it is told to, so
-            // a real-clock measurement saturates to zero here.
-            world.offset = Duration::from_secs(1);
-            let (cost, _) = picture.read(&mut world).expect("the picture reads");
-            assert_eq!(
-                cost,
-                Duration::ZERO,
-                "a scripted world that did not advance should cost nothing"
-            );
-            world.offset = Duration::from_secs(1);
-            picture.stale = true;
-            world.read_cost = Duration::from_millis(7);
-            let (cost, _) = picture.read(&mut world).expect("the picture reads");
-            assert_eq!(
-                cost,
-                Duration::from_millis(7),
-                "the topology cost did not come from the world's clock"
-            );
-            let _ = &mut syncer;
         }
 
         /// A card that structurally cannot report a capacity is asked once,
@@ -1639,7 +1375,7 @@ mod tests {
                     }),
                 ));
             }
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.capacity_asks.len(),
                 1,
@@ -1685,7 +1421,7 @@ mod tests {
                     }),
                 ));
             }
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.capacity_asks.len() >= 2,
                 "the unanswered card was written off because the other one answered"
@@ -1712,7 +1448,7 @@ mod tests {
                     }),
                 ));
             }
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.capacity_asks.len() >= 2,
                 "an uplink that did not exist yet was written off after one ask"
@@ -1741,7 +1477,7 @@ mod tests {
                     changed_links: vec![2],
                 }),
             ));
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 !world.capacity_asks.is_empty(),
                 "the configured pair was never asked for its capacity"
@@ -1749,44 +1485,6 @@ mod tests {
             assert_eq!(
                 syncer.max_macs, 64,
                 "the card's answer has to reach the pressure valve"
-            );
-        }
-
-        /// A link message arrived and the topology could not be read: the
-        /// held picture is the one whose staleness asked for the read, so
-        /// "does this interface have VFs" cannot be answered from it - the
-        /// carried driver answer has to be spent.
-        #[test]
-        fn an_unreadable_picture_spends_the_carried_driver_answer() {
-            let (mut syncer, _opts, _dir) = setup("blind-link-change", 300);
-            let mut world = FakeWorld::new(5);
-            let mut picture = Picture::new();
-            // What is held says index 2 has no functions. It is out of date -
-            // that is why the read was asked for - but it is confident.
-            picture.held = Some(
-                crate::topology::fixture::Builder::new()
-                    .add("nic1", 2, Some(mac(1)))
-                    .build(),
-            );
-            picture.stale = false;
-            syncer.vf_stale = false;
-            world.topo_fails = true;
-            let started = world.base;
-
-            handle_batch(
-                &mut world,
-                &mut syncer,
-                &mut picture,
-                &netlink::Events {
-                    links_changed: true,
-                    changed_links: vec![2],
-                    ..Default::default()
-                },
-                started,
-            );
-            assert!(
-                syncer.vf_stale,
-                "a link change judged out of an unreadable picture kept the carried answer"
             );
         }
 
@@ -1816,7 +1514,7 @@ mod tests {
             // bridge - or the first pass would settle the note back to
             // nothing and the filter would not be filling any more.
             world.fdb.fdb = vec![learned(3, 10, kept)];
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert_eq!(
                 world.passes.iter().map(|d| secs(*d)).collect::<Vec<_>>(),
                 vec![0, 1],
@@ -1839,7 +1537,7 @@ mod tests {
                 }),
             );
             world.fdb.fdb = vec![learned(3, 10, guest)];
-            daemon_loop(&mut world, &mut syncer, &opts, None);
+            daemon_loop(&mut world, &mut syncer, &opts);
             assert!(
                 world.fdb.added.iter().any(|(_, m)| *m == guest),
                 "the fixture never registered anything to leave in place"
@@ -1850,6 +1548,76 @@ mod tests {
                     .unwrap_or_default()
                     .contains("02:00:00:00:00:71"),
                 "the note has to survive the stop"
+            );
+        }
+
+        /// The topology figure is measured at the World seam, from the
+        /// pass's own reading: a real-clock measurement saturates to zero
+        /// under a scripted world and no loop test could assert it.
+        #[test]
+        fn the_pass_reports_what_its_reading_cost() {
+            let (mut syncer, opts, _dir) = setup("topo-cost", 300);
+            let mut world = FakeWorld::new(1);
+            world.read_cost = Duration::from_millis(7);
+            daemon_loop(&mut world, &mut syncer, &opts);
+            assert_eq!(
+                syncer.timings.topology,
+                Duration::from_millis(7),
+                "the topology cost did not come from the world's clock"
+            );
+        }
+
+        /// A batch whose reading fails can judge nothing: the carried driver
+        /// answer is spent, the fast path is skipped, and a pass is bought
+        /// - which reads again.
+        #[test]
+        fn a_batch_without_a_reading_spends_the_driver_answer_and_buys_a_pass() {
+            let (mut syncer, _opts, _dir) = setup("blind-batch", 300);
+            let mut world = FakeWorld::new(5);
+            // The reading before says index 2 has no functions.
+            let mut last = Some(
+                crate::topology::fixture::Builder::new()
+                    .add("nic1", 2, Some(mac(1)))
+                    .build(),
+            );
+            syncer.vf_stale = false;
+            world.topo_fails = true;
+            let started = world.base;
+            let bought = handle_batch(
+                &mut world,
+                &mut syncer,
+                &mut last,
+                &netlink::Events {
+                    links_changed: true,
+                    changed_links: vec![2],
+                    ..Default::default()
+                },
+                started,
+            );
+            assert!(
+                syncer.vf_stale,
+                "a link change nothing could judge kept the carried answer"
+            );
+            assert!(
+                bought.is_some(),
+                "a batch nothing could judge has to buy a pass"
+            );
+            // And a learning batch without a reading registers nothing but
+            // still buys the pass that will.
+            let bought = handle_batch(
+                &mut world,
+                &mut syncer,
+                &mut last,
+                &netlink::Events {
+                    fdb: vec![(RTM_NEWNEIGH, learned(3, 10, [0x02, 0, 0, 0, 0, 0x77]))],
+                    ..Default::default()
+                },
+                started,
+            );
+            assert!(bought.is_some());
+            assert!(
+                world.fdb.added.is_empty(),
+                "nothing may be registered blind"
             );
         }
     }

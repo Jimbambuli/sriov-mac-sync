@@ -3487,41 +3487,34 @@ fn renaming_a_device_carries_every_mark() {
     assert_eq!(said, erwartet);
 }
 
-/// A learn is a witness for the topology: it names a port and the bridge
-/// that recorded it, now. A port the picture does not know, or one it
-/// knows under another master, proves the picture old - the event path
-/// says so, and the daemon reads afresh before the next pass.
+/// Every batch works on a reading microseconds old, so a learn naming a
+/// port that reading does not know is a race, not staleness: it is left to
+/// the pass, registers nothing and buys nothing. A known port under another
+/// master is simply not ours.
 #[test]
-fn a_learn_that_contradicts_the_picture_disputes_it() {
-    let dir = scratch("witness");
+fn a_learn_the_reading_cannot_place_is_left_alone() {
+    let dir = scratch("unplaced-learn");
     let topo = small_host();
     let mut s = br0_syncer(&dir);
     let mut sock = kernel(vec![]);
     s.reconcile(&mut sock, true, &topo, Dur::ZERO).unwrap();
+    let before = sock.added.len();
 
-    // A port the picture knows, in the bridge it knows: no dispute.
-    let ok = vec![(RTM_NEWNEIGH, learned(4, 10, [0x02, 0xe0, 0, 0, 0, 1]))];
-    s.fast_apply(&mut sock, &topo, &ok).unwrap();
-    assert!(
-        !s.disputed.get(),
-        "a learn that matches the picture disputes nothing"
-    );
-
-    // A port the picture has never heard of.
     let unknown = vec![(RTM_NEWNEIGH, learned(77, 10, [0x02, 0xe0, 0, 0, 0, 2]))];
-    s.fast_apply(&mut sock, &topo, &unknown).unwrap();
-    assert!(
-        s.disputed.replace(false),
-        "an unknown port is proof the picture is old"
+    let u = s.fast_apply(&mut sock, &topo, &unknown).unwrap();
+    assert_eq!(
+        u,
+        Urgency::Nothing,
+        "an unplaceable learn is nobody's business"
     );
-
-    // A known port, but the bridge that recorded it is not its master.
     let moved = vec![(RTM_NEWNEIGH, learned(4, 99, [0x02, 0xe0, 0, 0, 0, 3]))];
-    s.fast_apply(&mut sock, &topo, &moved).unwrap();
-    assert!(
-        s.disputed.replace(false),
-        "a port under another master is proof too"
+    let u = s.fast_apply(&mut sock, &topo, &moved).unwrap();
+    assert_eq!(
+        u,
+        Urgency::Nothing,
+        "a port under a foreign master is not ours"
     );
+    assert_eq!(sock.added.len(), before, "neither may be registered");
     let _ = fs::remove_dir_all(&dir);
 }
 
