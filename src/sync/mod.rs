@@ -216,8 +216,8 @@ struct Carried {
 }
 
 /// What a ConnectX-4 Lx vport list holds - the assumption when neither the
-/// operator nor devlink says otherwise. The one spelling; main.rs and the
-/// help text both read it.
+/// operator nor the driver table says otherwise. The one spelling; main.rs
+/// and the help text both read it.
 pub const DEFAULT_MAX_MACS: usize = 128;
 
 /// Slots left free below `max_macs`: an allowance for counting drift (a
@@ -397,14 +397,10 @@ pub struct Syncer {
     /// pass from the picture: the event path has no topology, and a burst on
     /// a VLAN uplink measures against the card below.
     karte_von: Map<String, String>,
-    /// What single cards reported, by the interface holding the filter. Two
-    /// cards in one host can differ, and taking the smaller number for both
-    /// sheds keeps on the larger for nothing. Empty until devlink answers -
-    /// never on ixgbe, i40e and mlx4.
+    /// What each card holds by the driver table, by the interface holding the
+    /// filter. Two cards in one host can differ, and taking the smaller
+    /// number for both sheds keeps on the larger for nothing.
     pub max_macs_je_karte: Map<String, usize>,
-    /// Whether the last capacity question reached every configured device
-    /// and got an answer - read by the daemon to stop asking.
-    pub capacity_settled: bool,
     /// What the last pass measured about each uplink's filter, carried so the
     /// event path is capacity-aware without a dump per batch; corrected
     /// against the read-back every pass.
@@ -542,7 +538,6 @@ impl Syncer {
             max_macs: DEFAULT_MAX_MACS,
             karte_von: crate::hash::map(),
             max_macs_je_karte: crate::hash::map(),
-            capacity_settled: false,
             last_pass_at: 0,
             carried: crate::hash::map(),
             notes: std::cell::RefCell::new(crate::hash::map()),

@@ -14,17 +14,13 @@
 //! with what the bridges learn.
 
 mod daemon;
-mod devlink;
 mod drivers;
 mod hash;
 mod netlink;
 mod sync;
 mod topology;
 
-use crate::daemon::{
-    adopt_capacity, capacities_via_devlink, card_capacities, daemon_loop, filter_carriers,
-    read_topology, Live,
-};
+use crate::daemon::{apply_card_limits, daemon_loop, read_topology, Live};
 use crate::hash::Set;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
@@ -809,28 +805,7 @@ fn run() -> Result<bool, String> {
     let topo_load = topo_started.elapsed();
     let pairs = resolve_pairs(&topo, &opts)?;
 
-    // What the cards say their filters hold. Only when the operator has not
-    // said: a number from the hardware is better than this program's constant,
-    // and worse than an instruction.
-    let mut per_card: Vec<(String, usize)> = Vec::new();
-    if !opts.max_macs_set && matches!(opts.mode, Mode::Daemon | Mode::Once | Mode::Status) {
-        let devs: Vec<String> = pairs.iter().map(|p| p.dev.clone()).collect();
-        // Nothing to ask about is the ordinary state of a host whose
-        // uplink is not in a bridge yet, and a devlink dump for an empty
-        // list is a syscall round trip for a guaranteed empty answer.
-        if !devs.is_empty() {
-            let cards = filter_carriers(&devs, Some(&topo));
-            per_card = card_capacities(capacities_via_devlink(&cards), opts.max_macs, &topo);
-            if let Some(v) = adopt_capacity(&per_card, opts.max_macs) {
-                opts.max_macs = v;
-            }
-        }
-    }
-
     let mut syncer = Syncer::new(pairs.clone(), state_dir());
-    for (card, holds) in per_card {
-        syncer.max_macs_je_karte.insert(card, holds);
-    }
     syncer.dry_run = opts.dry_run;
     // Only the modes that print the per-address half of a report pay for
     // building one. Both are a single pass run by hand; the daemon, which
@@ -840,6 +815,13 @@ fn run() -> Result<bool, String> {
     // that a leftover note belongs to none of them.
     syncer.authoritative = opts.pairs.is_empty();
     syncer.max_macs = opts.max_macs;
+    // What the cards hold, by the kernel source, for the one-shot modes; the
+    // daemon applies it itself, every pass. Only when the operator has not
+    // said: a number from the driver's source beats this program's constant
+    // and loses to an instruction.
+    if !opts.max_macs_set && matches!(opts.mode, Mode::Once | Mode::Status) {
+        apply_card_limits(&mut syncer, &topo, &mut crate::hash::set());
+    }
     // The lists merge CLI values and conf-file values, so the label names
     // both homes - a tab-mangled EXCLUDE= line must not send its operator
     // grepping unit files for an --exclude nobody ever passed.

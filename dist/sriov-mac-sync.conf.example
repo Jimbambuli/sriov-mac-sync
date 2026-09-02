@@ -22,8 +22,8 @@
 
 # The filter capacity to respect: warn above it, and shed kept quiet
 # addresses as the list nears it. The vport list on ConnectX-4 Lx holds 128;
-# other hardware differs. Where the card reports its capacity through devlink
-# the daemon uses that instead, and setting this overrides both.
+# other hardware differs. The daemon takes the number from the kernel driver's
+# own source where that names one; setting this overrides it.
 #MAX_MACS=128
 
 # Addresses never to register, separated by commas or whitespace.

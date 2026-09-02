@@ -229,13 +229,6 @@ impl Socket {
         Self::open((1 << (RTNLGRP_NEIGH - 1)) | (1 << (RTNLGRP_LINK - 1)))
     }
 
-    /// A socket on generic netlink, where devlink lives. Everything below -
-    /// sequence numbers, grow-and-retry, acknowledgements - is
-    /// protocol-independent.
-    pub(crate) fn generic() -> io::Result<Self> {
-        Self::open_on(0, libc::NETLINK_GENERIC)
-    }
-
     fn open(groups: u32) -> io::Result<Self> {
         Self::open_on(groups, libc::NETLINK_ROUTE)
     }

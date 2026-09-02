@@ -11,7 +11,7 @@ invariants and the project vocabulary live in its module doc. From there:
     sync/notes.rs the ownership files: locks, atomicity, the quiet memory
     netlink.rs   the wire format, hand-rolled and fuzz-tested
     topology.rs  the interface graph and autodetection
-    devlink.rs   one question: the card's filter capacity
+    drivers.rs   what each kernel driver does with the list, per role
     hash.rs      the map/set wrappers (seeded hashing, deterministic tests)
 
 ## Build

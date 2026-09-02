@@ -9,25 +9,21 @@ On ConnectX-4 Lx it holds 128 entries. Beyond that the driver drops addresses
 silently, and *which* is not predictable — with 257 entries a given address
 still worked, with 513 it did not.
 
-That 128 was arrived at by experiment, and this file used to say the size could
-not be queried. It can, on the drivers that register the generic devlink
-parameter `max_macs`: on a ConnectX-4 Lx it reads 128 on both the physical
-function and its VFs, which is exactly the experimental figure. The daemon asks
-over devlink at startup — and again when a pair appears at runtime — and both
-warns above what the card says and releases quiet addresses to stay under it; `--max` or
-`MAX_MACS` overrides it. A card that says nothing - every driver but mlx4 and
-mlx5 - is answered from the kernel source where that names a number:
-[driver-limits.md](driver-limits.md) is the evidence, `src/drivers.rs` the
-table the daemon reads, one row per driver and role. bnxt holds 4, an
-untrusted iavf about 12, igbvf 3; several VF drivers never program the list at
-all (ena, mana, bnx2x, qede untrusted, fm10k), and the daemon says so at start.
-Where the limit lives in firmware the assumed 128 stays. The daemon reports
-the card's answer, or its silence, at start; a written-down `--max` settles the
-number before devlink is ever asked, so nothing is printed for it.
+That 128 was arrived at by experiment. The number the daemon works with now
+comes from the kernel driver sources: [driver-limits.md](driver-limits.md) is
+the evidence, five reviews of the mainline drivers with file and function per
+row, and `src/drivers.rs` the table the daemon reads, one row per driver and
+role. ConnectX (mlx5) holds `1 << log_max_current_uc_list`, 128 on every card
+seen, and truncates silently past it - the experimental figure. bnxt holds 4,
+an untrusted iavf about 12, igbvf 3; many cards go unicast-promiscuous past
+their limit instead of dropping; and several VF drivers never program the list
+at all (ena, mana, bnx2x, qede untrusted, fm10k), which the daemon says at
+start because nothing registered there takes effect. Where the limit lives in
+firmware the assumed 128 stays. `--max` or `MAX_MACS` overrides all of it.
 
-devlink is not otherwise used and cannot be: it has no forwarding database, no
-unicast filter and no neighbour notifications. This one number is the whole of
-what it has to offer here.
+mlx4 and mlx5 also report the number through the devlink parameter
+`max_macs`, and an earlier version asked it over generic netlink. The table
+answers the same for them and for everybody else, so the question is gone.
 
 ## A VF's own address must never be registered
 

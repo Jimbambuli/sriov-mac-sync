@@ -5,9 +5,7 @@
 //! `bridge fdb add <mac> dev X self` puts an address into the kernel's list
 //! for X. The kernel accepts any number; what the card then holds is the
 //! driver's business, and the list read back from the kernel cannot tell.
-//! Where a driver registers devlink `max_macs` (mlx4, mlx5) the card is
-//! asked; everywhere else this table is the only source, and it is used
-//! only where devlink answered nothing.
+//! This table is the one source, beside the operator's --max.
 
 /// What happens to addresses past the number the card holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +56,7 @@ const TABLE: &[(&str, Role, Option<usize>, Past)] = &[
     ("fm10k", Pf, None, Drops),
     ("fm10k", Vf, None, Ignored), // MAC-locked by the PF
     // Mellanox
-    ("mlx5_core", Any, None, Drops), // devlink max_macs answers; truncates past it
+    ("mlx5_core", Any, Some(128), Drops), // 1 << log_max_current_uc_list, 128 on every ConnectX seen
     ("mlx4_core", Any, Some(128), Promisc), // one MAC table per port, PF and VFs
     // Broadcom
     ("bnxt_en", Pf, Some(4), Promisc), // BNXT_MAX_UC_ADDRS

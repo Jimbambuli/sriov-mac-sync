@@ -346,7 +346,7 @@ restore_guest_port
 
 say "S6f: the filter fills up and a keep buys the newcomer its slot"
 # The valve, end to end - unit tests aside, nothing has ever driven it on a
-# real kernel. A veth uplink answers no devlink max_macs, so --max alone
+# real kernel. A veth uplink has no driver the table knows, so --max alone
 # opens it. The limit is derived from what is registered right now rather
 # than assumed: whatever the scenarios before this one left behind, the
 # room is exactly the two keeps, and the newcomer is one too many.

@@ -8,10 +8,9 @@ entry, and subscribe to `RTNLGRP_NEIGH` *and* `RTNLGRP_LINK` for changes —
 interfaces matter as much as addresses, and a link message is what spends the
 carried driver answer below. No shelling out to `bridge`, no output parsing, no
 async runtime — and real error codes, which is what makes `EEXIST` and
-`ENOSPC` distinguishable instead of guessed at. The one thing outside
-rtnetlink is a single generic-netlink question — the devlink parameter
-`max_macs`, the card's real filter capacity, asked at startup and again for a
-pair that appears at runtime; hardware-notes has the details.
+`ENOSPC` distinguishable instead of guessed at. Nothing outside rtnetlink:
+what a card holds comes from a table read off the kernel driver sources
+(`src/drivers.rs`, evidence in driver-limits.md), not from the card.
 
 Topology comes from one `RTM_GETLINK` dump: master for bonds, `IFLA_LINK` with
 the interface kind for stacking (a veth reports a peer there and a tunnel its
@@ -156,7 +155,7 @@ is kept by the interface it is stacked on. Several uplinks can therefore
 share one filter — three VLANs of one virtual function are three uplinks but
 one list of, say, 128 slots. Everything that measures the card asks the
 interface that actually holds the filter: the read-back that counts how full
-it is, and the devlink question about its capacity. Each uplink then sees its
+it is, and the driver table's number for it. Each uplink then sees its
 sisters' entries as foreign, counts them against the limit and leaves them
 alone, which is exactly what invariant 3 already says. The relation is told
 apart from mastering by looking back: a port names its master, a parent does

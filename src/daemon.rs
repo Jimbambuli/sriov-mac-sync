@@ -8,9 +8,7 @@ use crate::netlink::Socket;
 use crate::sync::{self, Pair, Syncer};
 use crate::topology::Topology;
 use crate::Options;
-use crate::{
-    clamp_max_macs, devlink, drivers, netlink, note, pair_names, report_changes, stopping,
-};
+use crate::{drivers, netlink, note, pair_names, report_changes, stopping};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -58,9 +56,6 @@ pub(crate) trait World: sync::FdbWriter {
     /// where even waiting itself is what fails.
     fn pause(&mut self, wait: Duration);
     fn read_topology(&mut self) -> Result<Topology, String>;
-    /// What the cards report their unicast filters hold - one devlink
-    /// reading for the whole list, answered per uplink.
-    fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)>;
 }
 
 /// The world as it actually is: the command socket, the subscription, the
@@ -152,9 +147,6 @@ impl World for Live {
     }
     fn read_topology(&mut self) -> Result<Topology, String> {
         read_topology(&mut self.sock)
-    }
-    fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)> {
-        capacities_via_devlink(devs)
     }
 }
 
@@ -252,8 +244,7 @@ pub(crate) fn daemon_loop<W: World>(world: &mut W, syncer: &mut Syncer, opts: &O
     let mut wait_failures = 0u32;
     let mut state = LoopState {
         said_empty: false,
-        // In autodetect mode the adoption rides on pair-set changes instead.
-        capacity_pending: !opts.pairs.is_empty() && !opts.max_macs_set,
+        said_cards: crate::hash::set(),
     };
 
     loop {
@@ -345,8 +336,8 @@ enum Pass {
 /// thing because it lives exactly as long as the loop.
 struct LoopState {
     said_empty: bool,
-    /// Whether a configured pair's card still owes its capacity answer.
-    capacity_pending: bool,
+    /// Cards whose limit has been said.
+    said_cards: crate::hash::Set<String>,
 }
 
 fn run_pass<W: World>(
@@ -383,32 +374,12 @@ fn run_pass<W: World>(
                 state.said_empty = false;
             }
             syncer.pairs = found;
-            // A pair adopted at runtime brings its card's capacity with it:
-            // the start-time question never saw this uplink, and a daemon
-            // that started before its bridges would otherwise warn against
-            // the assumed number for life. The operator's --max still wins.
-            if !opts.max_macs_set && !syncer.pairs.is_empty() {
-                if let Some(v) = ask_the_cards(world, syncer, &topo) {
-                    // One number, one home: the warning threshold and the
-                    // pressure valve read the same field. The operator's
-                    // --max never moves - the max_macs_set gate above
-                    // enforces that.
-                    syncer.max_macs = v;
-                }
-            }
         }
     }
-    // Pairs the operator wrote down are asked until every card has answered:
-    // a daemon started before its configured uplink exists gets no devlink
-    // answer at start. `capacity_pending` implies configured pairs and no
-    // --max, so it carries the gate alone.
-    if state.capacity_pending {
-        if let Some(v) = ask_the_cards(world, syncer, &topo) {
-            syncer.max_macs = v;
-        }
-        if syncer.capacity_settled {
-            state.capacity_pending = false;
-        }
+    // Every pass, because it is map lookups: a card that appears later
+    // gets its number when it does. The operator's --max still wins.
+    if !opts.max_macs_set {
+        apply_card_limits(syncer, &topo, &mut state.said_cards);
     }
     if syncer.pairs.is_empty() && !state.said_empty {
         note!("waiting for an SR-IOV interface to appear in a bridge");
@@ -520,53 +491,8 @@ fn handle_batch<W: World>(
     Some(((last_pass + wait).max(world.now()), trigger))
 }
 
-/// One uplink's capacity answer: what the card says, that it says
-/// nothing, or why asking failed - the last two look identical from the
-/// threshold and are not the same bug.
-type CapacityAnswer = Result<Option<u32>, String>;
-
-/// One devlink reading for the whole list, answered per uplink. The
-/// answer is device-independent; asking per pair re-ran the identical
-/// dump and discarded it, from the second pair on.
-pub(crate) fn capacities_via_devlink(devs: &[String]) -> Vec<(String, CapacityAnswer)> {
-    let read = devlink::read();
-    devs.iter()
-        .map(|d| {
-            let answer = match &read {
-                Ok(Some(caps)) => Ok(caps.for_netdev(d)),
-                Ok(None) => Ok(None), // no devlink on this kernel
-                Err(e) => Err(e.clone()),
-            };
-            (d.clone(), answer)
-        })
-        .collect()
-}
-
-/// The smallest capacity the cards report, as the threshold to warn at: one
-/// number governs every uplink, and the filter that fills first drops
-/// addresses. A card that says nothing changes nothing, nor does a number
-/// this program would refuse from a person - a driver is not more trustworthy
-/// than an operator. `None` means the assumed threshold stands; the `--max`
-/// gate lives at the call sites.
-/// Ask the cards behind the pairs what their filters hold: fills the per-card
-/// table, returns the assumed number for everything that reported none, and
-/// records whether every configured device was there to be asked - "the card
-/// says nothing" being an answer.
-fn ask_the_cards<W: World>(world: &mut W, syncer: &mut Syncer, topo: &Topology) -> Option<usize> {
-    let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
-    let answers = world.filter_capacities(&filter_carriers(&devs, Some(topo)));
-    let all_present = devs.iter().all(|d| topo.index_of(d).is_some());
-    syncer.capacity_settled = all_present && answers.iter().all(|(_, a)| a.is_ok());
-    let usable = card_capacities(answers, syncer.max_macs, topo);
-    for (karte, wert) in &usable {
-        syncer.max_macs_je_karte.insert(karte.clone(), *wert);
-    }
-    adopt_capacity(&usable, syncer.max_macs)
-}
-
 /// The interfaces that really hold the uplinks' filters: the uplink itself,
-/// or for a VLAN the interface below - the only one with a capacity devlink
-/// can be asked about.
+/// or for a VLAN the interface below - the only one with a list of its own.
 pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<String> {
     let Some(topo) = topo else {
         return devs.to_vec();
@@ -586,83 +512,78 @@ pub(crate) fn filter_carriers(devs: &[String], topo: Option<&Topology>) -> Vec<S
     aus
 }
 
-/// What each card holds, by the interface holding the filter: what it
-/// reported over devlink, else what the kernel source says its driver does
-/// (see `drivers`), else nothing - the assumed number then stands. Said per
-/// card, once per asking. A driver that never programs the list on this
-/// role is a warning: nothing this daemon registers there takes effect.
-pub(crate) fn card_capacities(
-    answers: Vec<(String, CapacityAnswer)>,
-    assumed: usize,
+/// What each card holds, by the interface holding the filter: what the
+/// kernel source says its driver does (see `drivers`), the assumed number
+/// where it names none. Applied to the syncer as the per-card limit and, as
+/// the smallest of them, the number to warn at. Each card is said once; a
+/// driver that never programs the list on this role is a warning, because
+/// nothing registered there takes effect.
+pub(crate) fn apply_card_limits(
+    syncer: &mut Syncer,
     topo: &Topology,
-) -> Vec<(String, usize)> {
-    let mut usable: Vec<(String, usize)> = Vec::new();
-    for (dev, answer) in answers {
-        match answer {
-            Ok(Some(v)) => match clamp_max_macs(v as usize) {
-                Ok(v) => usable.push((dev, v)),
-                Err(_) => note!("{dev}: reported capacity {v} is unusable, ignored"),
-            },
-            Ok(None) => {
-                let link = topo.index_of(&dev).and_then(|i| topo.at(i));
-                let known = link.and_then(|l| {
-                    l.driver
-                        .as_deref()
-                        .and_then(|d| drivers::filter_of(d, l.physfn.is_some()).map(|f| (d, f)))
-                });
-                match known {
-                    Some((driver, f)) if f.past == drivers::Past::Ignored => eprintln!(
-                        "warning: {dev}: the {driver} driver never programs a unicast \
+    said: &mut crate::hash::Set<String>,
+) {
+    let devs: Vec<String> = syncer.pairs.iter().map(|p| p.dev.clone()).collect();
+    let mut limit = sync::DEFAULT_MAX_MACS;
+    syncer.max_macs_je_karte.clear();
+    for card in filter_carriers(&devs, Some(topo)) {
+        let Some(link) = topo.index_of(&card).and_then(|i| topo.at(i)) else {
+            continue; // not there yet; asked again next pass
+        };
+        let known = link
+            .driver
+            .as_deref()
+            .and_then(|d| drivers::filter_of(d, link.physfn.is_some()).map(|f| (d, f)));
+        let first = said.insert(card.clone());
+        match known {
+            Some((driver, f)) if f.past == drivers::Past::Ignored => {
+                if first {
+                    eprintln!(
+                        "warning: {card}: the {driver} driver never programs a unicast \
                          list on this interface - nothing registered here takes effect"
-                    ),
-                    Some((driver, f)) => {
-                        let past = match f.past {
-                            drivers::Past::Drops => "drops silently",
-                            drivers::Past::Promisc => "goes unicast-promiscuous",
-                            drivers::Past::Hashes => "falls back to a hash filter",
-                            drivers::Past::Ignored => unreachable!(),
-                        };
-                        match f.holds {
-                            Some(n) => {
-                                note!(
-                                    "{dev}: no capacity reported; the {driver} driver holds \
-                                     {n} by the kernel source and {past} past that"
-                                );
-                                usable.push((dev, n));
-                            }
-                            None => note!(
-                                "{dev}: no capacity reported and the {driver} driver's limit \
-                                 lives in firmware; keeping the assumed {assumed}, and it \
-                                 {past} past its real one"
-                            ),
-                        }
-                    }
-                    None => {
-                        note!("{dev}: no filter capacity reported; keeping the assumed {assumed}")
-                    }
+                    );
                 }
             }
-            Err(e) => note!("{dev}: could not ask for the filter capacity: {e}"),
+            Some((driver, f)) => {
+                let past = match f.past {
+                    drivers::Past::Drops => "drops silently",
+                    drivers::Past::Promisc => "goes unicast-promiscuous",
+                    drivers::Past::Hashes => "falls back to a hash filter",
+                    drivers::Past::Ignored => unreachable!(),
+                };
+                match f.holds {
+                    Some(n) => {
+                        if first {
+                            note!(
+                                "{card}: the {driver} driver holds {n} addresses by the \
+                                 kernel source and {past} past that"
+                            );
+                        }
+                        syncer.max_macs_je_karte.insert(card, n);
+                        limit = limit.min(n);
+                    }
+                    None if first => note!(
+                        "{card}: the {driver} driver's limit lives in firmware; assuming \
+                         {}, and it {past} past its real one",
+                        sync::DEFAULT_MAX_MACS
+                    ),
+                    None => {}
+                }
+            }
+            None if first => note!(
+                "{card}: no driver this program knows; assuming {} addresses",
+                sync::DEFAULT_MAX_MACS
+            ),
+            None => {}
         }
     }
-    usable
-}
-
-/// The smallest usable capacity as the number to warn at: one number governs
-/// every uplink, and the filter that fills first drops addresses. `None`
-/// means the assumed threshold stands.
-pub(crate) fn adopt_capacity(usable: &[(String, usize)], assumed: usize) -> Option<usize> {
-    let (dev, value) = usable.iter().min_by_key(|(_, v)| *v)?;
-    if *value == assumed {
-        note!("{dev} says its filter holds {value} addresses, which is what was assumed");
-        return None;
+    if limit != syncer.max_macs {
+        note!(
+            "warning above {limit} addresses, and releasing quiet addresses as a \
+             list comes near its card's limit"
+        );
+        syncer.max_macs = limit;
     }
-    note!(
-        "{dev} says its filter holds {value} addresses instead of the assumed \
-         {assumed}; warning above that, and releasing quiet addresses as the \
-         list comes near it"
-    );
-    Some(*value)
 }
 
 #[cfg(test)]
@@ -706,50 +627,11 @@ mod tests {
         assert_eq!(s.trigger, "timed");
     }
 
-    /// The capacity policy, over answers rather than over hardware: the
-    /// smallest usable answer wins, an unusable one is dropped rather than
-    /// allowed to veto, silence and failure leave the default standing.
+    /// The kernel source answers for each card by driver and role; the
+    /// smallest number is the one to warn at; a driver that ignores the list
+    /// sets no limit; a card not in the reading is left for the next pass.
     #[test]
-    fn the_reported_capacity_policy() {
-        let dev = |d: &str, a: CapacityAnswer| (d.to_string(), a);
-        let topo = crate::topology::fixture::Builder::new().build();
-        let adopt =
-            |answers, assumed| adopt_capacity(&card_capacities(answers, assumed, &topo), assumed);
-        // The smallest usable answer wins across uplinks.
-        assert_eq!(
-            adopt(
-                vec![dev("nic0", Ok(Some(256))), dev("nic1", Ok(Some(64)))],
-                128
-            ),
-            Some(64)
-        );
-        // A card reporting nonsense is ignored, not a veto on the good one.
-        assert_eq!(
-            adopt(
-                vec![dev("nic0", Ok(Some(0))), dev("nic1", Ok(Some(64)))],
-                128
-            ),
-            Some(64)
-        );
-        // Nothing usable at all leaves the default standing.
-        assert_eq!(adopt(vec![dev("nic0", Ok(Some(0)))], 128), None);
-        // Agreement is not a change.
-        assert_eq!(adopt(vec![dev("nic0", Ok(Some(128)))], 128), None);
-        // Silence and failure leave the default standing.
-        assert_eq!(
-            adopt(
-                vec![dev("nic0", Ok(None)), dev("nic1", Err("no".into()))],
-                128
-            ),
-            None
-        );
-    }
-
-    /// Where the card says nothing, the kernel source may: a driver the
-    /// table knows answers for its role, one it does not leaves the assumed
-    /// number, and a driver that ignores the list never sets a limit.
-    #[test]
-    fn a_silent_card_is_answered_by_its_driver_where_the_source_names_a_number() {
+    fn the_driver_table_sets_the_limits() {
         use crate::topology::fixture::{mac, Builder};
         let topo = Builder::new()
             .add("bx", 2, Some(mac(1)))
@@ -763,24 +645,39 @@ mod tests {
             .driver("ena")
             .add("veth", 6, Some(mac(5)))
             .build();
-        let silent = |d: &str| (d.to_string(), Ok(None));
-        let usable = card_capacities(
-            vec![
-                silent("bx"),
-                silent("bxv"),
-                silent("mx"),
-                silent("ena0"),
-                silent("veth"),
-            ],
-            128,
-            &topo,
+        let pair = |d: &str| Pair {
+            dev: d.into(),
+            bridge: "br".into(),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("sriov-mac-sync-limits-{}", std::process::id()));
+        let mut syncer = Syncer::new(
+            vec![pair("mx"), pair("ena0"), pair("veth"), pair("later")],
+            dir.clone(),
         );
+        let mut said = crate::hash::set();
+        apply_card_limits(&mut syncer, &topo, &mut said);
         assert_eq!(
-            usable,
-            vec![("bx".to_string(), 4), ("bxv".to_string(), 4)],
-            "bnxt holds 4 on both roles; mlx5 and ena leave the assumed number"
+            syncer.max_macs, 128,
+            "mlx5 holds 128; ena and veth set nothing"
         );
-        assert_eq!(adopt_capacity(&usable, 128), Some(4));
+        assert_eq!(syncer.max_macs_je_karte.get("mx"), Some(&128));
+        assert!(!syncer.max_macs_je_karte.contains_key("ena0"));
+        assert!(
+            !said.contains("later"),
+            "an absent card is not said, it is asked again"
+        );
+
+        syncer.pairs = vec![pair("bx"), pair("bxv"), pair("mx")];
+        apply_card_limits(&mut syncer, &topo, &mut said);
+        assert_eq!(syncer.max_macs, 4, "the smallest card governs the warning");
+        assert_eq!(syncer.max_macs_je_karte.get("bxv"), Some(&4));
+        assert_eq!(
+            syncer.max_macs_je_karte.get("mx"),
+            Some(&128),
+            "per card, the card's own"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     mod loop_tests {
@@ -822,12 +719,6 @@ mod tests {
             wait_calls: usize,
             /// every pause the loop asked for
             paused: Vec<Duration>,
-            /// what filter_capacities answers, per netdev
-            capacities: crate::hash::Map<String, u32>,
-            /// netdevs whose devlink question fails outright
-            capacity_errors: Vec<String>,
-            /// each list of devices it was asked about
-            capacity_asks: Vec<Vec<String>>,
         }
 
         impl FakeWorld {
@@ -849,9 +740,6 @@ mod tests {
                     wait_fail_calls: Vec::new(),
                     wait_calls: 0,
                     paused: Vec::new(),
-                    capacities: crate::hash::map(),
-                    capacity_errors: Vec::new(),
-                    capacity_asks: Vec::new(),
                 }
             }
             fn at(mut self, secs: u64, ev: Result<Events, i32>) -> Self {
@@ -927,19 +815,6 @@ mod tests {
             fn pause(&mut self, wait: Duration) {
                 self.paused.push(wait);
                 self.offset += wait;
-            }
-            fn filter_capacities(&mut self, devs: &[String]) -> Vec<(String, CapacityAnswer)> {
-                self.capacity_asks.push(devs.to_vec());
-                devs.iter()
-                    .map(|d| {
-                        let a = if self.capacity_errors.contains(d) {
-                            Err(format!("{d}: devlink said no"))
-                        } else {
-                            Ok(self.capacities.get(d).copied())
-                        };
-                        (d.clone(), a)
-                    })
-                    .collect()
             }
             fn read_topology(&mut self) -> Result<Topology, String> {
                 self.topo_calls += 1;
@@ -1104,67 +979,6 @@ mod tests {
             assert!(
                 world.fdb.vf_asked >= 2,
                 "the recovery pass believed the carried VF answer"
-            );
-        }
-
-        /// A pair adopted at runtime brings its card's capacity with it:
-        /// without the re-ask a daemon started before its bridges warned
-        /// against the assumed 128 for life.
-        #[test]
-        fn a_runtime_pair_brings_its_capacity_along() {
-            let mut opts = Options {
-                interval: 300,
-                ..Default::default()
-            };
-            opts.mode = Mode::Daemon;
-            let _dir = scratch("hotplug-capacity");
-            let mut syncer = Syncer::new(Vec::new(), _dir.0.clone());
-            let mut world = FakeWorld::new(5);
-            world.bare_until = Duration::from_secs(1);
-            world.capacities.insert("nic1".to_string(), 64);
-            world.script.push_back((
-                Duration::from_secs(2),
-                Ok(Events {
-                    fdb: Vec::new(),
-                    links_changed: true,
-                    changed_links: vec![2],
-                }),
-            ));
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(
-                !world.capacity_asks.is_empty(),
-                "the adopted pair was never asked for its capacity"
-            );
-            assert_eq!(
-                syncer.max_macs, 64,
-                "asking is not adopting - the valve still measures the assumed number"
-            );
-            // The operator's word is never moved: the same run with --max
-            // set must not ask at all.
-            let mut opts = Options {
-                interval: 300,
-                max_macs: 200,
-                max_macs_set: true,
-                ..Default::default()
-            };
-            opts.mode = Mode::Daemon;
-            let _dir = scratch("hotplug-capacity-set");
-            let mut syncer = Syncer::new(Vec::new(), _dir.0.clone());
-            let mut world = FakeWorld::new(5);
-            world.bare_until = Duration::from_secs(1);
-            world.capacities.insert("nic1".to_string(), 64);
-            world.script.push_back((
-                Duration::from_secs(2),
-                Ok(Events {
-                    fdb: Vec::new(),
-                    links_changed: true,
-                    changed_links: vec![2],
-                }),
-            ));
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(
-                world.capacity_asks.is_empty(),
-                "--max was set and the cards were asked anyway"
             );
         }
 
@@ -1412,148 +1226,16 @@ mod tests {
             );
         }
 
-        /// A card that structurally cannot report a capacity is asked once,
-        /// not for ever: ixgbe, i40e and mlx4 have no devlink `max_macs`
-        /// parameter, and waiting for a number meant a full devlink parameter
-        /// dump on every reloaded pass - a tap appearing when a VM starts
-        /// bought one.
-        #[test]
-        fn a_card_that_reports_no_capacity_is_asked_only_once() {
-            let (mut syncer, opts, _dir) = setup("capacity-silent-card", 300);
-            let mut world = FakeWorld::new(20);
-            // The card is there and answers - with nothing, the way an
-            // ixgbe does. Several link batches follow.
-            for at in [2, 4, 6, 8] {
-                world.script.push_back((
-                    Duration::from_secs(at),
-                    Ok(Events {
-                        fdb: Vec::new(),
-                        links_changed: true,
-                        changed_links: vec![2],
-                    }),
-                ));
-            }
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert_eq!(
-                world.capacity_asks.len(),
-                1,
-                "a card that answered nothing was asked again on every reloaded pass"
-            );
-        }
-
-        /// One card answering does not settle the question for another:
-        /// taking the first answer would measure the second card - possibly
-        /// the smaller filter - against the first one's limit for life.
-        #[test]
-        fn one_card_s_answer_does_not_settle_another_s() {
-            let dir = scratch("capacity-two-cards");
-            let mut opts = Options {
-                interval: 300,
-                pairs: vec!["nic1:vmbr1".into(), "nic0:vmbr0".into()],
-                ..Default::default()
-            };
-            opts.mode = Mode::Daemon;
-            let mut syncer = Syncer::new(
-                vec![
-                    Pair {
-                        dev: "nic1".into(),
-                        bridge: "vmbr1".into(),
-                    },
-                    Pair {
-                        dev: "nic0".into(),
-                        bridge: "vmbr0".into(),
-                    },
-                ],
-                dir.0.clone(),
-            );
-            let mut world = FakeWorld::new(8);
-            world.capacities.insert("nic1".to_string(), 64);
-            world.capacity_errors.push("nic0".to_string());
-            for at in [2, 5] {
-                world.script.push_back((
-                    Duration::from_secs(at),
-                    Ok(Events {
-                        fdb: Vec::new(),
-                        links_changed: true,
-                        changed_links: vec![2],
-                    }),
-                ));
-            }
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(
-                world.capacity_asks.len() >= 2,
-                "the unanswered card was written off because the other one answered"
-            );
-        }
-
-        /// An uplink that is not there yet has not been asked at all - the
-        /// pending state exists so a daemon started before its bridges picks
-        /// the capacity up when the interface appears.
-        #[test]
-        fn an_uplink_that_appears_later_is_still_asked() {
-            let (mut syncer, opts, _dir) = setup("capacity-late-uplink", 300);
-            let mut world = FakeWorld::new(8);
-            // Until second 3 the world has no nic1 at all.
-            world.absent_until = Duration::from_secs(3);
-            world.capacities.insert("nic1".to_string(), 64);
-            for at in [1, 5] {
-                world.script.push_back((
-                    Duration::from_secs(at),
-                    Ok(Events {
-                        fdb: Vec::new(),
-                        links_changed: true,
-                        changed_links: vec![2],
-                    }),
-                ));
-            }
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(
-                world.capacity_asks.len() >= 2,
-                "an uplink that did not exist yet was written off after one ask"
-            );
-            assert_eq!(
-                syncer.max_macs, 64,
-                "the late uplink's card never reached the pressure valve"
-            );
-        }
-
-        /// A configured pair is not second class: without a re-ask a daemon
-        /// started before its written-down uplink measured threshold and
-        /// valve against the assumed number for life. Autodetection had the
-        /// cure first; --pair was left out.
-        #[test]
-        fn a_configured_pair_brings_its_capacity_when_it_appears() {
-            let (mut syncer, opts, _dir) = setup("conf-capacity", 300);
-            let mut world = FakeWorld::new(5);
-            world.bare_until = Duration::from_secs(1);
-            world.capacities.insert("nic1".to_string(), 64);
-            world.script.push_back((
-                Duration::from_secs(2),
-                Ok(Events {
-                    fdb: Vec::new(),
-                    links_changed: true,
-                    changed_links: vec![2],
-                }),
-            ));
-            daemon_loop(&mut world, &mut syncer, &opts);
-            assert!(
-                !world.capacity_asks.is_empty(),
-                "the configured pair was never asked for its capacity"
-            );
-            assert_eq!(
-                syncer.max_macs, 64,
-                "the card's answer has to reach the pressure valve"
-            );
-        }
-
         /// When the filter is filling up, even an ageing burst is answered
         /// at the fast rate: entries that should be gone are taking room
         /// from entries that should be there.
         #[test]
         fn a_filling_filter_turns_deletions_urgent() {
-            let (mut syncer, opts, _dir) = setup("filling", 300);
-            // The wiring run() does: the one capacity number lives in the
-            // syncer, where the valve and the batch heuristic read it.
+            let (mut syncer, mut opts, _dir) = setup("filling", 300);
+            // The operator's --max, the way run() wires it: the loop then
+            // leaves the number alone.
+            opts.max_macs = 1;
+            opts.max_macs_set = true;
             syncer.max_macs = 1;
             // One address already on record. The file is the truth, so the
             // file is what the test writes.
